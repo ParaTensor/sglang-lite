@@ -162,7 +162,7 @@ Apache-2.0 (to be confirmed)
 
 ## Status
 
-Phase 1 in progress (Production Shell + metrics + robustness).
-See v0.1.0 for the last Phase 0 release. Not for production use yet.
+Phase 1 in progress (MoE-focused production shell + metrics + robustness).
+See v0.1.0 for the last Phase 0 release (pre-MoE scope realignment). Not for production use yet.
 
 See git history and docs for detailed design discussions.
