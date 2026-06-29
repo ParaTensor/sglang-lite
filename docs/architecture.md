@@ -12,46 +12,61 @@ Only three things belong deeply coupled inside the core:
 
 Everything else is pushed out or treated as thin adapter.
 
-## Layered Architecture (MVP)
+## Layered Architecture (MVP) — sglang-lite as pure engine, unigateway as driver
 
-sglang-lite is a **pure library**. Serving, routing, auth, rate limiting, advanced observability, and most configuration are peeled to unigateway or thin dedicated layers.
+**sglang-lite is now a pure library** (the "Token Factory").
+
+All serving, routing, auth, rate-limiting, configuration, advanced observability, and driver integration are peeled to **unigateway** (or thin dedicated layers).
+
+unigateway acts as the **backend driver** for sglang-lite (the actual driver code lives in the unigateway repository):
+- It loads and manages the sglang-lite engine (preferred: direct Python library import inside unigateway: `LiteEngine(model_name=..., device=...)`).
+- It handles the OpenAI surface, streaming, validation, metrics, routing, auth, etc.
+- Any "sglang-lite backend" registration and connection logic moves to unigateway.
+- sglang-lite only exposes the minimal engine API.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        Clients / unigateway                  │
-│  (OpenAI /v1/chat/completions + routing, auth, rate-limit)   │
-│  (advanced metrics, config, graceful shutdown peeled here)   │
+│                        Clients                               │
 └───────────────────────────────┬─────────────────────────────┘
-                                │ HTTP/gRPC or in-process
+                                │ OpenAI
 ┌───────────────────────────────▼─────────────────────────────┐
-│  Rust Control Plane (axum, optional) — Control Point         │
-│  • Minimal OpenAI request models                             │
-│  • Validation + early reject                                 │
-│  • Streaming orchestration                                   │
-│  • Thin client to Python engine (or direct)                  │
-│  (most ops peeled to unigateway)                             │
+│  unigateway (the driver & full control plane)                │
+│  • OpenAI protocol, validation, streaming                    │
+│  • Routing, auth, rate-limit, KV affinity                    │
+│  • Metrics, logging, graceful shutdown, config               │
+│  • Drives sglang-lite as backend (Python import / gRPC / proc)│
 └───────────────────────────────┬─────────────────────────────┘
-                                │ protocol or PyO3
+                                │ sglang-lite engine API
 ┌───────────────────────────────▼─────────────────────────────┐
-│  Python Execution Core (pure library)                        │
+│  sglang-lite (pure library — MoE Token Factory only)         │
 │  ┌──────────────────────┐   ┌───────────────────────────┐   │
-│  │   KVCacheManager     │◄──┤   RadixTree (token seq)   │   │
-│  │   (pages / blocks)   │   │   prefix match + evict    │   │
+│  │   KVCacheManager     │◄──┤   RadixTree (MoE prefix)  │   │
+│  │   (Radix only)       │   │   prefix match + evict    │   │
 │  └──────────────────────┘   └───────────────────────────┘   │
 │  ┌──────────────────────┐   ┌───────────────────────────┐   │
-│  │ Continuous Batching  │◄──┤   Scheduler               │   │
-│  │   + Batcher          │   │   (add seq, step, retire) │   │
+│  │ Continuous Batching  │◄──┤   Scheduler (MoE-aware)   │   │
+│  │   (lite)             │   │   (add seq, step, retire) │   │
 │  └──────────────────────┘   └───────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │ ModelRunner (torch + flash / triton)                 │   │
-│  │   • MoE routing + expert execution                   │   │
-│  │   • CUDA graph (optional)                            │   │
+│  │ ModelRunner (MoE routing + execution)                │   │
+│  │   • Expert selection + basic batching                │   │
+│  │   • CUDA graph (optional, conservative)              │   │
 │  └──────────────────────────────────────────────────────┘   │
 │                                                              │
-│  (Tokenizer & HF model registry — thin reuse)               │
-│  (hooks for metrics/logging; export peeled to gateway)      │
+│  (Minimal tokenizer + HF MoE loader only)                   │
+│  (No serving, no advanced ops, no dense support)            │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+**Key peelings to unigateway:**
+- All HTTP serving and OpenAI surface
+- Auth, rate limit, routing, semantic routing
+- Advanced metrics, structured logging, tracing
+- Configuration and presets
+- Graceful shutdown, health, timeouts coordination
+- Driver glue (how to load/call sglang-lite engine)
+
+sglang-lite only owns the three high-cohesion pieces inside the MoE engine.
 
 ## Internal Protocol (to be defined precisely in code)
 

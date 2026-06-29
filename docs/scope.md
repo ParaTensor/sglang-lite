@@ -8,7 +8,11 @@ This is the authoritative reference for what belongs in core vs. what gets pushe
 
 The engine focuses exclusively on popular MoE architectures (Mixtral-style, DeepSeek-style, Qwen-MoE, etc.). Dense models are out of scope. MoE support is first-class.
 
-Serving (HTTP/gRPC server), advanced config, detailed observability, auth/rate-limit, and routing are peeled to unigateway or thin wrappers. sglang-lite is a pure library for the Token Factory.
+**unigateway is the backend driver** (driver code lives in the unigateway repo):
+- It loads and drives the sglang-lite engine (preferred: direct Python library import from unigateway).
+- All serving (HTTP/gRPC), routing, auth, rate-limit, advanced config, observability export, graceful shutdown, admission control, and timeouts live in unigateway.
+- Any backend registration, connection management, or driver glue moves to unigateway.
+- sglang-lite remains a minimal pure library (only the three high-cohesion pieces).
 
 ## Classification Rules
 

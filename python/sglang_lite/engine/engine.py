@@ -1,13 +1,15 @@
 """
-LiteEngine - the real orchestrator for Phase 0+.
+LiteEngine — the MoE Token Factory (pure library).
 
-It wires together:
-- RadixCache
-- Scheduler
-- ModelRunner
+Wires together the three high-cohesion pieces:
+- RadixCache (KV with prefix sharing)
+- Scheduler (continuous batching, MoE-aware)
+- ModelRunner (expert routing + execution)
 
-And provides a clean generate() and generate_stream() API
-that the internal server (and later Rust) can call.
+All serving, admission control, timeouts, routing, auth, metrics export,
+config, and driver integration live in unigateway (or thin layers).
+
+This keeps sglang-lite extremely small and focused.
 """
 
 from __future__ import annotations
@@ -25,7 +27,8 @@ except ImportError:
     HAS_PROMETHEUS = False
     Counter = Gauge = Histogram = lambda *a, **k: type('Noop', (), {'inc': lambda s, *a, **k: None, 'dec': lambda s, *a, **k: None, 'observe': lambda s, *a, **k: None, 'set': lambda s, *a, **k: None})()
 
-from .config import Config
+# Config is kept for convenience in examples / thin servers.
+# In production the driver (unigateway) controls parameters.
 from .kv_cache import RadixCache
 from .runner import ModelRunner
 from .scheduler import Scheduler, Sequence
@@ -56,19 +59,17 @@ else:
 class LiteEngine:
     def __init__(
         self,
-        config: Optional[Config] = None,
+        model_name: str = "stub",
+        device: str = "cpu",
     ):
-        if config is None:
-            config = Config.from_env("lite")
-        self.config = config
-        self.model_name = config.model
-        self.max_concurrent = config.max_concurrent
-        self.request_timeout = config.request_timeout
-        self.queue_timeout = config.queue_timeout
+        # All admission, timeouts, concurrency, config, etc. are handled in the driver (unigateway).
+        # sglang-lite only receives already-accepted work and a model name.
+        self.model_name = model_name
 
         self.radix = RadixCache(max_tokens=65536)
-        self.scheduler = Scheduler(self.radix, max_batch_size=config.max_batch_size)
-        self.runner = ModelRunner(config.model, device=config.device, max_batch=config.max_batch_size)
+        # Default batch size kept small for lite/MoE. Can be tuned by caller (unigateway).
+        self.scheduler = Scheduler(self.radix, max_batch_size=4)
+        self.runner = ModelRunner(model_name, device=device, max_batch=4)
 
         self._seq_map: Dict[str, Sequence] = {}   # request_id -> Sequence
         self._start_time: Dict[str, float] = {}   # for latency tracking
@@ -86,8 +87,8 @@ class LiteEngine:
         max_tokens: int = 128,
         temperature: float = 0.7,
     ) -> Sequence:
-        if len(self._seq_map) >= self.max_concurrent:
-            raise RuntimeError("max_concurrent requests reached")
+        # Admission control, concurrency limits, and queueing are handled in the driver (unigateway).
+        # The engine only sees already-accepted work.
 
         seq = self.scheduler.add_request(request_id, input_ids)
         seq.max_tokens = max_tokens          # attach generation params
@@ -95,9 +96,10 @@ class LiteEngine:
         self._seq_map[request_id] = seq
         self._start_time[request_id] = time.time()
 
-        REQUESTS_TOTAL.labels(model=self.model_name).inc()
-        ACTIVE_REQUESTS.inc()
-        QUEUE_DEPTH.set(len(self.scheduler.waiting))
+        if HAS_PROMETHEUS:
+            REQUESTS_TOTAL.labels(model=self.model_name).inc()
+            ACTIVE_REQUESTS.inc()
+            QUEUE_DEPTH.set(len(self.scheduler.waiting))
 
         _log_structured("INFO", "request_added", request_id=request_id, prompt_len=len(input_ids), max_tokens=max_tokens)
         return seq
@@ -159,11 +161,9 @@ class LiteEngine:
         start = time.time()
         seq = self.add_request(request_id, input_ids, max_tokens, temperature)
 
-        # Run until this sequence finishes or timeout
+        # Run until this sequence finishes.
+        # Timeouts and admission are enforced by the driver (unigateway) before calling the engine.
         while not seq.finished:
-            if time.time() - start > self.request_timeout:
-                self.scheduler.mark_finished(seq, "timeout")
-                break
             self.step(max_steps=1)
             if len(seq.output_ids) > max_tokens + 10:
                 break

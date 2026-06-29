@@ -171,7 +171,7 @@ def main():
     cfg.max_concurrent = args.max_concurrent
 
     global ENGINE
-    ENGINE = LiteEngine(config=cfg)
+    ENGINE = LiteEngine(model_name=cfg.model, device=cfg.device)
 
     print(f"[sglang-lite-core] Phase 1 engine starting on :{args.port}")
     print(f"  config: {cfg.to_dict()}")

@@ -14,6 +14,5 @@ Serving layer (HTTP server) is peeled to examples/ or unigateway.
 __version__ = "0.1.0"
 
 from .engine.engine import LiteEngine
-from .config import Config
 
-__all__ = ["LiteEngine", "Config"]
+__all__ = ["LiteEngine"]
