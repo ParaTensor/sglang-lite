@@ -26,6 +26,10 @@ sglang-lite follows a **high-cohesion** design (pure library only):
 - All driver glue and backend integration moves to unigateway.
 - sglang-lite stays an ultra-minimal pure library.
 
+A formal requirements document has been prepared for the UniGateway team:
+
+**→ docs/unigateway-sglang-lite-requirements.md**
+
 The goal is to achieve stable 80%+ of theoretical throughput in target scenarios (prefix-heavy chat/agent) with extremely low operational burden.
 
 References: nano-vLLM (~1.2k LOC teaching version), mini-sglang.

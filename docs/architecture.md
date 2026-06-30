@@ -24,6 +24,13 @@ unigateway acts as the **backend driver** for sglang-lite (the actual driver cod
 - Any "sglang-lite backend" registration and connection logic moves to unigateway.
 - sglang-lite only exposes the minimal engine API.
 
+**Important note for the UniGateway team**:
+- Please keep UniGateway's core abstractions (`ProviderDriver`, registry, routing, etc.) completely general.
+- Do **not** introduce sglang-lite specific concepts into the core engine or protocol layers.
+- All MoE/Radix-specific logic must stay inside the sglang-lite driver implementation.
+- Treat sglang-lite the same way you would treat any other local or remote LLM backend.
+- Detailed requirements document: `docs/unigateway-sglang-lite-requirements.md`
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        Clients                               │
