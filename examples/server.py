@@ -113,6 +113,53 @@ async def generate(req: GenRequest, request: Request):
         usage=result.get("usage", {}),
     )
 
+# OpenAI compatible endpoint for UniGateway HTTP mode
+class OpenAIChatRequest(BaseModel):
+    model: str
+    messages: List[dict]
+    max_tokens: Optional[int] = 128
+    temperature: Optional[float] = 0.7
+    stream: Optional[bool] = False
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: OpenAIChatRequest, request: Request):
+    global ENGINE
+    rid = getattr(request.state, "request_id", f"chatcmpl-{uuid.uuid4().hex[:12]}")
+    input_ids = _extract_input_ids(GenRequest(model=req.model, messages=req.messages, max_tokens=req.max_tokens, temperature=req.temperature))
+
+    if req.stream:
+        async def stream_gen():
+            for delta in ENGINE.generate_stream(rid, input_ids, max_tokens=req.max_tokens or 128, temperature=req.temperature or 0.7):
+                chunk = {
+                    "id": rid,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": req.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": delta.get("text", "")} if delta.get("text") else {},
+                        "finish_reason": delta.get("finish_reason")
+                    }]
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(stream_gen(), media_type="text/event-stream")
+    else:
+        result = ENGINE.generate(rid, input_ids, max_tokens=req.max_tokens or 128, temperature=req.temperature or 0.7)
+        response = {
+            "id": rid,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": result["text"]},
+                "finish_reason": result.get("finish_reason", "stop")
+            }],
+            "usage": result.get("usage", {})
+        }
+        return response
+
 
 @app.post("/generate_stream")
 async def generate_stream(req: GenRequest):
