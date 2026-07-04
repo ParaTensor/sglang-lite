@@ -54,7 +54,7 @@ Goal: A runnable system that proves the architecture and can serve real (small) 
 
 - Deep integration tests with unigateway (semantic routing + KV affinity hints)
 - Rust control plane enhancements (more early filters, intent metadata passthrough)
-- Optional: move hot scheduler or cache management bits to Rust via PyO3
+- Optional future: consider Rust components only if needed for extreme performance (no PyO3 embedding planned for unigateway integration)
 - Performance parity target vs SGLang on prefix-heavy chat workloads (within 10-15% on same hardware)
 - Packaging: docker images, helm chart skeleton
 - Documentation: operator guide, "when to choose sglang-lite vs full SGLang"

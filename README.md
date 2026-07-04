@@ -105,7 +105,7 @@ No serving or high-level orchestration in sglang-lite. See `examples/` for drive
 - Python + Triton: Mature kernels and fast iteration for the core engine.
 - Library first: The Python engine is a pure library. Serving, ops, and advanced features are peeled to unigateway or examples/. This keeps sglang-lite minimal and high-cohesion.
 
-**Communication (MVP)**: Start with local HTTP (loose coupling, easy to debug), or gRPC. Tighten with PyO3 later.
+**Communication**: Use HTTP or gRPC for integration with unigateway. Direct embedding (e.g. PyO3) is not used to keep unigateway as a general SDK.
 
 ## Tech Stack
 

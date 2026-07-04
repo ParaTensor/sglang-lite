@@ -15,6 +15,8 @@ sglang-lite is a **pure library** exposing three further-decomposed building blo
 - Handles all serving, routing, auth, rate-limit, advanced config, metrics export, graceful shutdown, etc.
 - sglang-lite only owns the high-cohesion core pieces (internal decomposition is allowed for modularity).
 
+**Critical boundary**: Communication with sglang-lite must use HTTP or gRPC only. PyO3 or direct in-process embedding is not used, to preserve unigateway as a general SDK.
+
 ## Classification Rules
 
 - **重构 / Must Control** — Re-implement or own the logic. This is where complexity lives and where we gain long-term maintainability + differentiation.

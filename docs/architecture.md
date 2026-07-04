@@ -28,7 +28,7 @@ sglang-lite only exports the fine-grained building blocks + a small default comp
 All serving, routing, auth, rate-limiting, configuration, advanced observability, and driver integration are peeled to **unigateway** (or thin dedicated layers).
 
 unigateway acts as the **backend driver** for sglang-lite (the actual driver code lives in the unigateway repository):
-- It loads and manages the sglang-lite engine (preferred: direct Python library import inside unigateway: `LiteEngine(model_name=..., device=...)`).
+- It loads and manages the sglang-lite engine via standard protocols (HTTP or gRPC). Direct embedding is avoided to preserve unigateway's generality as an SDK.
 - It handles the OpenAI surface, streaming, validation, metrics, routing, auth, etc.
 - Any "sglang-lite backend" registration and connection logic moves to unigateway.
 - sglang-lite only exposes the minimal engine API.
@@ -38,6 +38,7 @@ unigateway acts as the **backend driver** for sglang-lite (the actual driver cod
 - Do **not** introduce sglang-lite specific concepts into the core engine or protocol layers.
 - All MoE/Radix-specific logic must stay inside the sglang-lite driver implementation.
 - Treat sglang-lite the same way you would treat any other local or remote LLM backend.
+- **Critical boundary**: PyO3, direct Python embedding, or any in-process library calls are explicitly not used. All communication must go through HTTP or gRPC. This boundary is to keep UniGateway as a general-purpose embeddable SDK.
 - Detailed requirements document: `docs/unigateway-sglang-lite-requirements.md`
 
 ```
@@ -124,7 +125,7 @@ class Scheduler:
 |---------|--------------------|-------------------------------|--------------------------|---------------------|
 | MVP     | Local HTTP (FastAPI from Python) | Easy debug, separate process | Serialization + latency  | Now                 |
 | Phase1  | gRPC (tonic + py)  | Typed, efficient, streaming  | More boilerplate         | When core stabilizes|
-| Later   | PyO3 / in-process  | Zero copy, best perf         | Build complexity         | Hot paths only      |
+| Later (not planned) | Direct embedding (e.g. PyO3) | Avoided | Conflicts with unigateway generality | Not considered for unigateway driver |
 
 ## Model Support Strategy
 
