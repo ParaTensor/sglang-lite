@@ -43,6 +43,9 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Number of prompt tokens served from cache (for sglang-lite / unigateway passthrough)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit_tokens: Option<u32>,
 }
 
 /// Blocking result used by non-stream path.

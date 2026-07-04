@@ -251,6 +251,7 @@ class LiteEngine:
             "prompt_tokens": prompt,
             "completion_tokens": completion,
             "total_tokens": prompt + completion,
+            "cache_hit_tokens": seq.cached_len,  # number of prompt tokens served from Radix cache (for unigateway passthrough)
         }
 
     def _get_eos_token(self) -> int:

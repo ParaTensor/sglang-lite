@@ -168,6 +168,7 @@ async fn chat_completions(
             prompt_tokens: resp.usage.prompt_tokens,
             completion_tokens: resp.usage.completion_tokens,
             total_tokens: resp.usage.total_tokens,
+            cache_hit_tokens: resp.usage.cache_hit_tokens,
         };
         let response = ChatCompletionResponse {
             id: request_id,

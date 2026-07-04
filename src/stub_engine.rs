@@ -54,6 +54,7 @@ impl StubEngineClient {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
+                cache_hit_tokens: None,
             },
         })
     }
@@ -122,6 +123,7 @@ impl StubEngineClient {
                             prompt_tokens,
                             completion_tokens,
                             total_tokens: prompt_tokens + completion_tokens,
+                            cache_hit_tokens: None,
                         })
                     } else {
                         None
@@ -228,9 +230,10 @@ async fn forward_blocking(base: &str, req: GenerationRequest) -> Result<Generati
             prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
             completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
             total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
+            cache_hit_tokens: u.get("cache_hit_tokens").and_then(|v| v.as_u64()).map(|v| v as u32),
         }
     } else {
-        Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+        Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cache_hit_tokens: None }
     };
 
     Ok(GenerationResult { text, finish_reason: fr, usage })

@@ -119,6 +119,9 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Extended for sglang-lite cache hit passthrough to unigateway
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]

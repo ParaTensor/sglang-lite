@@ -179,3 +179,69 @@ Phase 1 in progress (MoE-focused production shell + metrics + robustness).
 See v0.1.0 for the last Phase 0 release (pre-MoE scope realignment). Not for production use yet.
 
 See git history and docs for detailed design discussions.
+
+## Integration with UniGateway
+
+sglang-lite is designed to be used as a backend by [unigateway](https://github.com/EeroEternal/unigateway).
+
+### Running for UniGateway (HTTP mode)
+
+sglang-lite can be run as a standalone OpenAI-compatible server that unigateway can connect to.
+
+Example:
+
+```bash
+# Using the example server
+python -m sglang_lite.server \
+  --port 8000 \
+  --model "deepseek-ai/DeepSeek-V2-Lite-Chat" \
+  --device cuda \
+  --max-batch-size 8
+```
+
+Or use the Rust binary which proxies to a Python core:
+
+```bash
+SGLANG_LITE_PYTHON_CORE=http://localhost:9001 ./target/debug/sglang-lite --port 8000
+```
+
+### Environment variables (for Config.from_env)
+
+- SGLANG_LITE_MODEL
+- SGLANG_LITE_DEVICE
+- SGLANG_LITE_PORT
+- SGLANG_LITE_MAX_BATCH_SIZE
+- SGLANG_LITE_MAX_CONCURRENT
+- SGLANG_LITE_REQUEST_TIMEOUT
+- SGLANG_LITE_LOG_LEVEL
+
+### UniGateway TOML example
+
+```toml
+[[providers]]
+name = "my-moe"
+provider_type = "sglang-lite"
+base_url = "http://localhost:8000/v1"
+# api_key can be empty for local
+api_key = ""
+
+[providers.model_policy]
+default_model = "local-moe"
+```
+
+See unigateway docs for full details.
+
+### Response format for cache metrics passthrough
+
+The usage object in responses includes:
+
+```json
+"usage": {
+  "prompt_tokens": 20,
+  "completion_tokens": 10,
+  "total_tokens": 30,
+  "cache_hit_tokens": 12
+}
+```
+
+This allows unigateway to extract cache hit information.
