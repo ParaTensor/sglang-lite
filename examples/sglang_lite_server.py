@@ -8,6 +8,7 @@ Run with: PYTHONPATH=. python examples/sglang_lite_server.py --model ...
 """
 
 import sys
+
 sys.path.insert(0, "python")
 
 from server import main

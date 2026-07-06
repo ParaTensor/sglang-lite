@@ -15,15 +15,27 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Dict, Generator, List, Optional
+from typing import Dict, Generator, List
+
+import torch
 
 # Prometheus metrics are optional (peeled to serving layer like unigateway when needed)
 try:
     from prometheus_client import Counter, Gauge, Histogram
+
     HAS_PROMETHEUS = True
 except ImportError:
     HAS_PROMETHEUS = False
-    Counter = Gauge = Histogram = lambda *a, **k: type('Noop', (), {'inc': lambda s, *a, **k: None, 'dec': lambda s, *a, **k: None, 'observe': lambda s, *a, **k: None, 'set': lambda s, *a, **k: None})()
+    Counter = Gauge = Histogram = lambda *a, **k: type(
+        "Noop",
+        (),
+        {
+            "inc": lambda s, *a, **k: None,
+            "dec": lambda s, *a, **k: None,
+            "observe": lambda s, *a, **k: None,
+            "set": lambda s, *a, **k: None,
+        },
+    )()
 
 # Config is kept for convenience in examples / thin servers.
 # In production the driver (unigateway) controls parameters.
@@ -32,6 +44,7 @@ from .runner import ModelRunner
 from .scheduler import Scheduler, Sequence
 
 logger = logging.getLogger("sglang_lite")
+
 
 def _log_structured(level: str, msg: str, **kwargs):
     log_data = {"level": level, "msg": msg, "ts": time.time(), **kwargs}
@@ -42,16 +55,35 @@ def _log_structured(level: str, msg: str, **kwargs):
     else:
         logger.error(json.dumps(log_data))
 
+
 # Prometheus metrics (optional, peeled to unigateway/serving layer)
 if HAS_PROMETHEUS:
-    REQUESTS_TOTAL = Counter("sglang_lite_requests_total", "Total number of generation requests", ["model"])
+    REQUESTS_TOTAL = Counter(
+        "sglang_lite_requests_total", "Total number of generation requests", ["model"]
+    )
     TOKENS_GENERATED = Counter("sglang_lite_tokens_generated_total", "Total tokens generated")
     ACTIVE_REQUESTS = Gauge("sglang_lite_active_requests", "Currently active requests")
     QUEUE_DEPTH = Gauge("sglang_lite_queue_depth", "Current waiting queue depth")
     BATCH_SIZE = Gauge("sglang_lite_current_batch_size", "Current batch size being processed")
-    REQUEST_LATENCY = Histogram("sglang_lite_request_latency_seconds", "End-to-end request latency", buckets=(0.1, 0.5, 1, 2, 5, 10, 30))
+    REQUEST_LATENCY = Histogram(
+        "sglang_lite_request_latency_seconds",
+        "End-to-end request latency",
+        buckets=(0.1, 0.5, 1, 2, 5, 10, 30),
+    )
 else:
-    REQUESTS_TOTAL = TOKENS_GENERATED = ACTIVE_REQUESTS = QUEUE_DEPTH = BATCH_SIZE = REQUEST_LATENCY = type('NoopMetric', (), {'inc': lambda *a,**k:None, 'dec':lambda *a,**k:None, 'observe':lambda *a,**k:None, 'set':lambda *a,**k:None, 'labels': lambda *a,**k: REQUESTS_TOTAL})()
+    REQUESTS_TOTAL = TOKENS_GENERATED = ACTIVE_REQUESTS = QUEUE_DEPTH = BATCH_SIZE = (
+        REQUEST_LATENCY
+    ) = type(
+        "NoopMetric",
+        (),
+        {
+            "inc": lambda *a, **k: None,
+            "dec": lambda *a, **k: None,
+            "observe": lambda *a, **k: None,
+            "set": lambda *a, **k: None,
+            "labels": lambda *a, **k: REQUESTS_TOTAL,
+        },
+    )()
 
 
 class LiteEngine:
@@ -59,17 +91,28 @@ class LiteEngine:
         self,
         model_name: str = "stub",
         device: str = "cpu",
+        max_batch_size: int = 4,
     ):
         # All admission, timeouts, concurrency, config, etc. are handled in the driver (unigateway).
         # sglang-lite only receives already-accepted work and a model name.
         self.model_name = model_name
 
-        self.radix = RadixCache(max_tokens=65536)
-        self.scheduler = Scheduler(self.radix, max_batch_size=4)
-        self.runner = ModelRunner(model_name, device=device, max_batch=4)
+        self.runner = ModelRunner(model_name, device=device, max_batch=max_batch_size)
 
-        self._seq_map: Dict[str, Sequence] = {}   # request_id -> Sequence
-        self._start_time: Dict[str, float] = {}   # for latency tracking
+        # Init paged radix with model dims for FlashInfer
+        self.radix = RadixCache(
+            max_tokens=65536,
+            block_size=16,
+            num_layers=self.runner.num_layers,
+            num_kv_heads=self.runner.num_kv_heads,
+            head_dim=self.runner.head_dim,
+            dtype=torch.float16 if device != "cpu" else torch.float32,
+            device=device if device != "cpu" else "cpu",
+        )
+        self.scheduler = Scheduler(self.radix, max_batch_size=max_batch_size)
+
+        self._seq_map: Dict[str, Sequence] = {}  # request_id -> Sequence
+        self._start_time: Dict[str, float] = {}  # for latency tracking
 
     def tokenize(self, text: str) -> List[int]:
         return self.runner.tokenize(text)
@@ -88,17 +131,37 @@ class LiteEngine:
         # The engine only sees already-accepted work.
 
         seq = self.scheduler.add_request(request_id, input_ids)
-        seq.max_tokens = max_tokens          # attach generation params
+        seq.max_tokens = max_tokens  # attach generation params
         seq.temperature = temperature
         self._seq_map[request_id] = seq
         self._start_time[request_id] = time.time()
+
+        # Observe prefix cache hit (key for Radix + unigateway)
+        if seq.cached_len > 0:
+            _log_structured(
+                "INFO",
+                "prefix_cache_hit",
+                request_id=request_id,
+                cached_len=seq.cached_len,
+                prompt_len=len(input_ids),
+            )
+            if HAS_PROMETHEUS:
+                # Could add a counter, but stats via get_stats
+                pass
 
         if HAS_PROMETHEUS:
             REQUESTS_TOTAL.labels(model=self.model_name).inc()
             ACTIVE_REQUESTS.inc()
             QUEUE_DEPTH.set(len(self.scheduler.waiting))
 
-        _log_structured("INFO", "request_added", request_id=request_id, prompt_len=len(input_ids), max_tokens=max_tokens)
+        _log_structured(
+            "INFO",
+            "request_added",
+            request_id=request_id,
+            prompt_len=len(input_ids),
+            max_tokens=max_tokens,
+            cached_len=seq.cached_len,
+        )
         return seq
 
     def step(self, max_steps: int = 1) -> List[Dict]:
@@ -113,7 +176,12 @@ class LiteEngine:
                 break
 
             BATCH_SIZE.set(len(batch))
-            _log_structured("INFO", "batch_step", batch_size=len(batch), prefill_count=sum(1 for p in is_prefill if p))
+            _log_structured(
+                "INFO",
+                "batch_step",
+                batch_size=len(batch),
+                prefill_count=sum(1 for p in is_prefill if p),
+            )
 
             next_tokens = self.runner.run_batch(batch, self.radix, is_prefill)
 
@@ -155,7 +223,6 @@ class LiteEngine:
         temperature: float = 0.7,
     ) -> Dict:
         """Blocking generation (convenient for /generate)."""
-        start = time.time()
         seq = self.add_request(request_id, input_ids, max_tokens, temperature)
 
         # Run until this sequence finishes.
@@ -177,7 +244,14 @@ class LiteEngine:
         ACTIVE_REQUESTS.dec()
         QUEUE_DEPTH.set(len(self.scheduler.waiting))
 
-        _log_structured("INFO", "request_finished", request_id=request_id, duration=duration, finish_reason=result.get("finish_reason"), usage=result.get("usage"))
+        _log_structured(
+            "INFO",
+            "request_finished",
+            request_id=request_id,
+            duration=duration,
+            finish_reason=result.get("finish_reason"),
+            usage=result.get("usage"),
+        )
         return result
 
     def generate_stream(

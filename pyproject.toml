@@ -16,11 +16,17 @@ dependencies = [
     "torch>=2.3",
     "transformers>=4.40",
     "sentencepiece>=0.2",
+    # gRPC support for unigateway integration (optional in practice, but included for completeness)
+    "grpcio>=1.60",
+    "grpcio-tools>=1.60",
     # prometheus-client is optional (peeled to serving layer)
 ]
 
 [project.optional-dependencies]
 dev = ["ruff", "pytest"]
+# For production paged attention with FlashInfer (CUDA only)
+# pip install "sglang-lite[flashinfer]"
+flashinfer = ["flashinfer>=0.1.0"]  # install via --extra-index-url https://flashinfer.ai/whl/cu121/torch2.4/ etc.
 
 [tool.setuptools.packages.find]
 where = ["python"]

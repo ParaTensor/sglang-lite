@@ -13,8 +13,8 @@ Usage:
 """
 
 import argparse
-import os
 import sys
+
 sys.path.insert(0, "python")
 
 from sglang_lite.engine.engine import LiteEngine
@@ -22,7 +22,11 @@ from sglang_lite.engine.engine import LiteEngine
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="stub")
+    parser.add_argument(
+        "--model",
+        default="hf-internal-testing/tiny-random-gpt2",
+        help="Use a small real HF model for real skeleton test; override with MoE model name for true MoE (e.g. a small Qwen-MoE if available)",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--max-tokens", type=int, default=12)
     args = parser.parse_args()
@@ -35,7 +39,7 @@ def main():
     eng = LiteEngine(model_name=args.model, device=args.device, max_batch_size=4)
 
     # Demonstrate radix prefix sharing with raw tokens (reliable)
-    shared_prefix = list(range(100, 140))          # 40 tokens shared
+    shared_prefix = list(range(100, 140))  # 40 tokens shared
     continuation1 = [200, 201, 202]
     continuation2 = [300, 301]
 

@@ -47,6 +47,10 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Generated protobuf / gRPC (do not commit, regenerate from proto/)
+python/sglang_lite/*_pb2*.py
+python/sglang_lite/*_pb2*.pyi
 logs/
 
 # Project specific

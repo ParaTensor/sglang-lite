@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 from .kv_cache import RadixCache, PastKV
 
@@ -22,11 +22,15 @@ from .kv_cache import RadixCache, PastKV
 @dataclass
 class Sequence:
     """Lightweight sequence descriptor. Lifecycle mostly managed by the driver (unigateway)."""
+
     seq_id: int
     request_id: str
     input_ids: List[int]
     output_ids: List[int] = field(default_factory=list)
     cached_len: int = 0
+    # For paged KV + FlashInfer
+    block_table: List[int] = field(default_factory=list)
+    # Legacy for transition
     kv_state: Optional[PastKV] = None
     created_ts: float = field(default_factory=time.time)
     last_token_ts: float = field(default_factory=time.time)
@@ -38,6 +42,7 @@ class Sequence:
 
 class SequenceTable:
     """Manages active sequences. Can be driven by unigateway."""
+
     def __init__(self):
         self.sequences: Dict[int, Sequence] = {}
         self._next_id = 1
@@ -69,7 +74,7 @@ class Scheduler:
     def __init__(
         self,
         radix_cache: RadixCache,
-        max_batch_size: int = 8,          # smaller on CPU
+        max_batch_size: int = 8,  # smaller on CPU
         max_tokens_per_batch: int = 512,
         max_waiting: int = 128,
     ):
@@ -81,6 +86,7 @@ class Scheduler:
         self.waiting: Deque[Sequence] = deque()
         self.running: List[Sequence] = []
         self.batch_former = BatchFormer(max_batch_size, max_tokens_per_batch)
+        self._next_seq_id = 1
         # Note: max_waiting / admission can be handled by unigateway driver
 
     def add_request(self, request_id: str, input_ids: List[int]) -> Sequence:
@@ -95,15 +101,16 @@ class Scheduler:
         self._next_seq_id += 1
 
         # Radix prefix match — this is where we win on multi-turn
-        matched, matched_len, remaining, cached_kv = self.radix.match_prefix(input_ids)
+        matched, matched_len, remaining, block_ids = self.radix.match_prefix(input_ids)
 
         seq.cached_len = matched_len
-        if cached_kv is not None:
-            seq.kv_state = self.radix.fork_kv(cached_kv)
+        # Paged: get shared block ids from radix prefix match
+        if block_ids:  # from updated match_prefix returning block_ids
+            seq.block_table = list(block_ids)  # share the prefix blocks
 
         # Record the prefix in the tree (even if we haven't computed new KV yet)
         if matched:
-            self.radix.insert_or_update(matched, seq.kv_state or [], matched_len)
+            self.radix.insert_or_update(matched, None, matched_len)  # blocks handled in paged path
 
         self.waiting.append(seq)
         return seq
@@ -123,11 +130,14 @@ class Scheduler:
         seq: Sequence,
         new_tokens: List[int],
         new_kv_state: PastKV,
+        new_block_ids: Optional[List[int]] = None,
     ) -> None:
         """Called by runner after a prefill step."""
         seq.input_ids.extend(new_tokens)  # usually not needed, but for clarity
         seq.cached_len = len(seq.input_ids)
         seq.kv_state = new_kv_state
+        if new_block_ids:
+            seq.block_table.extend(new_block_ids)
         seq.prefill_tokens += len(new_tokens)
 
         # Commit this prefix (including the newly computed part) into the radix tree
@@ -135,12 +145,18 @@ class Scheduler:
         self.radix.insert_or_update(full_prompt, new_kv_state, seq.cached_len)
 
     def update_after_decode(
-        self, seq: Sequence, new_token: int, new_kv_state: PastKV
+        self,
+        seq: Sequence,
+        new_token: int,
+        new_kv_state: PastKV,
+        new_block_ids: Optional[List[int]] = None,
     ) -> None:
         """Called by runner after decoding one token."""
         seq.output_ids.append(new_token)
         seq.cached_len += 1
         seq.kv_state = new_kv_state
+        if new_block_ids:
+            seq.block_table.extend(new_block_ids)
         seq.decode_tokens += 1
         seq.last_token_ts = time.time()
 
@@ -154,3 +170,41 @@ class Scheduler:
         self.radix.release_blocks(getattr(seq, "allocated_blocks", []))
         if hasattr(seq, "allocated_blocks"):
             seq.allocated_blocks = []
+
+
+class BatchFormer:
+    """
+    Forms a batch for the runner.
+
+    Simple policy for skeleton:
+    - Prefer continuing running sequences (decode)
+    - Admit new from waiting (prefill) if space
+    - unigateway can replace this with custom MoE-aware policy.
+    """
+
+    def __init__(self, max_batch_size: int = 8, max_tokens_per_batch: int = 512):
+        self.max_batch_size = max_batch_size
+        self.max_tokens_per_batch = max_tokens_per_batch
+
+    def form_batch(
+        self, waiting: deque, running: List[Sequence]
+    ) -> Tuple[List[Sequence], List[bool]]:
+        batch: List[Sequence] = []
+        is_prefill: List[bool] = []
+
+        # First, continue as many running (decode) as possible
+        for seq in list(running):
+            if len(batch) >= self.max_batch_size:
+                break
+            if not seq.finished:
+                batch.append(seq)
+                is_prefill.append(False)
+
+        # Then admit from waiting (prefill), up to remaining slots
+        while waiting and len(batch) < self.max_batch_size:
+            seq = waiting.popleft()
+            if not seq.finished:
+                batch.append(seq)
+                is_prefill.append(True)
+
+        return batch, is_prefill
