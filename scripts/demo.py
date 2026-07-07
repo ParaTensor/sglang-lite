@@ -8,16 +8,21 @@ Shows:
 - Basic continuous batching behavior
 
 Usage:
-    PYTHONPATH=python python demo.py
-    PYTHONPATH=python python demo.py --model Qwen/Qwen2.5-0.5B-Instruct --device cpu
+    # Recommended:
+    pip install -e .
+    python scripts/demo.py
+
+    # or with specific model
+    pip install -e .
+    python scripts/demo.py --model Qwen/Qwen2.5-0.5B-Instruct --device cpu
 """
 
 import argparse
 import sys
 
-sys.path.insert(0, "python")
+sys.path.insert(0, "engine")
 
-from sglang_lite.engine.engine import LiteEngine
+from sglang_lite import LiteEngine
 
 
 def main():

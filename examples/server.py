@@ -8,7 +8,7 @@ Serving, routing, auth, advanced metrics, etc. belong in unigateway
 or a dedicated thin server.
 
 Run:
-    python examples/sglang_lite_server.py --port 9001 --model ...
+    pip install -e . && python examples/sglang_lite_server.py --port 9001 --model ...
 """
 
 from __future__ import annotations
@@ -28,10 +28,10 @@ from pydantic import BaseModel
 
 import sys
 
-sys.path.insert(0, "python")
+sys.path.insert(0, "engine")
 
 from sglang_lite.config import Config
-from sglang_lite.engine.engine import LiteEngine
+from sglang_lite import LiteEngine
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("sglang_lite_server")

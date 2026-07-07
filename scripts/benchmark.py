@@ -5,13 +5,14 @@ Basic benchmark script for sglang-lite (Phase 1)
 Focus: prefix-heavy chat workload to measure cache hit benefit.
 
 Usage:
-    PYTHONPATH=python python benchmark.py --url http://localhost:9001 --num-requests 20 --prefix-len 80
+    # Recommended:
+    pip install -e .
+    python scripts/benchmark.py --url http://localhost:9001 --num-requests 20 --prefix-len 80
 """
 
 import argparse
 import time
 import requests
-import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 

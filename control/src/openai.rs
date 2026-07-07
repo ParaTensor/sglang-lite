@@ -1,5 +1,9 @@
 //! OpenAI-compatible types (intentionally minimal).
 //!
+//! This is sglang-lite's thin control plane adapter.
+//! Per architecture, the FULL OpenAI protocol, complex parsing, and serving
+//! logic belongs in Unigateway (Rust). Keep this minimal.
+//!
 //! This is a control point. We keep the accepted surface small on purpose.
 //! Extra fields are either ignored (with warning later) or explicitly rejected in the handler.
 

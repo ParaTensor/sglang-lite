@@ -4,6 +4,7 @@ target/
 
 # Python
 __pycache__/
+.ruff_cache/
 *.py[cod]
 *$py.class
 *.so

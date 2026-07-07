@@ -10,8 +10,8 @@ This document records the current optimization summary after pausing unigateway 
   - kv_cache 有基础 radix tree 但 eviction/paging 是 placeholder
   - scheduler 有框架但很多逻辑简化
 - Phase 0 基本完成，Phase 1 roadmap 上很多标 “completed”，但实际距离“可用于真实 MoE 生产负载”还有明显差距。
-- 最近 gRPC 相关文件（pb2 等）留在 python/sglang_lite/ 里，属于集成副产品。
-- Rust 侧 src/ 有一个独立的 OpenAI 兼容服务器（用 stub_engine），与“serving 剥离”原则有冲突。
+- 最近 gRPC 相关文件（pb2 等）留在 engine/ 里，属于集成副产品。
+- 原来 Rust 侧的独立 OpenAI 兼容服务器代码已移动到 serving/control/（main.rs + openai.rs + stub_engine），作为薄控制面保留。完整 serving 应由 unigateway 提供，与“serving 剥离”原则一致。建议逐步标记为 legacy 或瘦身成协议定义。
 
 ## 优先需要优化的领域（按对核心价值的影响排序）
 
@@ -44,8 +44,8 @@ scope 和 architecture 都反复强调要分解，让 driver 可以替换/组合
 - 减少 LiteEngine 里的隐式状态（目前 _seq_map 等还是在 facade 里）。
 
 ### 3. 清理与集成暂停相关的遗留
-- python/sglang_lite/ 里的 sglang_lite_pb2* 文件：既然 unigateway 集成暂停，建议移到 examples/ 或做成可选 feature，否则污染纯库包。
-- Rust 侧 src/ 的独立服务器（main.rs + openai.rs + stub_engine）：要么明确标记为“standalone demo / legacy”，要么瘦身成只剩协议定义。否则和“serving 剥离到 unigateway”冲突。
+- engine/ 里的 sglang_lite_pb2* 文件：既然 unigateway 集成暂停，建议移到 examples/ 或做成可选 feature，否则污染纯库包。
+- serving/control/ 下的独立服务器代码（main.rs + openai.rs + stub_engine）：明确标记为“standalone demo / legacy”或瘦身成只剩协议定义。完整 serving 由 unigateway 负责。
 - 文档状态漂移：
   - roadmap.md 里 Phase 1 大量标 completed，但代码现实不符，需要诚实更新。
   - scope.md 和 architecture.md 很好，但要和实际类名（RadixCache vs 文档里的 RadixKVCache 等）保持同步。
@@ -85,7 +85,7 @@ scope 和 architecture 都反复强调要分解，让 driver 可以替换/组合
   - More robust real HF model loading (trust_remote_code, MoE note).
   - Added _prepare_past_for_hf and _to_legacy_kv to handle modern transformers Cache vs legacy list (fixes past_key_values errors).
   - Dummy MoE routing simulation in TinyLM stub.
-- In engine.py:
+- In core.py (was engine.py):
   - LiteEngine now accepts max_batch_size and passes down.
   - Explicit prefix cache hit logging when cached_len > 0 on add_request (for observation).
   - usage already reports cache_hit_tokens = cached_len.

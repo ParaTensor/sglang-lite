@@ -1,10 +1,14 @@
-//! sglang-lite: Minimal high-cohesion LLM inference engine
-//! Rust control plane (OpenAI API layer) + Python execution core.
+//! sglang-lite thin control plane library (OpenAI API layer + Python execution core client).
 //!
-//! This binary is the entrypoint. The Rust layer is the explicit control point:
-//! - Strict OpenAI-compatible surface
+//! This crate provides the minimal control point for the sglang-lite engine:
+//! - Strict OpenAI-compatible surface (minimal)
 //! - Early rejection of out-of-scope features
 //! - Clean internal request protocol to the engine core
+//!
+//! NOTE: Full OpenAI surface, drivers, and serving logic MUST be implemented in
+//! Unigateway (external Rust). This crate is only a thin adapter.
+
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use axum::{
@@ -17,63 +21,40 @@ use axum::{
     Router,
 };
 use futures::Stream;
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::convert::Infallible;
 use tokio::time::sleep;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
-mod openai;
-mod protocol;
-mod stub_engine;
+pub mod openai;
+pub mod protocol;
+pub mod stub_engine;
 
-use openai::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Delta, Role,
-};
-use protocol::GenerationRequest;
-use stub_engine::StubEngineClient;
+pub use openai::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Delta, Role};
+pub use protocol::GenerationRequest;
+pub use stub_engine::StubEngineClient;
 
 #[derive(Clone)]
-struct AppState {
-    engine: Arc<StubEngineClient>,
-    model_list: Arc<Vec<String>>,
+pub struct AppState {
+    pub engine: Arc<StubEngineClient>,
+    pub model_list: Arc<Vec<String>>,
+    pub core_url: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    eprintln!("sglang-lite starting, port from PORT env");
-    // Logging
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "sglang_lite=info,tower_http=debug".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8000);
-
-    // Supported models (very limited in lite mode — this is intentional)
-    let supported_models: Vec<String> = vec![
-        "Qwen/Qwen2.5-7B-Instruct".to_string(),
-        "Qwen/Qwen2.5-72B-Instruct".to_string(),
-        "meta-llama/Meta-Llama-3.1-8B-Instruct".to_string(),
-        "meta-llama/Meta-Llama-3.1-70B-Instruct".to_string(),
-        "mistralai/Mistral-7B-Instruct-v0.3".to_string(),
-        // Add more only after explicit support + test
-    ];
-
-    let engine = Arc::new(StubEngineClient::new());
+/// Build the axum router for the sglang-lite control plane.
+pub fn build_router(
+    engine: Arc<StubEngineClient>,
+    model_list: Arc<Vec<String>>,
+    core_url: Option<String>,
+) -> Router {
     let state = AppState {
         engine,
-        model_list: Arc::new(supported_models),
+        model_list,
+        core_url,
     };
 
-    let app = Router::new()
+    Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
         .route("/healthz", get(healthz))
@@ -81,22 +62,30 @@ async fn main() -> Result<()> {
         .route("/metrics", get(metrics))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive());
+        .layer(CorsLayer::permissive())
+}
 
+/// Run a standalone HTTP server with the given configuration.
+///
+/// This is provided as a convenience for local testing and standalone deployments.
+/// Production serving should be handled by Unigateway.
+pub async fn serve(
+    engine: Arc<StubEngineClient>,
+    model_list: Arc<Vec<String>>,
+    core_url: Option<String>,
+    port: u16,
+) -> Result<()> {
+    let app = build_router(engine, model_list, core_url);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("sglang-lite (Rust control plane) listening on {}", addr);
-    info!("Phase 1 — Production shell + metrics");
-    info!("Try: curl http://localhost:{}/v1/chat/completions -d '{{...}}'", port);
-    info!("Metrics: curl http://localhost:{}/metrics", port);
+    info!("sglang-lite control plane listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
-
     Ok(())
 }
 
 /// POST /v1/chat/completions — the primary control surface.
-async fn chat_completions(
+pub async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, String)> {
@@ -104,7 +93,14 @@ async fn chat_completions(
     if !state.model_list.iter().any(|m| m == &req.model) {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
-            json_error("invalid_request_error", &format!("model '{}' not supported in sglang-lite (see GET /v1/models).", req.model), "model_not_found"),
+            json_error(
+                "invalid_request_error",
+                &format!(
+                    "model '{}' not supported in sglang-lite (see GET /v1/models).",
+                    req.model
+                ),
+                "model_not_found",
+            ),
         ));
     }
 
@@ -120,7 +116,11 @@ async fn chat_completions(
     if req.response_format.is_some() {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
-            json_error("invalid_request_error", "response_format / structured output is not supported inside the engine.", "structured_output_not_supported"),
+            json_error(
+                "invalid_request_error",
+                "response_format / structured output is not supported inside the engine.",
+                "structured_output_not_supported",
+            ),
         ));
     }
 
@@ -183,7 +183,7 @@ async fn chat_completions(
 }
 
 /// SSE stream helper
-fn stream_chat(
+pub fn stream_chat(
     engine: Arc<StubEngineClient>,
     gen_req: GenerationRequest,
     created: i64,
@@ -264,7 +264,7 @@ fn stream_chat(
 }
 
 /// GET /v1/models
-async fn list_models(State(state): State<AppState>) -> Json<openai::ModelsResponse> {
+pub async fn list_models(State(state): State<AppState>) -> Json<openai::ModelsResponse> {
     let data = state
         .model_list
         .iter()
@@ -282,7 +282,7 @@ async fn list_models(State(state): State<AppState>) -> Json<openai::ModelsRespon
 }
 
 /// GET /healthz
-async fn healthz() -> Json<serde_json::Value> {
+pub async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
         "service": "sglang-lite",
@@ -292,10 +292,10 @@ async fn healthz() -> Json<serde_json::Value> {
 }
 
 /// GET /metrics — Phase 1 observability
-async fn metrics() -> Result<String, (axum::http::StatusCode, String)> {
-    let mut output = String::from("# sglang-lite metrics (Phase 1)\n");
-
-    if let Some(base) = PYTHON_CORE_URL.as_ref() {
+pub async fn metrics(
+    State(state): State<AppState>,
+) -> Result<String, (axum::http::StatusCode, String)> {
+    if let Some(base) = state.core_url.as_ref() {
         let client = reqwest::Client::new();
         let url = format!("{}/metrics", base.trim_end_matches('/'));
         if let Ok(resp) = client.get(&url).send().await {
@@ -308,6 +308,7 @@ async fn metrics() -> Result<String, (axum::http::StatusCode, String)> {
     }
 
     // Fallback basic metrics
+    let mut output = String::from("# sglang-lite metrics (Phase 1)\n");
     output.push_str("sglang_lite_phase 1\n");
     output.push_str("sglang_lite_up 1\n");
     Ok(output)
@@ -321,5 +322,6 @@ fn json_error(typ: &str, message: &str, code: &str) -> String {
             "param": null,
             "code": code
         }
-    }).to_string()
+    })
+    .to_string()
 }

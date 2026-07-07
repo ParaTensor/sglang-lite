@@ -143,8 +143,8 @@ No serving or high-level orchestration in sglang-lite. See `examples/` for drive
 ## Quick Start (current stub state)
 
 ```bash
-# Rust API (stub)
-cargo run -p sglang-lite-api -- serve --port 8000
+# Rust serving wrapper (thin standalone)
+cargo run -p sglang-lite-serving
 
 # or Python stub
 python -m sglang_lite.server
@@ -202,7 +202,7 @@ python -m sglang_lite.server \
 Or use the Rust binary which proxies to a Python core:
 
 ```bash
-SGLANG_LITE_PYTHON_CORE=http://localhost:9001 ./target/debug/sglang-lite --port 8000
+SGLANG_LITE_PYTHON_CORE=http://localhost:9001 PORT=8000 ./target/debug/sglang-lite-serving
 ```
 
 ### Environment variables (for Config.from_env)

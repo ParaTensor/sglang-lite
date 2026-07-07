@@ -56,6 +56,67 @@ sglang-lite 是一个**极致高内聚的 Token Factory（令牌工厂）**。
 - 任何影响 OpenAI 契约或调度决策的变更必须补充测试
 - 提交前运行格式化与检查
 
+## 目录结构规范（按功能划分，保持根目录极简）
+
+sglang-lite 强调高内聚与整洁，**根目录严禁堆放非核心内容**。
+
+推荐采用**功能目录**组织（优于纯语言划分）：
+
+**根目录仅允许：**
+- 构建与元数据：pyproject.toml、Cargo.toml、README.md、AGENTS.md、.gitignore 等
+- 文档：docs/
+- 轻量示例：examples/
+
+**核心功能目录：**
+- `engine/` — **执行核心库**（功能目录）：sglang-lite 纯引擎的 Python 实现（RadixKVCache、Scheduler、ModelRunner + LiteEngine）。package 内容直接放这里，通过 pyproject.toml 的 package-dir 映射为 `import sglang_lite`。这是项目的“Token Factory”主体。
+- `control/` — **Rust 控制面库**（**纯 Rust** 实现）
+  - sglang-lite 的薄控制面：OpenAI 协议最小解析/适配、请求验证、early reject、streaming 控制、内部 GenerationRequest / TokenDelta 协议。
+  - 全部内容用 Rust 编写。
+  - 极薄：只提供最小控制点，真实完整的 serving（OpenAI 表面、driver 等）由 Unigateway（外部 Rust）提供。
+  - 严禁任何 Python 代码或重型 serving 逻辑。OpenAI 解析在此仅为薄适配。
+- `serving/` — **Rust 可执行服务包装层**（**纯 Rust** 实现）
+  - 组合 `control/` 库形成的可运行 standalone wrapper。
+  - 真实完整 serving 由 Unigateway（外部 Rust）实现；此层仅用于本地测试和演示。
+- `scripts/` — 开发/基准/工具脚本
+- `tests/` — 测试代码
+
+**严禁放在根目录的内容必须归类：**
+- 演示脚本 → `scripts/` 或 `examples/`
+- 基准测试脚本 → `scripts/benchmark.py` 或 `serving/`
+- 其他开发脚本 → `scripts/`
+- 控制面库 → `control/`
+- 完整服务 / 可执行 wrapper → `serving/`
+
+**实践要求：**
+- 优先使用功能目录（engine/、control/、serving/、scripts/）。
+- 新增控制面相关代码必须放入 `control/`。
+- 新增 serving 包装或可执行入口代码必须放入 `serving/`。
+- 提交前检查：`find . -maxdepth 1 -name "*.py" | head -5`，确保根目录干净。
+- 移动后同步更新引用和 AGENTS.md。
+- `serving/` 内的代码必须保持薄：只负责组合，不实现核心逻辑。OpenAI 协议解析等最小适配可保留作为 sglang-lite 控制点，但完整实现应在 Unigateway。
+- examples/ 用于演示；serving/ 用于生产级完整服务包装。
+- 核心库使用功能名 `engine/`（执行核心，sglang_lite 包文件直接放在这里），避免用“python/”这类语言名目录。
+
+## 模块边界定义（严格遵守）
+
+| 模块               | 位置                  | 职责范围                                                                 | 严格禁止                                                                 |
+|--------------------|-----------------------|--------------------------------------------------------------------------|--------------------------------------------------------------------------|
+| **核心引擎库**    | `engine/`（功能目录，直接放 sglang_lite 包文件） | KVCache (Radix)、Scheduler、Batching、ModelRunner、核心执行。提供干净的 LiteEngine / building blocks。这是纯库的主体。 | 实现 serving、完整 OpenAI 服务器、routing、auth、metrics 聚合、配置管理。 |
+| **Rust 控制面库** | `control/` | OpenAI 最小协议适配、请求验证、streaming、内部 GenerationRequest / TokenDelta 协议、engine 客户端。**极薄**，真实完整 serving 由 Unigateway（Rust）实现。 | 实现重型 serving、业务逻辑、完整 OpenAI 表面（这些应在 Unigateway）。 |
+| **Rust Serving 包装层** | `serving/` | 可执行 wrapper，组合 `control/` 对外提供 HTTP 服务。真实完整 serving 由 Unigateway（Rust）实现。 | 实现核心引擎逻辑、重型 serving、业务逻辑。 |
+| **示例**          | `examples/`          | 薄演示如何使用核心库或简单服务器。                                       | 作为生产服务代码。                                                       |
+| **脚本**          | `scripts/`           | 开发工具、基准、demo 脚本。                                              | 生产服务入口。                                                           |
+| **文档**          | `docs/`              | 架构、scope、边界说明。                                                  | 代码实现。                                                               |
+
+**关键边界原则**：
+- sglang-lite 永远是**纯引擎库**（Token Factory）。
+- **全部 serving 逻辑由 Unigateway（Rust）实现**。
+- `control/` 是 sglang-lite 的 Rust 控制面库（薄 OpenAI 协议适配 + 内部协议）。保持极薄，完整实现和重型逻辑在 Unigateway。OpenAI 解析在此仅为最小适配。
+- `serving/` 是 sglang-lite 的 Rust 可执行服务包装层（组合 `control/`）。真实完整 serving 由 Unigateway 实现。
+- 严禁在 sglang-lite 实现完整 OpenAI 表面或业务逻辑。
+- 任何跨越边界的变更必须先更新本文件 + docs/scope.md + docs/architecture.md。
+- 新功能先问：它属于核心引擎、控制面、还是 serving 包装层？
+
 ## 模型支持策略
 
 **只支持主流 MoE 模型**（DeepSeek、Qwen-MoE、Mixtral 等）。Dense 模型不在支持范围内。

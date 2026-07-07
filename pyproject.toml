@@ -28,10 +28,9 @@ dev = ["ruff", "pytest"]
 # pip install "sglang-lite[flashinfer]"
 flashinfer = ["flashinfer>=0.1.0"]  # install via --extra-index-url https://flashinfer.ai/whl/cu121/torch2.4/ etc.
 
-[tool.setuptools.packages.find]
-where = ["python"]
-include = ["sglang_lite*"]
-exclude = ["sglang_lite.server*"]
+[tool.setuptools]
+packages = ["sglang_lite"]
+package-dir = { "sglang_lite" = "engine" }
 
 [tool.ruff]
 line-length = 100

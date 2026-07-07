@@ -2,6 +2,9 @@
 //!
 //! This is the clean boundary. The Rust layer translates the (potentially messy)
 //! OpenAI request into this, and the core only ever sees this.
+//!
+//! Note: Full/complex OpenAI parsing and serving drivers live in Unigateway.
+//! This file is minimal adapter only.
 
 use serde::{Deserialize, Serialize};
 

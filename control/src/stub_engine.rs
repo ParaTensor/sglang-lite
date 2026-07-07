@@ -12,14 +12,19 @@ use crate::protocol::{GenerationRequest, GenerationResult, TokenDelta, Usage};
 use once_cell::sync::Lazy;
 
 /// If set, forward GenerationRequest to this Python core HTTP endpoint.
-static PYTHON_CORE_URL: Lazy<Option<String>> = Lazy::new(|| {
-    std::env::var("SGLANG_LITE_PYTHON_CORE").ok()
-});
+static PYTHON_CORE_URL: Lazy<Option<String>> =
+    Lazy::new(|| std::env::var("SGLANG_LITE_PYTHON_CORE").ok());
 
 /// Very simple stub that produces deterministic but realistic-looking output.
 /// It simulates prefill + decode time and can pretend to do prefix cache hits.
 pub struct StubEngineClient {
     // In real version this will hold connection to python core or in-process handle.
+}
+
+impl Default for StubEngineClient {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StubEngineClient {
@@ -76,8 +81,16 @@ impl StubEngineClient {
                             let _ = tx
                                 .send(TokenDelta {
                                     text: format!("{} ", w),
-                                    finish_reason: if is_last { Some("stop".to_string()) } else { None },
-                                    usage: if is_last { Some(res.usage.clone()) } else { None },
+                                    finish_reason: if is_last {
+                                        Some("stop".to_string())
+                                    } else {
+                                        None
+                                    },
+                                    usage: if is_last {
+                                        Some(res.usage.clone())
+                                    } else {
+                                        None
+                                    },
                                 })
                                 .await;
                             tokio::time::sleep(std::time::Duration::from_millis(6)).await;
@@ -117,7 +130,11 @@ impl StubEngineClient {
 
                 let delta = TokenDelta {
                     text: format!("{} ", tok),
-                    finish_reason: if is_last { Some("stop".to_string()) } else { None },
+                    finish_reason: if is_last {
+                        Some("stop".to_string())
+                    } else {
+                        None
+                    },
                     usage: if is_last {
                         Some(Usage {
                             prompt_tokens,
@@ -148,7 +165,9 @@ fn estimate_prompt_tokens(req: &GenerationRequest) -> u32 {
     let mut n = 0u32;
     for m in &req.messages {
         match m {
-            crate::openai::ChatMessage::System { content, .. } => n += (content.len() as u32) / 3 + 4,
+            crate::openai::ChatMessage::System { content, .. } => {
+                n += (content.len() as u32) / 3 + 4
+            }
             crate::openai::ChatMessage::User { content, .. } => n += (content.len() as u32) / 3 + 4,
             crate::openai::ChatMessage::Assistant { content, .. } => {
                 if let Some(c) = content {
@@ -177,7 +196,10 @@ fn simulate_completion(req: &GenerationRequest, seed: u64) -> Vec<String> {
     let lower = last_user.to_lowercase();
 
     if lower.contains("hello") || lower.contains("hi ") || lower == "hi" {
-        return "Hello! How can I help you today? I'm running in sglang-lite Phase 0 stub mode.".split_whitespace().map(|s| s.to_string()).collect();
+        return "Hello! How can I help you today? I'm running in sglang-lite Phase 0 stub mode."
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
     }
     if lower.contains("who are you") || lower.contains("what are you") {
         return "I am sglang-lite, a minimal high-coherence inference engine. Radix KV cache and continuous batching are the focus.".split_whitespace().map(|s| s.to_string()).collect();
@@ -230,11 +252,23 @@ async fn forward_blocking(base: &str, req: GenerationRequest) -> Result<Generati
             prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
             completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
             total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
-            cache_hit_tokens: u.get("cache_hit_tokens").and_then(|v| v.as_u64()).map(|v| v as u32),
+            cache_hit_tokens: u
+                .get("cache_hit_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
         }
     } else {
-        Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cache_hit_tokens: None }
+        Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cache_hit_tokens: None,
+        }
     };
 
-    Ok(GenerationResult { text, finish_reason: fr, usage })
+    Ok(GenerationResult {
+        text,
+        finish_reason: fr,
+        usage,
+    })
 }
