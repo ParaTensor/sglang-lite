@@ -274,8 +274,10 @@ def main():
 # ---------------- gRPC support (to correspond with unigateway gRPC client skeleton) ----------------
 HAS_GRPC = False
 try:
-    from sglang_lite import sglang_lite_pb2 as pb2
-    from sglang_lite import sglang_lite_pb2_grpc as pb2_grpc
+    # gRPC generated code is kept out of the engine package; it is an integration artifact.
+    sys.path.insert(0, "examples/grpc")
+    import sglang_lite_pb2 as pb2
+    import sglang_lite_pb2_grpc as pb2_grpc
     import grpc
     from concurrent import futures
 
