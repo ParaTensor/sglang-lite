@@ -142,7 +142,9 @@ class Scheduler:
 
         # Commit this prefix (including the newly computed part) into the radix tree
         full_prompt = seq.input_ids[: seq.cached_len]
-        self.radix.insert_or_update(full_prompt, new_kv_state, seq.cached_len)
+        self.radix.insert_or_update(
+            full_prompt, new_kv_state, seq.cached_len, block_ids=list(seq.block_table)
+        )
 
     def update_after_decode(
         self,

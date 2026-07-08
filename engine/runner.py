@@ -300,16 +300,15 @@ class ModelRunner:  # kept for backward compat in examples; prefer MoEModelRunne
                 v_new = v_new.to(device=self.device, dtype=torch.float16)
                 if k_new.dim() != 3 or k_new.shape[1] != self.num_kv_heads:
                     # stub or legacy kv shape not (s, heads, d); use dummy shaped for paged append test
-                    alen = max(1, k_new.shape[0] if k_new.dim() > 0 else 1)
                     k_new = torch.randn(
-                        alen,
+                        append_len,
                         self.num_kv_heads,
                         self.head_dim,
                         device=self.device,
                         dtype=torch.float16,
                     )
                     v_new = torch.randn(
-                        alen,
+                        append_len,
                         self.num_kv_heads,
                         self.head_dim,
                         device=self.device,
@@ -389,16 +388,16 @@ class ModelRunner:  # kept for backward compat in examples; prefer MoEModelRunne
                 k_new = k_new.to(device=self.device, dtype=torch.float16)
                 v_new = v_new.to(device=self.device, dtype=torch.float16)
                 if k_new.dim() != 3 or k_new.shape[1] != self.num_kv_heads:
-                    alen = max(1, k_new.shape[0] if k_new.dim() > 0 else 1)
+                    # decode appends exactly one token
                     k_new = torch.randn(
-                        alen,
+                        1,
                         self.num_kv_heads,
                         self.head_dim,
                         device=self.device,
                         dtype=torch.float16,
                     )
                     v_new = torch.randn(
-                        alen,
+                        1,
                         self.num_kv_heads,
                         self.head_dim,
                         device=self.device,
@@ -497,13 +496,24 @@ class ModelRunner:  # kept for backward compat in examples; prefer MoEModelRunne
         positions = torch.arange(
             append_base, append_base + append_len, dtype=torch.int32, device=dev
         )
-        kv_indices = torch.tensor(seq.block_table, dtype=torch.int32, device=dev)
+        # Ensure block table has enough pages for append_base + append_len tokens,
+        # and trim to exactly the pages flashinfer should see. The last page in the
+        # trimmed table is the page we are appending into; its pre-append length is
+        # kv_last_page_len.
+        pages_with_data = (
+            (append_base + radix.block_size - 1) // radix.block_size if append_base > 0 else 0
+        )
+        pages_after_append = (append_base + append_len + radix.block_size - 1) // radix.block_size
+        total_pages = max(pages_with_data, pages_after_append)
+        while len(seq.block_table) < total_pages:
+            seq.block_table.extend(radix.allocate_blocks(1))
+        active_blocks = seq.block_table[:total_pages]
+
+        kv_indices = torch.tensor(active_blocks, dtype=torch.int32, device=dev)
         kv_indptr = torch.tensor([0, kv_indices.numel()], dtype=torch.int32, device=dev)
-        # last page len: how many tokens in the last used page for this seq
-        total_after = append_base + append_len
-        last_len = total_after % radix.block_size
-        if last_len == 0:
-            last_len = radix.block_size
+        # last page len: number of tokens already stored in the LAST page of active_blocks
+        # BEFORE this append (0 when the last page is a freshly allocated empty page)
+        last_len = append_base % radix.block_size if append_base > 0 else 0
         kv_last_page_len = torch.tensor([last_len], dtype=torch.int32, device=dev)
         k_cache_l = radix.k_cache[layer_idx]
         v_cache_l = radix.v_cache[layer_idx]

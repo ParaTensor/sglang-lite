@@ -14,6 +14,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import time
@@ -46,6 +47,7 @@ app = FastAPI(title="sglang-lite Python Core (real engine)")
 
 # Global engine
 ENGINE: Optional[LiteEngine] = None
+ENGINE_LOCK = asyncio.Lock()
 
 
 @app.middleware("http")
@@ -111,12 +113,13 @@ async def generate(req: GenRequest, request: Request):
     input_ids = _extract_input_ids(req)
 
     _log("generate_start", request_id=rid, max_tokens=req.max_tokens)
-    result = ENGINE.generate(
-        rid,
-        input_ids,
-        max_tokens=req.max_tokens,
-        temperature=req.temperature,
-    )
+    async with ENGINE_LOCK:
+        result = ENGINE.generate(
+            rid,
+            input_ids,
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+        )
     _log("generate_end", request_id=rid, finish_reason=result.get("finish_reason"))
     return GenResult(
         text=result["text"],
@@ -150,32 +153,37 @@ async def chat_completions(req: OpenAIChatRequest, request: Request):
     if req.stream:
 
         async def stream_gen():
-            for delta in ENGINE.generate_stream(
-                rid, input_ids, max_tokens=req.max_tokens or 128, temperature=req.temperature or 0.7
-            ):
-                chunk = {
-                    "id": rid,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": req.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": delta.get("text", "")}
-                            if delta.get("text")
-                            else {},
-                            "finish_reason": delta.get("finish_reason"),
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
+            async with ENGINE_LOCK:
+                for delta in ENGINE.generate_stream(
+                    rid,
+                    input_ids,
+                    max_tokens=req.max_tokens or 128,
+                    temperature=req.temperature or 0.7,
+                ):
+                    chunk = {
+                        "id": rid,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": req.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": delta.get("text", "")}
+                                if delta.get("text")
+                                else {},
+                                "finish_reason": delta.get("finish_reason"),
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream_gen(), media_type="text/event-stream")
     else:
-        result = ENGINE.generate(
-            rid, input_ids, max_tokens=req.max_tokens or 128, temperature=req.temperature or 0.7
-        )
+        async with ENGINE_LOCK:
+            result = ENGINE.generate(
+                rid, input_ids, max_tokens=req.max_tokens or 128, temperature=req.temperature or 0.7
+            )
         response = {
             "id": rid,
             "object": "chat.completion",
@@ -199,12 +207,13 @@ async def generate_stream(req: GenRequest):
     input_ids = _extract_input_ids(req)
 
     async def event_generator():
-        for delta in ENGINE.generate_stream(
-            rid, input_ids, max_tokens=req.max_tokens, temperature=req.temperature
-        ):
-            import json
+        async with ENGINE_LOCK:
+            for delta in ENGINE.generate_stream(
+                rid, input_ids, max_tokens=req.max_tokens, temperature=req.temperature
+            ):
+                import json
 
-            yield f"data: {json.dumps(delta)}\n\n"
+                yield f"data: {json.dumps(delta)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

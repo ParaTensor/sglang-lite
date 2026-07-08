@@ -169,17 +169,28 @@ class RadixCache:
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # (k, v) for new tokens, shape (num_new, num_heads, head_dim) or per layer?
         prefix_len: int = 0,
+        block_ids: Optional[List[int]] = None,
     ) -> List[int]:
         """
         Walk/create the path and allocate/store paged blocks for new tokens.
         For paged + FlashInfer.
 
         kv_tensors: for simplicity in transition, expect per-layer? But start simple.
+        block_ids: if provided (e.g. from the runner's paged block table), use them
+            directly instead of allocating new blocks. This keeps the radix tree
+            block list consistent with the actual paged KV cache.
         Returns the list of new block ids allocated for this append.
         """
         node = self.tree.insert_path(token_ids)
 
         new_block_ids: List[int] = []
+
+        if kv_tensors is not None and block_ids is not None:
+            # Runner already allocated pages and appended KV via flashinfer;
+            # just record the block table on the radix node for prefix sharing.
+            node.block_ids = list(block_ids)
+            node.prefix_len = prefix_len + len(token_ids)
+            return list(block_ids)
 
         if kv_tensors is not None:
             # Handle legacy PastKV list or single (k,v)
