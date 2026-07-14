@@ -17,7 +17,7 @@ sglang-lite is a **pure library** exposing three further-decomposed building blo
 
 **Critical boundary**: Communication with sglang-lite must use HTTP or gRPC only. PyO3 or direct in-process embedding is not used, to preserve unigateway as a general SDK.
 
-**vLLM compatibility boundary**: sglang-lite must be compatible with vLLM as a peer `local-inference` backend at the protocol/capability/metrics layer, but it does not inherit vLLM's broad model/API/feature scope. External abstractions should use generic names (`PrefixCache`, `BlockKVCache`, `ContinuousScheduler`, `ModelExecutor`, `BackendCapabilities`) rather than Radix- or SGLang-only concepts.
+**vLLM compatibility boundary**: KV cache management/prefix reuse, continuous scheduling, and model execution are shared engine capabilities in both SGLang and vLLM; RadixKVCache, BatchingScheduler, and MoEModelRunner are sglang-lite's implementations of them. sglang-lite must be compatible with vLLM as a peer `local-inference` backend at the protocol/capability/metrics layer, but it does not inherit vLLM's broad model/API/feature scope. External abstractions should use generic names (`PrefixCache`, `BlockKVCache`, `ContinuousScheduler`, `ModelExecutor`, `BackendCapabilities`) rather than Radix- or SGLang-only concepts.
 
 ## Classification Rules
 

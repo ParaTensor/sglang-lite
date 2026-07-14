@@ -2,11 +2,54 @@
 
 本文回答一个边界问题：sglang-lite 目前明显参考了 SGLang 的 RadixAttention 路线，但是否也应该考虑 vLLM 的定位与兼容性？
 
-结论：**需要兼容 vLLM 的“后端定位”和协议生态，但不追求兼容 vLLM 的完整功能面或内部实现。**
+结论分两层：
+
+1. **之前从 SGLang 提炼的三个核心能力，在 vLLM 中同样成立。**
+2. **需要兼容 vLLM 的后端定位和协议生态，但不追求兼容 vLLM 的完整功能面或内部实现。**
 
 sglang-lite 应该被定义为 `local-inference backend` 家族中的一个 MoE 优化后端；vLLM 是同一层级的通用后端。UniGateway 面向两者暴露统一的 provider/driver/capability 抽象，而不是把 UniGateway 的核心抽象绑定到 SGLang 或 sglang-lite。
 
-## 1. vLLM 的相关定位
+## 1. 三个核心能力是否同样适用于 vLLM
+
+**是，完全适用于能力层；不等于内部实现可以直接互换。**
+
+之前基于 SGLang 总结的核心，不应该命名为 SGLang 专属组件，而应该先定义成三类引擎通用职责：
+
+| 通用核心能力 | sglang-lite / SGLang 路线 | vLLM 路线 | 共同语义 |
+| --- | --- | --- | --- |
+| KV cache management + prefix reuse | RadixKVCache / RadixAttention | KVCacheManager + APC + PagedAttention blocks | KV 分配、block/page 生命周期、引用/释放、淘汰、前缀命中 |
+| Continuous scheduling | BatchingScheduler | vLLM V1 Scheduler | waiting/running 状态、token budget、prefill/decode 混合、batch formation |
+| Model execution | MoEModelRunner + KernelBackend/CUDA graph | GPUModelRunner / Worker + CUDA graph/compile | model forward、sampling、KV 写入、kernel/backend 选择、MoE routing |
+
+因此原来的三个核心组件可以保留为 **sglang-lite 的实现名称**，但架构层应该使用：
+
+```text
+KVCacheManager / PrefixCache / BlockKVCache
+ContinuousScheduler
+ModelExecutor
+```
+
+需要区分：
+
+- **能力相同**：两者都必须解决 KV 生命周期、持续调度和模型执行。
+- **机制不同**：SGLang/sglang-lite 偏 Radix tree；vLLM 偏 block table + hash-based APC。
+- **内部接口不同**：cache key、block ownership、scheduler state、runner input 都不能假设可直接互换。
+- **外部可统一**：健康检查、请求/流式协议、capability、request id、cache-hit metrics 可以由 UniGateway 统一。
+
+所以正确的架构不是“把 vLLM 再接进一个 SGLang 模型”，而是：
+
+```text
+                       LocalInferenceBackend
+                               │
+            ┌──────────────────┴──────────────────┐
+            │                                     │
+       sglang-lite                              vLLM
+  RadixKVCache / Scheduler / Runner    KVCacheManager / Scheduler / Runner
+            │                                     │
+            └──── shared protocol + capabilities ─┘
+```
+
+## 2. vLLM 的相关定位
 
 vLLM V1 的公开设计重点包括：
 
@@ -24,7 +67,7 @@ vLLM V1 的公开设计重点包括：
 - vLLM automatic prefix caching: https://docs.vllm.ai/en/stable/features/automatic_prefix_caching/
 - vLLM V1 architecture blog: https://blog.vllm.ai/2025/01/27/v1-alpha-release.html
 
-## 2. sglang-lite 与 vLLM 的定位差异
+## 3. sglang-lite 与 vLLM 的定位差异
 
 | 维度 | vLLM | sglang-lite |
 | --- | --- | --- |
@@ -40,7 +83,7 @@ vLLM V1 的公开设计重点包括：
 
 > 一个 MoE-only、prefix-heavy workloads 优先的 local inference backend；通过 UniGateway 与 vLLM 共享 OpenAI-compatible 协议、provider capability 和观测指标抽象。
 
-## 3. 兼容层级
+## 4. 兼容层级
 
 ### P0：协议兼容
 
@@ -118,7 +161,7 @@ sglang-lite 内部仍可以使用 RadixKVCache，但对外不要暴露 RadixTree
 
 这允许 UniGateway 的 KV-affinity、prefix-cache-aware routing、metrics aggregation 同时兼容 sglang-lite 与 vLLM。
 
-## 4. 可借鉴但不照搬的 vLLM 设计
+## 5. 可借鉴但不照搬的 vLLM 设计
 
 ### 值得吸收
 
@@ -136,7 +179,7 @@ sglang-lite 内部仍可以使用 RadixKVCache，但对外不要暴露 RadixTree
 - Structured output、dynamic LoRA、spec decode、PD disaggregation。
 - 直接复用 vLLM scheduler/KVCacheManager 内部实现，导致 lite 失去可理解性。
 
-## 5. 对现有文档/实现的调整要求
+## 6. 对现有文档/实现的调整要求
 
 1. `README.md`、`architecture.md`、`scope.md` 必须把外部抽象从 “SGLang/Radix 特化” 提升到 “local inference backend + generic prefix cache capability”。
 2. UniGateway 需求中应明确：`SglangLiteDriver` 是 `LocalInferenceDriver` 家族的一个实现；vLLM 应作为同层级 backend 兼容。
@@ -144,7 +187,7 @@ sglang-lite 内部仍可以使用 RadixKVCache，但对外不要暴露 RadixTree
 4. sglang-lite 的 Paged/block KV 设计要兼容 vLLM-style block table 语义，但实现可继续保持 Radix-first。
 5. 不要为追求 vLLM 兼容而扩大 core scope；不在 core 支持 dense/multimodal/structured output。
 
-## 6. 选择建议
+## 7. 选择建议
 
 | 场景 | 优先选择 |
 | --- | --- |

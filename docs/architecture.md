@@ -2,9 +2,17 @@
 
 ## Guiding Principle: High Cohesion + Composability
 
-sglang-lite remains a **pure library** whose job is to provide the three core building blocks for a MoE "Token Factory". These three must stay reasonably cohesive for performance, but we further decompose them internally so that unigateway (as the driver) can compose and control higher-level policies.
+sglang-lite remains a **pure library** whose job is to provide the three core capabilities for a MoE "Token Factory". These capabilities are not SGLang-specific; they are the same engine-level responsibilities found in vLLM:
 
-Core three (still the only deeply coupled pieces):
+| Engine-neutral capability | sglang-lite / SGLang-oriented implementation | vLLM implementation |
+| --- | --- | --- |
+| KV lifecycle + prefix reuse | RadixKVCache / RadixAttention | KVCacheManager + APC + PagedAttention blocks |
+| Continuous token scheduling | BatchingScheduler | vLLM V1 Scheduler |
+| Model execution | MoEModelRunner + CUDA graph/kernel backend | GPUModelRunner / Worker + CUDA graph/compile |
+
+The shared capability model does **not** imply implementation or internal API compatibility. Each backend owns its scheduler state, cache indexing, block lifecycle, and execution path. UniGateway should depend on capability and protocol contracts, not these internal classes.
+
+sglang-lite realizes the three capabilities with these deeply coupled pieces:
 
 1. **RadixKVCache** (was KVCacheManager)
    - Composed of: RadixTree + KVAllocator + MemoryBudget + EvictionPolicy
@@ -46,6 +54,14 @@ unigateway acts as the **backend driver** for sglang-lite (the actual driver cod
 ## vLLM-compatible positioning
 
 sglang-lite's external position should be compatible with vLLM as another `local-inference` backend, while its internal implementation remains MoE-only and Radix-first.
+
+The primary conclusion is that the original three sglang-lite core capabilities also apply to vLLM. Compatibility therefore starts from a shared capability model:
+
+1. KV allocation, eviction, block lifecycle, and optional prefix reuse.
+2. Continuous scheduling across prefill/decode token work.
+3. Model execution, kernel selection, CUDA graph/compile, and MoE routing where supported.
+
+RadixAttention is only one implementation of the first capability; it must not define the generic backend contract.
 
 Compatibility target:
 

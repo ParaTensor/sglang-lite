@@ -40,6 +40,7 @@ References: nano-vLLM (~1.2k LOC teaching version), mini-sglang.
 
 sglang-lite is **not** a SGLang-only design and should not become a mini vLLM. It is a narrow MoE token factory that must remain compatible with vLLM at the **gateway/protocol/capability** layer:
 
+- The three core capabilities are engine-neutral and apply equally to SGLang and vLLM: KV/prefix-cache management, continuous scheduling, and model execution. SGLang uses RadixAttention-oriented implementations; vLLM uses KVCacheManager/APC/PagedAttention, the V1 Scheduler, and GPUModelRunner/Worker.
 - UniGateway should treat both sglang-lite and vLLM as `local-inference` backends.
 - Shared compatibility target: OpenAI-compatible chat completions, streaming, models, health, request-id passthrough, and generic prefix-cache metrics such as `usage.cache_hit_tokens`.
 - Internal concepts should map to generic names (`PrefixCache`, `BlockKVCache`, `ContinuousScheduler`, `ModelExecutor`) instead of leaking Radix/SGLang-specific terms into gateway core abstractions.
