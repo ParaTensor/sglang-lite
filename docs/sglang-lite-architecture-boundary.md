@@ -44,6 +44,17 @@ sglang-lite 是**极简的纯 MoE 引擎库**（Token Factory）。
 
 **目标**：让 sglang-lite 变得更小、更专注，unigateway 作为通用驱动层灵活集成。
 
+### 与 vLLM 的兼容边界
+
+sglang-lite 不应被设计成 SGLang 专用后端，也不应追求 vLLM 功能面全兼容。更合理的定位是：sglang-lite 与 vLLM 都是 unigateway 下的 `local-inference` backend。
+
+- unigateway core 使用通用抽象：`PrefixCache`、`BlockKVCache`、`ContinuousScheduler`、`ModelExecutor`、`BackendCapabilities`。
+- sglang-lite 内部继续保持 RadixKVCache + MoE-aware batching；vLLM 内部可使用 APC + PagedAttention。
+- 两者在协议层共享 OpenAI-compatible chat/stream/models/health、request id 透传、prefix-cache metrics（如 `usage.cache_hit_tokens`）。
+- vLLM 的宽 API（Responses、multimodal、LoRA、spec decode、disagg 等）不进入 sglang-lite core。
+
+详细评估见 `docs/vllm-positioning-compatibility.md`。
+
 ## 4. 进一步可剥离的内容
 
 - Tokenizer：彻底外部化，由调用方负责。

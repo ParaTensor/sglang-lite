@@ -37,9 +37,29 @@ unigateway acts as the **backend driver** for sglang-lite (the actual driver cod
 - Please keep UniGateway's core abstractions (`ProviderDriver`, registry, routing, etc.) completely general.
 - Do **not** introduce sglang-lite specific concepts into the core engine or protocol layers.
 - All MoE/Radix-specific logic must stay inside the sglang-lite driver implementation.
-- Treat sglang-lite the same way you would treat any other local or remote LLM backend.
+- Treat sglang-lite the same way you would treat any other local or remote LLM backend, including vLLM.
+- Prefer generic local-inference concepts (`PrefixCache`, `BlockKVCache`, `ContinuousScheduler`, `ModelExecutor`, `BackendCapabilities`) over SGLang/Radix-specific terms in UniGateway core.
 - **Critical boundary**: PyO3, direct Python embedding, or any in-process library calls are explicitly not used. All communication must go through HTTP or gRPC. This boundary is to keep UniGateway as a general-purpose embeddable SDK.
 - Detailed requirements document: `docs/unigateway-sglang-lite-requirements.md`
+- vLLM positioning document: `docs/vllm-positioning-compatibility.md`
+
+## vLLM-compatible positioning
+
+sglang-lite's external position should be compatible with vLLM as another `local-inference` backend, while its internal implementation remains MoE-only and Radix-first.
+
+Compatibility target:
+
+- **Protocol**: keep the minimal OpenAI-compatible chat completions surface aligned with vLLM's local server shape where in scope: `/v1/chat/completions`, streaming chunks, `/v1/models`, health, request-id passthrough, and OpenAI-shaped errors.
+- **Capabilities**: expose generic backend capabilities (`chat_completions`, `streaming`, `prefix_cache`, `prefix_cache_metric`, `moe_optimized`) rather than backend-name-specific checks.
+- **Metrics**: treat `usage.cache_hit_tokens` as a generic prefix-cache metric. It should be usable for both sglang-lite RadixKVCache and vLLM Automatic Prefix Caching.
+- **KV abstraction**: keep RadixKVCache as the default internal structure, but make block/page terminology compatible with vLLM-style KVCacheManager/PagedAttention concepts.
+
+Non-goals:
+
+- Do not implement vLLM's broad API surface in sglang-lite core (`/v1/responses`, audio, multimodal, embeddings for non-core models).
+- Do not expose vLLM-specific request parameters as stable sglang-lite contract unless they are part of the shared minimal sampling surface.
+- Do not import vLLM internals or copy its scheduler/KV manager wholesale.
+- Do not add dense, multimodal, LoRA, speculative decoding, or disaggregated serving to core for the sake of vLLM compatibility.
 
 ```
 Clients / unigateway (full gateway + driver)
@@ -133,6 +153,7 @@ class Scheduler:
 - Use HF `AutoModelForCausalLM` + `AutoTokenizer` initially for loading.
 - Later: direct safetensors weight loading + custom modeling files for speed (like nano-vLLM style).
 - Extension point: small model registry + loader trait.
+- vLLM compatibility is handled through protocol/capability mapping, not by expanding sglang-lite model scope to match vLLM.
 
 ## Observability
 

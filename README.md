@@ -36,6 +36,17 @@ References: nano-vLLM (~1.2k LOC teaching version), mini-sglang.
 
 **Scope note**: After re-evaluation, sglang-lite supports **only popular MoE models** (DeepSeek, Qwen-MoE, Mixtral-style, etc.). Dense models are explicitly out of scope. MoE routing and batching are first-class considerations, while keeping the overall design lightweight.
 
+## vLLM Positioning Compatibility
+
+sglang-lite is **not** a SGLang-only design and should not become a mini vLLM. It is a narrow MoE token factory that must remain compatible with vLLM at the **gateway/protocol/capability** layer:
+
+- UniGateway should treat both sglang-lite and vLLM as `local-inference` backends.
+- Shared compatibility target: OpenAI-compatible chat completions, streaming, models, health, request-id passthrough, and generic prefix-cache metrics such as `usage.cache_hit_tokens`.
+- Internal concepts should map to generic names (`PrefixCache`, `BlockKVCache`, `ContinuousScheduler`, `ModelExecutor`) instead of leaking Radix/SGLang-specific terms into gateway core abstractions.
+- vLLM-specific broad features (Responses API, multimodal, LoRA, spec decode, disaggregation, structured output backends) remain outside sglang-lite core.
+
+See **docs/vllm-positioning-compatibility.md** for the detailed comparison and compatibility strategy.
+
 ## Target Workloads (Priority)
 
 1. Multi-turn dialogue / Agent traffic (RadixAttention advantage is largest due to prefix sharing)

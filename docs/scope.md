@@ -17,6 +17,8 @@ sglang-lite is a **pure library** exposing three further-decomposed building blo
 
 **Critical boundary**: Communication with sglang-lite must use HTTP or gRPC only. PyO3 or direct in-process embedding is not used, to preserve unigateway as a general SDK.
 
+**vLLM compatibility boundary**: sglang-lite must be compatible with vLLM as a peer `local-inference` backend at the protocol/capability/metrics layer, but it does not inherit vLLM's broad model/API/feature scope. External abstractions should use generic names (`PrefixCache`, `BlockKVCache`, `ContinuousScheduler`, `ModelExecutor`, `BackendCapabilities`) rather than Radix- or SGLang-only concepts.
+
 ## Classification Rules
 
 - **重构 / Must Control** — Re-implement or own the logic. This is where complexity lives and where we gain long-term maintainability + differentiation.
@@ -31,9 +33,11 @@ sglang-lite is a **pure library** exposing three further-decomposed building blo
 | **API Layer (Rust)**           | POST /v1/chat/completions + streaming   | **重构**      | The contract. All external behavior decided here. Early scope enforcement.                        | -                                        | P0       |
 | **API Layer (Rust)**           | GET /v1/models + /healthz               | **重构**      | Minimal surface.                                                                                  | -                                        | P0       |
 | **API Layer (Rust)**           | Request validation & internal mapping   | **重构**      | Define clean GenerationRequest here.                                                              | -                                        | P0       |
+| **API Layer**                  | vLLM-compatible local inference subset  | **重构**      | Keep shared OpenAI-compatible chat/stream/models/health semantics so UniGateway can treat sglang-lite and vLLM as peer backends. | Generic `local-inference` capabilities   | P0       |
 | **API Layer (Rust)**           | Tool calls (function calling)           | **重构**      | Only placeholder shape + clear error. Execution belongs in harness.                               | Gateway layer                            | P1       |
 | **API Layer**                  | Structured / JSON mode                  | **不做**      | Requires FSM / constrained decoding. Breaks token-factory cohesion.                               | outlines / xgrammar in gateway           | -        |
 | **KV & Memory**                | RadixKVCache (composed of RadixTree + KVAllocator + Eviction) | **重构** | Core for MoE prefix sharing. Internal pieces are further decomposed for composability by the driver. | - (default) | P0       |
+| **KV & Memory**                | vLLM-style block/page KV compatibility  | Hybrid        | Keep block table / page terminology and metrics compatible with vLLM KVCacheManager/PagedAttention without adopting its full implementation. | Generic `BlockKVCache` facade            | P1       |
 | **KV & Memory**                | Memory budget / eviction policy         | **重构** (partial) | Can be replaced; unigateway may provide policy. | - | P1       |
 | **Scheduling**                 | BatchingScheduler (SequenceTable + BatchFormer) | **重构** | Core continuous batching. Admission/queueing peeled to unigateway driver. | - | P0       |
 | **Scheduling**                 | MoE-aware batch formation               | **重构** (partial) | BatchFormer can be supplied by unigateway. | - | P1       |
@@ -49,6 +53,7 @@ sglang-lite is a **pure library** exposing three further-decomposed building blo
 | **Advanced**                   | Prefill / Decode disaggregation         | **不做**      | Distributed systems concern, not single-node token factory.                                       | Future "advanced" mode                   | -        |
 | **Advanced**                   | Dynamic multi-LoRA / hot swap           | **不做**      | Huge complexity for narrow win.                                                                   | -                                        | -        |
 | **Advanced**                   | Multimodal encoders                     | **不做**      | Completely different data and execution path.                                                     | Separate multimodal service              | -        |
+| **Advanced**                   | vLLM feature-parity surface             | **不做**      | vLLM is a broad general serving engine; sglang-lite remains MoE-only and minimal.                  | Use vLLM as another UniGateway backend   | -        |
 | **Advanced**                   | Full expert parallelism + advanced load balancing | **Hybrid** | Lite focuses on efficient routing + batching + Radix on shared parts. Full EP is advanced. | Basic MoE in core; advanced EP later     | P1       |
 
 ## Summary Counts (MVP)
@@ -69,6 +74,7 @@ sglang-lite is an ultra-minimal pure library. Serving, config, observability, ad
 - Easy to reason about one request's journey through the system.
 - The three building blocks are internally decomposed for modularity. unigateway (the driver) owns the main loop and higher-level policies.
 - Dense models are explicitly out of scope.
+- vLLM is a peer backend to interoperate with through UniGateway, not a feature checklist to copy.
 - Serving, ops, and cross-cutting concerns are peeled to unigateway or dedicated thin layers. The core is a pure library.
 - Codebase should stay small enough that a single engineer can hold the mental model.
 
