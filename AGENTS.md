@@ -15,6 +15,7 @@ sglang-lite 是一个**极致高内聚的 Token Factory（令牌工厂）**。
 - **Rust 层是对外的控制点**（OpenAI 协议适配层）。所有请求验证、早期拒绝、streaming 控制、错误处理都必须在这里完成。
 - 一切业务逻辑（agent loop、structured output、多模态、tool calling 执行等）、serving、配置、详细可观测性**必须上移**到 unigateway / gateway 层或独立薄层。sglang-lite 是纯引擎库。
 - KV cache management、continuous scheduling、model execution 是 SGLang 与 vLLM 共有的三类引擎能力；RadixKVCache、BatchingScheduler、MoEModelRunner 只是 sglang-lite 的具体实现名称。
+- FlashInfer 是 kernel/backend library，不代表 vLLM 的完整引擎能力；不得以“接入 FlashInfer”为由扩大 sglang-lite scope 或宣称覆盖 vLLM 全部场景。
 - sglang-lite 与 vLLM 是 unigateway 下同层级的 `local-inference` backend。兼容目标是 OpenAI-compatible 协议、capability、request id 和 prefix-cache metrics，不追求 vLLM 功能面或内部实现兼容。
 - 遇到不确定时，**优先缩小 scope**，宁可删减功能，也不要增加复杂度。
 

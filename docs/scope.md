@@ -19,6 +19,8 @@ sglang-lite is a **pure library** exposing three further-decomposed building blo
 
 **vLLM compatibility boundary**: KV cache management/prefix reuse, continuous scheduling, and model execution are shared engine capabilities in both SGLang and vLLM; RadixKVCache, BatchingScheduler, and MoEModelRunner are sglang-lite's implementations of them. sglang-lite must be compatible with vLLM as a peer `local-inference` backend at the protocol/capability/metrics layer, but it does not inherit vLLM's broad model/API/feature scope. External abstractions should use generic names (`PrefixCache`, `BlockKVCache`, `ContinuousScheduler`, `ModelExecutor`, `BackendCapabilities`) rather than Radix- or SGLang-only concepts.
 
+**Replacement boundary**: FlashInfer is a kernel/backend dependency, not a complete inference engine. Combining it with sglang-lite and UniGateway may replace vLLM for supported MoE, prefix-heavy deployments, but does not expand this scope to vLLM's full model, hardware, distributed, quantization, multimodal, LoRA, or advanced decoding matrix.
+
 ## Classification Rules
 
 - **重构 / Must Control** — Re-implement or own the logic. This is where complexity lives and where we gain long-term maintainability + differentiation.

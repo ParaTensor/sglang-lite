@@ -49,7 +49,45 @@ ModelExecutor
             └──── shared protocol + capabilities ─┘
 ```
 
-## 2. vLLM 的相关定位
+## 2. sglang-lite + FlashInfer 是否能替代完整 vLLM
+
+**不能直接得出这个结论。能力同构不等于产品等价。**
+
+FlashInfer 的定位是 GPU kernel/backend library，主要覆盖 attention、paged KV、sampling、MoE 等算子与执行原语。它不能单独提供：
+
+- request/sequence scheduler 与抢占、公平性、chunked prefill 策略；
+- KV block 生命周期、prefix cache policy、内存预算和 OOM 恢复；
+- model registry、权重加载、量化兼容和 tokenizer/preprocessor；
+- tensor/pipeline/expert parallel 与多节点 worker 管理；
+- OpenAI API、streaming、错误兼容、部署和可观测性；
+- multimodal、LoRA、speculative decoding、pooling/embeddings 等产品能力。
+
+组合后的分层是：
+
+| 层 | 组件 | 负责内容 |
+| --- | --- | --- |
+| Gateway/control plane | UniGateway | API、routing、auth、metrics、lifecycle |
+| Engine core | sglang-lite | KV/cache policy、continuous scheduling、MoE model execution |
+| Kernel backend | FlashInfer/Triton/CUDA | attention、paged KV、sampling、MoE kernels |
+
+这套组合可以在明确边界内成为 vLLM 的替代方案：
+
+- 主流 MoE 模型；
+- 单机或受控的并行拓扑；
+- prefix-heavy chat/agent workload；
+- 固定且已验证的 dtype/quantization/kernel 组合；
+- 只要求最小 OpenAI chat/streaming surface。
+
+它不是 vLLM 的通用 drop-in replacement，除非继续补齐 vLLM 已经承担的广泛模型、硬件、分布式和高级功能矩阵。那样做会把 sglang-lite 重新建设成另一个通用大引擎，并违背 `lite` 的 scope。
+
+因此应明确两个目标：
+
+```text
+目标 A：在选定生产 workload 中替代 vLLM     -> 是，sglang-lite 的合理目标
+目标 B：覆盖 vLLM 的全部场景和功能矩阵       -> 否，不是 sglang-lite 的目标
+```
+
+## 3. vLLM 的相关定位
 
 vLLM V1 的公开设计重点包括：
 
@@ -67,7 +105,7 @@ vLLM V1 的公开设计重点包括：
 - vLLM automatic prefix caching: https://docs.vllm.ai/en/stable/features/automatic_prefix_caching/
 - vLLM V1 architecture blog: https://blog.vllm.ai/2025/01/27/v1-alpha-release.html
 
-## 3. sglang-lite 与 vLLM 的定位差异
+## 4. sglang-lite 与 vLLM 的定位差异
 
 | 维度 | vLLM | sglang-lite |
 | --- | --- | --- |
@@ -83,7 +121,7 @@ vLLM V1 的公开设计重点包括：
 
 > 一个 MoE-only、prefix-heavy workloads 优先的 local inference backend；通过 UniGateway 与 vLLM 共享 OpenAI-compatible 协议、provider capability 和观测指标抽象。
 
-## 4. 兼容层级
+## 5. 兼容层级
 
 ### P0：协议兼容
 
@@ -161,7 +199,7 @@ sglang-lite 内部仍可以使用 RadixKVCache，但对外不要暴露 RadixTree
 
 这允许 UniGateway 的 KV-affinity、prefix-cache-aware routing、metrics aggregation 同时兼容 sglang-lite 与 vLLM。
 
-## 5. 可借鉴但不照搬的 vLLM 设计
+## 6. 可借鉴但不照搬的 vLLM 设计
 
 ### 值得吸收
 
@@ -179,7 +217,7 @@ sglang-lite 内部仍可以使用 RadixKVCache，但对外不要暴露 RadixTree
 - Structured output、dynamic LoRA、spec decode、PD disaggregation。
 - 直接复用 vLLM scheduler/KVCacheManager 内部实现，导致 lite 失去可理解性。
 
-## 6. 对现有文档/实现的调整要求
+## 7. 对现有文档/实现的调整要求
 
 1. `README.md`、`architecture.md`、`scope.md` 必须把外部抽象从 “SGLang/Radix 特化” 提升到 “local inference backend + generic prefix cache capability”。
 2. UniGateway 需求中应明确：`SglangLiteDriver` 是 `LocalInferenceDriver` 家族的一个实现；vLLM 应作为同层级 backend 兼容。
@@ -187,7 +225,7 @@ sglang-lite 内部仍可以使用 RadixKVCache，但对外不要暴露 RadixTree
 4. sglang-lite 的 Paged/block KV 设计要兼容 vLLM-style block table 语义，但实现可继续保持 Radix-first。
 5. 不要为追求 vLLM 兼容而扩大 core scope；不在 core 支持 dense/multimodal/structured output。
 
-## 7. 选择建议
+## 8. 选择建议
 
 | 场景 | 优先选择 |
 | --- | --- |

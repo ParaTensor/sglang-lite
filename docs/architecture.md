@@ -12,6 +12,8 @@ sglang-lite remains a **pure library** whose job is to provide the three core ca
 
 The shared capability model does **not** imply implementation or internal API compatibility. Each backend owns its scheduler state, cache indexing, block lifecycle, and execution path. UniGateway should depend on capability and protocol contracts, not these internal classes.
 
+It also does not imply complete product equivalence. FlashInfer can provide attention, KV, sampling, and related GPU kernels, but it does not provide the scheduler, cache policy, model registry/loaders, distributed executor, broad feature surface, or production compatibility matrix that make up vLLM as a complete engine. `UniGateway + sglang-lite + FlashInfer` can replace vLLM only inside sglang-lite's deliberately narrow supported envelope.
+
 sglang-lite realizes the three capabilities with these deeply coupled pieces:
 
 1. **RadixKVCache** (was KVCacheManager)
