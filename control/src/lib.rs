@@ -1,13 +1,4 @@
-//! sglang-lite thin control plane library (OpenAI API layer + Python execution core client).
-//!
-//! This crate provides the minimal control point for the sglang-lite engine:
-//! - Strict OpenAI-compatible surface (minimal)
-//! - Early rejection of out-of-scope features
-//! - Clean internal request protocol to the engine core
-//!
-//! NOTE: This crate owns only the minimal single-engine serving contract.
-//! Broad protocol normalization, multi-backend routing, auth, and policy belong
-//! in an optional gateway such as Unigateway.
+//! sglang-lite thin control plane library (OpenAI API layer + engine client).
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -23,36 +14,45 @@ use axum::{
 };
 use futures::Stream;
 use std::convert::Infallible;
-use tokio::time::sleep;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 use uuid::Uuid;
 
+pub mod engine_client;
+pub mod http_engine;
 pub mod openai;
 pub mod protocol;
 pub mod stub_engine;
 
+pub use engine_client::EngineClient;
+pub use http_engine::HttpEngineClient;
 pub use openai::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Delta, Role};
 pub use protocol::GenerationRequest;
 pub use stub_engine::StubEngineClient;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub engine: Arc<StubEngineClient>,
+    pub engine: Arc<EngineClient>,
     pub model_list: Arc<Vec<String>>,
     pub core_url: Option<String>,
+    pub ready: Arc<std::sync::atomic::AtomicBool>,
+    pub draining: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Build the axum router for the sglang-lite control plane.
 pub fn build_router(
-    engine: Arc<StubEngineClient>,
+    engine: Arc<EngineClient>,
     model_list: Arc<Vec<String>>,
     core_url: Option<String>,
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    draining: Arc<std::sync::atomic::AtomicBool>,
 ) -> Router {
     let state = AppState {
         engine,
         model_list,
         core_url,
+        ready,
+        draining,
     };
 
     Router::new()
@@ -60,6 +60,7 @@ pub fn build_router(
         .route("/v1/models", get(list_models))
         .route("/healthz", get(healthz))
         .route("/v1/health", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
@@ -67,21 +68,25 @@ pub fn build_router(
 }
 
 /// Run a standalone HTTP server with the given configuration.
-///
-/// This is the minimal standalone serving entry point.
-/// Multi-backend gateway capabilities may be added by an upstream such as Unigateway.
 pub async fn serve(
-    engine: Arc<StubEngineClient>,
+    engine: Arc<EngineClient>,
     model_list: Arc<Vec<String>>,
     core_url: Option<String>,
     port: u16,
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    draining: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
-    let app = build_router(engine, model_list, core_url);
+    let app = build_router(engine, model_list, core_url, ready, draining);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("sglang-lite control plane listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("shutdown signal received");
+        })
+        .await?;
     Ok(())
 }
 
@@ -90,7 +95,30 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, String)> {
-    // === CONTROL POINT: early validation + scope enforcement ===
+    use std::sync::atomic::Ordering;
+
+    if state.draining.load(Ordering::Relaxed) {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            json_error(
+                "server_error",
+                "server is draining; not accepting new requests",
+                "draining",
+            ),
+        ));
+    }
+
+    if !state.ready.load(Ordering::Relaxed) {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            json_error(
+                "server_error",
+                "model not ready",
+                "not_ready",
+            ),
+        ));
+    }
+
     if !state.model_list.iter().any(|m| m == &req.model) {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
@@ -125,6 +153,20 @@ pub async fn chat_completions(
         ));
     }
 
+    // Reject clearly out-of-scope extras
+    for key in ["tools", "tool_choice", "logit_bias", "n", "functions"] {
+        if req.extra.contains_key(key) {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                json_error(
+                    "invalid_request_error",
+                    &format!("parameter '{}' is not supported in sglang-lite", key),
+                    "unsupported_parameter",
+                ),
+            ));
+        }
+    }
+
     let request_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
 
@@ -133,25 +175,24 @@ pub async fn chat_completions(
         model: req.model.clone(),
         messages: req.messages.clone(),
         max_tokens: req.max_tokens.unwrap_or(512),
-        temperature: req.temperature.unwrap_or(0.7),
-        top_p: req.top_p.unwrap_or(0.95),
+        temperature: req.temperature.unwrap_or(0.0),
+        top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k,
+        seed: req.seed,
         stop: req.stop.clone(),
         stream: req.stream.unwrap_or(false),
     };
 
     if gen_req.stream {
-        // Streaming path — SSE
-        let stream = stream_chat(state.engine, gen_req, created, request_id);
+        let stream = stream_chat(state.engine.clone(), gen_req, created, request_id);
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
-        // Non-streaming — collect then return
         let resp = state.engine.generate_blocking(gen_req).await.map_err(|e| {
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("engine error: {}", e),
+                json_error("server_error", &format!("engine error: {}", e), "engine_error"),
             )
         })?;
 
@@ -164,7 +205,6 @@ pub async fn chat_completions(
             finish_reason: Some(resp.finish_reason),
         };
 
-        // Convert protocol Usage -> openai Usage for the response surface
         let openai_usage = openai::Usage {
             prompt_tokens: resp.usage.prompt_tokens,
             completion_tokens: resp.usage.completion_tokens,
@@ -183,18 +223,18 @@ pub async fn chat_completions(
     }
 }
 
-/// SSE stream helper
+/// SSE stream helper — cancels engine work if the client disconnects.
 pub fn stream_chat(
-    engine: Arc<StubEngineClient>,
+    engine: Arc<EngineClient>,
     gen_req: GenerationRequest,
     created: i64,
     request_id: String,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
         let model = gen_req.model.clone();
+        let cancel_id = gen_req.request_id.clone();
         let mut token_stream = engine.generate_stream(gen_req).await;
 
-        // First chunk usually contains role
         let first = Event::default()
             .json_data(openai::ChatCompletionChunk {
                 id: request_id.clone(),
@@ -213,7 +253,14 @@ pub fn stream_chat(
             .unwrap_or_else(|_| Event::default().data("data: [ERROR]"));
         yield Ok(first);
 
+        let mut saw_finish = false;
         while let Some(delta) = token_stream.recv().await {
+            if let Some(err) = delta.error.clone() {
+                let ev = Event::default().data(format!("engine error: {}", err));
+                yield Ok(ev);
+                let _ = engine.cancel(&cancel_id).await;
+                break;
+            }
             let finish = delta.finish_reason.clone();
             let chunk = openai::ChatCompletionChunk {
                 id: request_id.clone(),
@@ -232,34 +279,23 @@ pub fn stream_chat(
 
             match Event::default().json_data(chunk) {
                 Ok(ev) => yield Ok(ev),
-                Err(_) => break,
+                Err(_) => {
+                    let _ = engine.cancel(&cancel_id).await;
+                    break;
+                }
             }
 
             if finish.is_some() {
+                saw_finish = true;
                 break;
             }
-
-            // tiny delay to make streaming visible in demos
-            sleep(Duration::from_millis(12)).await;
         }
 
-        // OpenAI style final empty chunk (some clients expect it)
-        let done = Event::default()
-            .json_data(serde_json::json!({
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop"
-                }]
-            }))
-            .unwrap_or_else(|_| Event::default().data("data: [DONE]"));
-        yield Ok(done);
+        // If the SSE consumer dropped early, cancel backend work.
+        if !saw_finish {
+            let _ = engine.cancel(&cancel_id).await;
+        }
 
-        // The official terminator
         yield Ok(Event::default().data("[DONE]"));
     }
 }
@@ -282,24 +318,46 @@ pub async fn list_models(State(state): State<AppState>) -> Json<openai::ModelsRe
     })
 }
 
-/// GET /healthz
+/// GET /healthz — liveness
 pub async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
         "service": "sglang-lite",
-        "phase": "1",
-        "note": "Production shell in progress"
     }))
 }
 
-/// GET /metrics — Phase 1 observability
+/// GET /readyz — readiness (model loaded + engine warm)
+pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+    if state.ready.load(Ordering::Relaxed) && state.engine.ready().await {
+        (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({"status": "ready"})),
+        )
+    } else {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "not_ready"})),
+        )
+    }
+}
+
+/// GET /metrics
 pub async fn metrics(
     State(state): State<AppState>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
     if let Some(base) = state.core_url.as_ref() {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let url = format!("{}/metrics", base.trim_end_matches('/'));
-        if let Ok(resp) = client.get(&url).send().await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
             if resp.status().is_success() {
                 if let Ok(body) = resp.text().await {
                     return Ok(body);
@@ -308,9 +366,7 @@ pub async fn metrics(
         }
     }
 
-    // Fallback basic metrics
-    let mut output = String::from("# sglang-lite metrics (Phase 1)\n");
-    output.push_str("sglang_lite_phase 1\n");
+    let mut output = String::from("# sglang-lite metrics\n");
     output.push_str("sglang_lite_up 1\n");
     Ok(output)
 }

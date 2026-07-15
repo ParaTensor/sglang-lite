@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang-lite"
-version = "0.1.1"
+version = "0.2.0"
 description = "sglang-lite Python execution core (pure library): Radix KV + MoE-aware continuous batching scheduler + model runner for popular MoE models"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,9 @@ dependencies = [
     "grpcio-tools>=1.60",
     # prometheus-client is optional (peeled to serving layer)
 ]
+
+[project.scripts]
+sglang-lite-engine = "sglang_lite.process:main"
 
 [project.optional-dependencies]
 dev = ["ruff", "pytest"]

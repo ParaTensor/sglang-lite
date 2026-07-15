@@ -8,6 +8,8 @@ This is the authoritative reference for what belongs in core vs. what gets pushe
 
 The engine focuses exclusively on popular MoE architectures (Mixtral-style, DeepSeek-style, Qwen-MoE, etc.). Dense models are out of scope. MoE support is first-class.
 
+**Verified / advertised MoE families** (see `engine/models.py`): Mixtral-style (`mistralai/Mixtral-8x7B-Instruct-v0.1`, …), Qwen-MoE, DeepSeek-MoE. Unverified ids are not listed on `GET /v1/models` until load succeeds. Local CI uses `fixture:<path>` tiny Mixtral weights. Dense models (Llama, Qwen2.5 dense, Mistral dense, …) are rejected.
+
 The `engine/` core is a **pure library** exposing three further-decomposed building blocks (RadixKVCache, BatchingScheduler, MoEModelRunner). The sglang-lite product also ships a thin standalone control/serving shell so it can serve users without SGLang, vLLM, or UniGateway.
 
 **Ownership boundary**:

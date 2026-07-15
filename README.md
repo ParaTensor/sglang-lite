@@ -157,14 +157,26 @@ UniGateway owns cross-backend routing, auth, rate limits, global policy, and agg
 - Optionally migrate scheduler/KV hotspots to Rust
 - Deep integration validation with unigateway (KV affinity, etc.)
 
-## Quick Start (current stub state)
+## Quick Start (standalone MoE service)
+
+Does **not** require SGLang, vLLM, or UniGateway.
 
 ```bash
-# Rust serving wrapper (thin standalone)
-cargo run -p sglang-lite-serving
+pip install -e .
+# Official entry: spawns Python engine process + Rust OpenAI control plane
+cargo run -p sglang-lite-serving -- serve \
+  --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
+  --device cuda \
+  --port 8000
 
-# or Python stub
-python -m sglang_lite.server
+# Control-plane only (no real model; for API tests)
+cargo run -p sglang-lite-serving -- serve --stub --port 8000
+```
+
+Engine process alone (internal GenerationRequest / TokenDelta NDJSON):
+
+```bash
+python -m sglang_lite.process --model mistralai/Mixtral-8x7B-Instruct-v0.1 --device cuda --port 9001
 ```
 
 Then:
@@ -173,15 +185,17 @@ Then:
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-ai/DeepSeek-V2-Lite-Chat",
+    "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "messages": [{"role":"user","content":"Hello"}],
     "max_tokens": 128,
     "stream": true
   }'
 ```
 
-See [docs/roadmap.md](docs/roadmap.md) and [docs/architecture.md](docs/architecture.md).
-The concrete work required to reach a standalone production service is tracked in
+Endpoints: `POST /v1/chat/completions`, `GET /v1/models`, `GET /healthz`, `GET /readyz`, `GET /metrics`.
+
+Supported families (MoE only): Mixtral-style, Qwen-MoE, DeepSeek-MoE. Dense models are rejected.
+See [docs/scope.md](docs/scope.md), [docs/architecture.md](docs/architecture.md), and
 [docs/standalone-inference-service-roadmap.md](docs/standalone-inference-service-roadmap.md).
 
 ## Contribution and Scope Discipline
@@ -194,8 +208,10 @@ Apache-2.0 (to be confirmed)
 
 ## Status
 
-Phase 1 in progress (MoE-focused production shell + metrics + robustness).
-See v0.1.0 for the last Phase 0 release (pre-MoE scope realignment). Not for production use yet.
+Phase 0 P0 standalone path is implemented: real MoE load (no silent stub fallback),
+Radix/paged KV with prefix skip, central engine loop, true Rust↔Python TokenDelta
+streaming, and `sglang-lite-serving serve`. P1 items (CUDA graph, quant matrix, TP)
+remain. Not a vLLM feature-parity substitute.
 
 See git history and docs for detailed design discussions.
 
