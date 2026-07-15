@@ -1,56 +1,226 @@
-//! sglang-lite-serving
+//! sglang-lite-serving — official standalone inference entry.
 //!
-//! **Thin Rust wrapper** for the sglang-lite inference engine.
-//!
-//! - This binary is the official minimal standalone service.
-//! - Broad OpenAI protocol support, multi-backend routing, auth, and policy stay in an optional gateway.
-//! - This crate only composes the `sglang-lite-control` library into a runnable standalone server.
-//! - See `control/` for the actual control plane logic.
+//! ```text
+//! sglang-lite-serving serve --model <moe> --device cuda --port 8000
+//! ```
 
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use sglang_lite_control::StubEngineClient;
+use anyhow::{anyhow, Context, Result};
+use clap::{Parser, Subcommand};
+use sglang_lite_control::{EngineClient, StubEngineClient};
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+#[derive(Parser, Debug)]
+#[command(name = "sglang-lite-serving")]
+#[command(about = "Official standalone MoE inference server for sglang-lite")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Start the OpenAI-compatible control plane + Python engine process
+    Serve {
+        /// MoE model id (or fixture:/path). Required unless --stub.
+        #[arg(long)]
+        model: Option<String>,
+
+        #[arg(long, default_value = "cuda")]
+        device: String,
+
+        #[arg(long, default_value_t = 8000)]
+        port: u16,
+
+        /// Internal Python engine HTTP port
+        #[arg(long, default_value_t = 9001)]
+        engine_port: u16,
+
+        /// Use in-process stub engine (no Python / no real model)
+        #[arg(long)]
+        stub: bool,
+
+        /// Do not spawn Python; connect to an already-running engine at this URL
+        #[arg(long)]
+        engine_url: Option<String>,
+
+        /// Extra verified model ids to advertise on GET /v1/models
+        #[arg(long)]
+        advertise: Vec<String>,
+    },
+}
+
+struct EngineChild {
+    child: Child,
+}
+
+impl Drop for EngineChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_python_engine(model: &str, device: &str, engine_port: u16) -> Result<EngineChild> {
+    let mut cmd = Command::new("python");
+    cmd.arg("-m")
+        .arg("sglang_lite.process")
+        .arg("--model")
+        .arg(model)
+        .arg("--device")
+        .arg(device)
+        .arg("--port")
+        .arg(engine_port.to_string())
+        .arg("--host")
+        .arg("127.0.0.1")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    if model == "stub" {
+        cmd.arg("--allow-stub");
+    }
+
+    let child = cmd
+        .spawn()
+        .context("failed to spawn python -m sglang_lite.process (is sglang-lite installed?)")?;
+    Ok(EngineChild { child })
+}
+
+async fn wait_engine_ready(url: &str, timeout: Duration) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .context("build reqwest client")?;
+    let readyz = format!("{}/readyz", url.trim_end_matches('/'));
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            return Err(anyhow!("engine not ready within {:?}", timeout));
+        }
+        if let Ok(resp) = client.get(&readyz).send().await {
+            if resp.status().is_success() {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Logging
+async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "sglang_lite=info,tower_http=debug".into()),
+                .unwrap_or_else(|_| "sglang_lite=info,tower_http=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8000);
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Serve {
+            model,
+            device,
+            port,
+            engine_port,
+            stub,
+            engine_url,
+            advertise,
+        } => {
+            run_serve(model, device, port, engine_port, stub, engine_url, advertise).await
+        }
+    }
+}
 
-    let core_url = std::env::var("SGLANG_LITE_PYTHON_CORE").ok();
+async fn run_serve(
+    model: Option<String>,
+    device: String,
+    port: u16,
+    engine_port: u16,
+    stub: bool,
+    engine_url: Option<String>,
+    advertise: Vec<String>,
+) -> Result<()> {
+    let ready = Arc::new(AtomicBool::new(false));
+    let draining = Arc::new(AtomicBool::new(false));
 
-    // Supported models (very limited in lite mode — this is intentional)
-    let supported_models: Vec<String> = vec![
-        "Qwen/Qwen2.5-7B-Instruct".to_string(),
-        "Qwen/Qwen2.5-72B-Instruct".to_string(),
-        "meta-llama/Meta-Llama-3.1-8B-Instruct".to_string(),
-        "meta-llama/Meta-Llama-3.1-70B-Instruct".to_string(),
-        "mistralai/Mistral-7B-Instruct-v0.3".to_string(),
-        // Add more only after explicit support + test
-    ];
+    let (engine, core_url, model_id, _child_guard): (
+        EngineClient,
+        Option<String>,
+        String,
+        Option<EngineChild>,
+    ) = if stub {
+        info!("starting in --stub mode (no real MoE model)");
+        (
+            EngineClient::Stub(StubEngineClient::new()),
+            None,
+            model.unwrap_or_else(|| "stub".into()),
+            None,
+        )
+    } else if let Some(url) = engine_url {
+        let model_id = model.ok_or_else(|| anyhow!("--model is required with --engine-url"))?;
+        info!("using external engine at {}", url);
+        wait_engine_ready(&url, Duration::from_secs(120)).await?;
+        (
+            EngineClient::http(url.clone()),
+            Some(url),
+            model_id,
+            None,
+        )
+    } else {
+        let model_id = model.ok_or_else(|| anyhow!("--model is required (or pass --stub)"))?;
+        let url = format!("http://127.0.0.1:{}", engine_port);
+        info!(
+            "spawning Python engine model={} device={} port={}",
+            model_id, device, engine_port
+        );
+        let child = spawn_python_engine(&model_id, &device, engine_port)?;
+        wait_engine_ready(&url, Duration::from_secs(600)).await?;
+        (
+            EngineClient::http(url.clone()),
+            Some(url),
+            model_id,
+            Some(child),
+        )
+    };
 
-    let engine = Arc::new(StubEngineClient::new());
+    let mut supported_models = vec![model_id.clone()];
+    for m in advertise {
+        if !supported_models.contains(&m) {
+            supported_models.push(m);
+        }
+    }
+    // MoE-only defaults that may be advertised once verified; never dense.
+    // Only include the active model unless explicitly advertised.
 
-    info!("sglang-lite-serving starting");
-    info!("Phase 1 — thin wrapper over sglang-lite-control");
-    info!(
-        "Try: curl http://localhost:{}/v1/chat/completions -d '{{...}}'",
-        port
-    );
-    info!("Metrics: curl http://localhost:{}/metrics", port);
+    ready.store(true, Ordering::Relaxed);
 
-    sglang_lite_control::serve(engine, Arc::new(supported_models), core_url, port).await
+    let ready_bg = ready.clone();
+    let draining_bg = draining.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("SIGINT: draining…");
+        draining_bg.store(true, Ordering::Relaxed);
+        ready_bg.store(false, Ordering::Relaxed);
+    });
+
+    info!("sglang-lite-serving ready on port {}", port);
+    info!("OpenAI: POST http://127.0.0.1:{}/v1/chat/completions", port);
+    info!("readyz: GET http://127.0.0.1:{}/readyz", port);
+
+    sglang_lite_control::serve(
+        Arc::new(engine),
+        Arc::new(supported_models),
+        core_url,
+        port,
+        ready,
+        draining,
+    )
+    .await
 }

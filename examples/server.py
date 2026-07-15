@@ -1,14 +1,12 @@
 """
-Example thin server (peeled out of core).
+Demo / legacy example server (NOT the production path).
 
-sglang-lite core is a pure library. This example shows a minimal
-HTTP server built on top.
+Production standalone entry:
+  cargo run -p sglang-lite-serving -- serve --model <moe> --port 8000
+  # which spawns: python -m sglang_lite.process
 
-Serving, routing, auth, advanced metrics, etc. belong in unigateway
-or a dedicated thin server.
-
-Run:
-    pip install -e . && python examples/sglang_lite_server.py --port 9001 --model ...
+This file may still use a process-wide lock and is kept only for demos.
+Do not treat it as the official continuous-batching serving path.
 """
 
 from __future__ import annotations

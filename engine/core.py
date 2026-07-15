@@ -1,47 +1,19 @@
-"""
-LiteEngine (thin facade, mostly for examples).
-
-In the recommended architecture, unigateway (the driver) owns the main loop and
-directly composes the fine-grained pieces:
-  - RadixKVCache
-  - BatchingScheduler
-  - MoEModelRunner
-
-This class is kept for backward compatibility and simple standalone use.
-"""
+"""LiteEngine facade — thin wrapper over EngineLoop for simple/scripts use."""
 
 from __future__ import annotations
 
 import json
 import logging
 import time
-from typing import Dict, Generator, List
+import uuid
+from typing import Dict, Generator, List, Optional
 
 import torch
 
-# Prometheus metrics are optional (peeled to serving layer like unigateway when needed)
-try:
-    from prometheus_client import Counter, Gauge, Histogram
-
-    HAS_PROMETHEUS = True
-except ImportError:
-    HAS_PROMETHEUS = False
-    Counter = Gauge = Histogram = lambda *a, **k: type(
-        "Noop",
-        (),
-        {
-            "inc": lambda s, *a, **k: None,
-            "dec": lambda s, *a, **k: None,
-            "observe": lambda s, *a, **k: None,
-            "set": lambda s, *a, **k: None,
-        },
-    )()
-
-# Config is kept for convenience in examples / thin servers.
-# In production the driver (unigateway) controls parameters.
 from .kv_cache import RadixCache
+from .loop import EngineLoop, GenParams
 from .runner import ModelRunner
-from .scheduler import Scheduler, Sequence
+from .scheduler import Sequence
 
 logger = logging.getLogger("sglang_lite")
 
@@ -56,63 +28,36 @@ def _log_structured(level: str, msg: str, **kwargs):
         logger.error(json.dumps(log_data))
 
 
-# Prometheus metrics (optional, peeled to unigateway/serving layer)
-if HAS_PROMETHEUS:
-    REQUESTS_TOTAL = Counter(
-        "sglang_lite_requests_total", "Total number of generation requests", ["model"]
-    )
-    TOKENS_GENERATED = Counter("sglang_lite_tokens_generated_total", "Total tokens generated")
-    ACTIVE_REQUESTS = Gauge("sglang_lite_active_requests", "Currently active requests")
-    QUEUE_DEPTH = Gauge("sglang_lite_queue_depth", "Current waiting queue depth")
-    BATCH_SIZE = Gauge("sglang_lite_current_batch_size", "Current batch size being processed")
-    REQUEST_LATENCY = Histogram(
-        "sglang_lite_request_latency_seconds",
-        "End-to-end request latency",
-        buckets=(0.1, 0.5, 1, 2, 5, 10, 30),
-    )
-else:
-    REQUESTS_TOTAL = TOKENS_GENERATED = ACTIVE_REQUESTS = QUEUE_DEPTH = BATCH_SIZE = (
-        REQUEST_LATENCY
-    ) = type(
-        "NoopMetric",
-        (),
-        {
-            "inc": lambda *a, **k: None,
-            "dec": lambda *a, **k: None,
-            "observe": lambda *a, **k: None,
-            "set": lambda *a, **k: None,
-            "labels": lambda *a, **k: REQUESTS_TOTAL,
-        },
-    )()
-
-
 class LiteEngine:
     def __init__(
         self,
         model_name: str = "stub",
         device: str = "cpu",
         max_batch_size: int = 4,
+        allow_stub: bool = False,
+        start_loop: bool = True,
     ):
-        # All admission, timeouts, concurrency, config, etc. are handled in the driver (unigateway).
-        # sglang-lite only receives already-accepted work and a model name.
         self.model_name = model_name
-
-        self.runner = ModelRunner(model_name, device=device, max_batch=max_batch_size)
-
-        # Init paged radix with model dims for FlashInfer
+        self.runner = ModelRunner(
+            model_name, device=device, max_batch=max_batch_size, allow_stub=allow_stub
+        )
         self.radix = RadixCache(
             max_tokens=65536,
             block_size=16,
             num_layers=self.runner.num_layers,
             num_kv_heads=self.runner.num_kv_heads,
             head_dim=self.runner.head_dim,
-            dtype=torch.float16 if device != "cpu" else torch.float32,
+            dtype=torch.float32 if device == "cpu" else torch.float16,
             device=device if device != "cpu" else "cpu",
         )
-        self.scheduler = Scheduler(self.radix, max_batch_size=max_batch_size)
-
-        self._seq_map: Dict[str, Sequence] = {}  # request_id -> Sequence
-        self._start_time: Dict[str, float] = {}  # for latency tracking
+        self.loop = EngineLoop(
+            self.runner,
+            radix=self.radix,
+            max_batch_size=max_batch_size,
+        )
+        self.scheduler = self.loop.scheduler
+        if start_loop:
+            self.loop.start()
 
     def tokenize(self, text: str) -> List[int]:
         return self.runner.tokenize(text)
@@ -126,209 +71,125 @@ class LiteEngine:
         input_ids: List[int],
         max_tokens: int = 128,
         temperature: float = 0.7,
+        top_p: float = 1.0,
+        top_k: Optional[int] = None,
+        seed: Optional[int] = None,
+        stop: Optional[List[str]] = None,
     ) -> Sequence:
-        # Admission control, concurrency limits, and queueing are handled in the driver (unigateway).
-        # The engine only sees already-accepted work.
-
-        seq = self.scheduler.add_request(request_id, input_ids)
-        seq.max_tokens = max_tokens  # attach generation params
-        seq.temperature = temperature
-        self._seq_map[request_id] = seq
-        self._start_time[request_id] = time.time()
-
-        # Observe prefix cache hit (key for Radix + unigateway)
-        if seq.cached_len > 0:
-            _log_structured(
-                "INFO",
-                "prefix_cache_hit",
-                request_id=request_id,
-                cached_len=seq.cached_len,
-                prompt_len=len(input_ids),
-            )
-            if HAS_PROMETHEUS:
-                # Could add a counter, but stats via get_stats
-                pass
-
-        if HAS_PROMETHEUS:
-            REQUESTS_TOTAL.labels(model=self.model_name).inc()
-            ACTIVE_REQUESTS.inc()
-            QUEUE_DEPTH.set(len(self.scheduler.waiting))
-
-        _log_structured(
-            "INFO",
-            "request_added",
-            request_id=request_id,
-            prompt_len=len(input_ids),
+        params = GenParams(
             max_tokens=max_tokens,
-            cached_len=seq.cached_len,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            stop=stop,
         )
-        return seq
+        self.loop.submit(request_id, input_ids, params)
+        # Wait briefly for admission
+        for _ in range(1000):
+            seq = self.scheduler._by_request.get(request_id)
+            if seq is not None:
+                _log_structured(
+                    "INFO",
+                    "request_added",
+                    request_id=request_id,
+                    prompt_len=len(input_ids),
+                    cached_len=seq.cache_hit_tokens,
+                )
+                return seq
+            time.sleep(0.001)
+        raise RuntimeError(f"failed to admit request {request_id}")
 
     def step(self, max_steps: int = 1) -> List[Dict]:
-        """
-        Run the engine for up to max_steps scheduler steps.
-        Returns list of finished or intermediate results.
-        """
-        results = []
-        for _ in range(max_steps):
-            batch, is_prefill = self.scheduler.step()
-            if not batch:
-                break
-
-            BATCH_SIZE.set(len(batch))
-            _log_structured(
-                "INFO",
-                "batch_step",
-                batch_size=len(batch),
-                prefill_count=sum(1 for p in is_prefill if p),
-            )
-
-            next_tokens = self.runner.run_batch(batch, self.radix, is_prefill)
-
-            for seq, tok, pre in zip(batch, next_tokens, is_prefill):
-                if seq.finished or tok is None:
-                    continue
-
-                if pre:
-                    # After prefill we usually emit the first real token
-                    # and move to decode phase
-                    self.scheduler.update_after_prefill(seq, [], seq.kv_state or [])
-                    # We already got the first token from prefill in many cases
-                    # For simplicity we treat the returned tok as first generated
-                    self.scheduler.update_after_decode(seq, tok, seq.kv_state or [])
-                else:
-                    self.scheduler.update_after_decode(seq, tok, seq.kv_state or [])
-
-                # Check stopping conditions
-                if len(seq.output_ids) >= getattr(seq, "max_tokens", 128):
-                    self.scheduler.mark_finished(seq, "length")
-                    results.append(self._make_result(seq, finished=True))
-                elif tok == self._get_eos_token():
-                    self.scheduler.mark_finished(seq, "stop")
-                    results.append(self._make_result(seq, finished=True))
-                else:
-                    # still running
-                    results.append(self._make_result(seq, finished=False))
-
-            # remove finished from running list
-            self.scheduler.running = [s for s in self.scheduler.running if not s.finished]
-
-        return results
+        # Loop runs in background; step is a no-op observability hook
+        return []
 
     def generate(
         self,
         request_id: str,
         input_ids: List[int],
         max_tokens: int = 128,
-        temperature: float = 0.7,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: Optional[int] = None,
+        seed: Optional[int] = None,
+        stop: Optional[List[str]] = None,
     ) -> Dict:
-        """Blocking generation (convenient for /generate)."""
-        seq = self.add_request(request_id, input_ids, max_tokens, temperature)
-
-        # Run until this sequence finishes.
-        # Timeouts and admission are enforced by the driver (unigateway) before calling the engine.
-        while not seq.finished:
-            self.step(max_steps=1)
-            if len(seq.output_ids) > max_tokens + 10:
-                break
-
-        if not seq.finished:
-            self.scheduler.mark_finished(seq, "length")
-
-        result = self._make_result(seq, finished=True)
-
-        # Record metrics
-        duration = time.time() - self._start_time.pop(request_id, time.time())
-        REQUEST_LATENCY.observe(duration)
-        TOKENS_GENERATED.inc(result["usage"]["completion_tokens"])
-        ACTIVE_REQUESTS.dec()
-        QUEUE_DEPTH.set(len(self.scheduler.waiting))
-
-        _log_structured(
-            "INFO",
-            "request_finished",
-            request_id=request_id,
-            duration=duration,
-            finish_reason=result.get("finish_reason"),
-            usage=result.get("usage"),
+        params = GenParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            stop=stop,
         )
-        return result
+        sub = self.loop.submit(request_id, input_ids, params)
+        text_parts: List[str] = []
+        finish = "stop"
+        usage = None
+        while True:
+            item = sub.delta_queue.get(timeout=300.0)
+            if item.get("error"):
+                raise RuntimeError(item["error"])
+            if item.get("text"):
+                text_parts.append(item["text"])
+            if item.get("finish_reason") is not None:
+                finish = item["finish_reason"]
+                usage = item.get("usage")
+                break
+        return {
+            "request_id": request_id,
+            "text": "".join(text_parts),
+            "finish_reason": finish,
+            "finished": True,
+            "usage": usage
+            or {
+                "prompt_tokens": len(input_ids),
+                "completion_tokens": 0,
+                "total_tokens": len(input_ids),
+                "cache_hit_tokens": 0,
+            },
+        }
 
     def generate_stream(
         self,
         request_id: str,
         input_ids: List[int],
         max_tokens: int = 128,
-        temperature: float = 0.7,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: Optional[int] = None,
+        seed: Optional[int] = None,
+        stop: Optional[List[str]] = None,
     ) -> Generator[Dict, None, None]:
-        """Yields token deltas one by one. Good for SSE."""
-        seq = self.add_request(request_id, input_ids, max_tokens, temperature)
-
-        last_len = 0
-        while not seq.finished:
-            self.step(max_steps=1)
-
-            current_out = seq.output_ids
-            new_tokens = current_out[last_len:]
-            last_len = len(current_out)
-
-            for t in new_tokens:
-                text = self.detokenize([t])
-                yield {
-                    "request_id": request_id,
-                    "token": t,
-                    "text": text,
-                    "finished": seq.finished,
-                    "finish_reason": seq.finish_reason or None,
-                }
-
-            if seq.finished:
+        params = GenParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            stop=stop,
+        )
+        sub = self.loop.submit(request_id, input_ids, params)
+        while True:
+            item = sub.delta_queue.get(timeout=300.0)
+            yield {
+                "request_id": request_id,
+                "token": item.get("token"),
+                "text": item.get("text") or "",
+                "finished": item.get("finish_reason") is not None,
+                "finish_reason": item.get("finish_reason"),
+                "usage": item.get("usage"),
+                "error": item.get("error"),
+            }
+            if item.get("finish_reason") is not None or item.get("error"):
                 break
 
-        # final
-        yield {
-            "request_id": request_id,
-            "token": None,
-            "text": "",
-            "finished": True,
-            "finish_reason": seq.finish_reason or "stop",
-            "usage": self._usage(seq),
-        }
+    def cancel(self, request_id: str) -> bool:
+        return self.loop.cancel(request_id)
 
     def get_stats(self) -> Dict:
-        cache_stats = self.radix.get_cache_stats()
-        return {
-            "waiting": len(self.scheduler.waiting),
-            "running": len(self.scheduler.running),
-            "cache": cache_stats,
-            "model": self.runner.model_name,
-            "device": self.runner.device,
-        }
+        return self.loop.get_stats()
 
-    # --- helpers ---
-
-    def _make_result(self, seq: Sequence, finished: bool) -> Dict:
-        text = self.detokenize(seq.output_ids)
-        return {
-            "request_id": seq.request_id,
-            "text": text,
-            "output_ids": list(seq.output_ids),
-            "finish_reason": seq.finish_reason if finished else None,
-            "finished": finished,
-            "usage": self._usage(seq),
-        }
-
-    def _usage(self, seq: Sequence) -> Dict:
-        prompt = len(seq.input_ids)
-        completion = len(seq.output_ids)
-        return {
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "total_tokens": prompt + completion,
-            "cache_hit_tokens": seq.cached_len,  # number of prompt tokens served from Radix cache (for unigateway passthrough)
-        }
-
-    def _get_eos_token(self) -> int:
-        if self.runner.tokenizer is not None and hasattr(self.runner.tokenizer, "eos_token_id"):
-            return self.runner.tokenizer.eos_token_id or 2
-        return 2
+    def shutdown(self) -> None:
+        self.loop.stop()

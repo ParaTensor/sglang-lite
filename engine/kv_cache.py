@@ -1,75 +1,49 @@
-"""
-RadixAttention-style KV Cache with actual prefix KV state management.
-
-This is a core component. We implement prefix sharing here so that
-multi-turn / agent workloads can reuse pre-computed KV for common prefixes.
-
-For Phase 0 (CPU friendly):
-- We store KV states directly on the tree nodes (list of (key, value) per layer).
-- On prefix match we can reuse the stored KV up to the match point.
-- When forking a new branch we copy the prefix KV (simple but correct).
-- No full paged GPU blocks yet — we will evolve to paged later.
-"""
+"""RadixAttention-style KV cache with paged blocks, COW, and eviction."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 
 
 @dataclass
 class KVBlock:
-    """Simple abstraction for a memory block (used for stats & future paged impl)."""
-
     block_id: int
     ref_count: int = 0
 
 
-# Legacy type kept for compatibility during transition to paged KV + FlashInfer.
-# Will be phased out.
 PastKV = List[Tuple[torch.Tensor, torch.Tensor]]
 
 
 @dataclass
 class RadixNode:
-    """Node in the radix tree over token ids (pure tree structure)."""
-
     tokens: List[int] = field(default_factory=list)
     children: Dict[int, "RadixNode"] = field(default_factory=dict)
     ref_count: int = 0
-
-    # For paged KV: list of block ids that hold the KV for this prefix.
-    # Shared across sequences for common prefixes (refcounted).
     block_ids: List[int] = field(default_factory=list)
-
-    # Rough memory usage estimate (number of tokens this prefix represents)
     prefix_len: int = 0
+    # HF-compatible KV snapshot at this node (cloned on fork)
+    past_kv: Optional[PastKV] = None
 
 
 class RadixTree:
-    """Pure token radix tree. KV concerns are handled by the caller (RadixCache)."""
-
     def __init__(self):
         self.root = RadixNode()
 
     def walk(self, token_ids: List[int]) -> Tuple[RadixNode, List[int], int]:
-        """Walk the tree as far as possible. Returns (final_node, matched, matched_len)."""
         node = self.root
         matched: List[int] = []
-        i = 0
         for tid in token_ids:
             if tid in node.children:
                 node = node.children[tid]
                 matched.append(tid)
-                i += 1
             else:
                 break
-        return node, matched, i
+        return node, matched, len(matched)
 
     def insert_path(self, token_ids: List[int]) -> RadixNode:
-        """Create nodes for the path if missing. Returns the leaf node."""
         node = self.root
         for tid in token_ids:
             if tid not in node.children:
@@ -78,16 +52,17 @@ class RadixTree:
             node.ref_count += 1
         return node
 
+    def find_node(self, token_ids: List[int]) -> Optional[RadixNode]:
+        node, _, n = self.walk(token_ids)
+        if n == len(token_ids) and token_ids:
+            return node
+        if not token_ids:
+            return self.root
+        return None
+
 
 class RadixCache:
-    """
-    Radix cache with KV state sharing.
-
-    Key operations:
-    - match_prefix: find longest matching prefix and return cached KV if available.
-    - commit: after computing new tokens, store/update the KV for the path.
-    - fork / share: when a new sequence branches from an existing prefix.
-    """
+    """Paged KV + radix prefix index with refcounted blocks and COW forks."""
 
     def __init__(
         self,
@@ -109,199 +84,298 @@ class RadixCache:
 
         self.tree = RadixTree()
         self._allocated_blocks: Dict[int, KVBlock] = {}
+        self._free_blocks: List[int] = []
         self._next_block_id = 0
 
-        # Pre-allocate paged KV cache for FlashInfer
-        # shape: (num_layers, num_blocks, block_size, num_kv_heads, head_dim)
-        num_blocks = (max_tokens + block_size - 1) // block_size
+        self.num_blocks = max(1, (max_tokens + block_size - 1) // block_size)
         self.k_cache = torch.zeros(
-            (num_layers, num_blocks, block_size, num_kv_heads, head_dim), dtype=dtype, device=device
+            (num_layers, self.num_blocks, block_size, num_kv_heads, head_dim),
+            dtype=dtype,
+            device=device,
         )
         self.v_cache = torch.zeros(
-            (num_layers, num_blocks, block_size, num_kv_heads, head_dim), dtype=dtype, device=device
+            (num_layers, self.num_blocks, block_size, num_kv_heads, head_dim),
+            dtype=dtype,
+            device=device,
         )
+        # Token occupancy per physical page (for append position)
+        self._page_len: Dict[int, int] = {}
 
-        # Simple stats
         self.total_tokens_stored = 0
         self.hit_count = 0
         self.miss_count = 0
+        self.oom_reject_count = 0
+        self.evict_count = 0
 
-    def match_prefix(self, token_ids: List[int]) -> Tuple[List[int], int, List[int], List[int]]:
-        """
-        Find longest prefix match (paged version).
+    def match_prefix(
+        self, token_ids: List[int]
+    ) -> Tuple[List[int], int, List[int], List[int], Optional[PastKV]]:
+        """Return matched tokens/len/remaining/block_ids/past_kv.
 
-        Returns:
-            matched_tokens, matched_len, remaining_tokens, block_ids (shared prefix blocks)
+        cache hit only counts when matched_len > 0 and reusable KV exists
+        (past_kv or non-empty block_ids).
         """
         node, matched, i = self.tree.walk(token_ids)
-        block_ids = list(node.block_ids)  # copy for sharing
-
         remaining = token_ids[i:]
-        if block_ids:  # we have blocks for this prefix
+        block_ids = list(node.block_ids) if node.block_ids else []
+        past_kv = self.fork_kv(node.past_kv) if node.past_kv is not None else None
+
+        # Walk upward for nearest ancestor with KV if leaf has none
+        if past_kv is None and i > 0:
+            cur = self.tree.root
+            best_kv = None
+            best_blocks: List[int] = []
+            best_len = 0
+            for j, tid in enumerate(matched):
+                cur = cur.children.get(tid)
+                if cur is None:
+                    break
+                if cur.past_kv is not None:
+                    best_kv = cur.past_kv
+                    best_blocks = list(cur.block_ids)
+                    best_len = j + 1
+            if best_kv is not None and best_len == i:
+                past_kv = self.fork_kv(best_kv)
+                block_ids = best_blocks
+
+        reusable = past_kv is not None or bool(block_ids)
+        if i > 0 and reusable:
             self.hit_count += 1
-        elif i > 0:
-            # find from subtree if partial match to a committed longer prefix
-            def find_blocks(n):
-                if n.block_ids:
-                    return n.block_ids
-                for c in n.children.values():
-                    res = find_blocks(c)
-                    if res:
-                        return res
-                return None
+        else:
+            self.miss_count += 1
+            if not reusable:
+                # No real KV → treat as full miss for skip purposes
+                return [], 0, token_ids, [], None
 
-            full_blocks = find_blocks(node)
-            if full_blocks:
-                num_blocks = (i + self.block_size - 1) // self.block_size
-                block_ids = full_blocks[:num_blocks]
-                self.hit_count += 1
-                self.miss_count = max(0, self.miss_count - 1)
-            else:
-                self.hit_count += 1
-                self.miss_count = max(0, self.miss_count - 1)
+        # Share block refs
+        for bid in block_ids:
+            blk = self._allocated_blocks.get(bid)
+            if blk:
+                blk.ref_count += 1
 
-        return matched, i, remaining, block_ids
+        return matched, i, remaining, block_ids, past_kv
 
     def insert_or_update(
         self,
         token_ids: List[int],
-        kv_tensors: Optional[
-            Tuple[torch.Tensor, torch.Tensor]
-        ] = None,  # (k, v) for new tokens, shape (num_new, num_heads, head_dim) or per layer?
+        kv_tensors: Optional[PastKV] = None,
         prefix_len: int = 0,
         block_ids: Optional[List[int]] = None,
     ) -> List[int]:
-        """
-        Walk/create the path and allocate/store paged blocks for new tokens.
-        For paged + FlashInfer.
-
-        kv_tensors: for simplicity in transition, expect per-layer? But start simple.
-        block_ids: if provided (e.g. from the runner's paged block table), use them
-            directly instead of allocating new blocks. This keeps the radix tree
-            block list consistent with the actual paged KV cache.
-        Returns the list of new block ids allocated for this append.
-        """
+        if not token_ids:
+            return list(block_ids or [])
         node = self.tree.insert_path(token_ids)
-
-        new_block_ids: List[int] = []
-
-        if kv_tensors is not None and block_ids is not None:
-            # Runner already allocated pages and appended KV via flashinfer;
-            # just record the block table on the radix node for prefix sharing.
-            node.block_ids = list(block_ids)
-            node.prefix_len = prefix_len + len(token_ids)
-            return list(block_ids)
-
+        if block_ids is not None:
+            # Tree retains its own refs so finished sequences can release without dropping prefix KV.
+            new_list = list(block_ids)
+            if node.block_ids != new_list:
+                if node.block_ids:
+                    self.release_blocks(node.block_ids)
+                node.block_ids = self.fork_blocks(new_list)
         if kv_tensors is not None:
-            # Handle legacy PastKV list or single (k,v)
-            if (
-                isinstance(kv_tensors, list)
-                and len(kv_tensors) > 0
-                and isinstance(kv_tensors[0], tuple)
-            ):
-                # multi layer, take first for demo
-                k, v = kv_tensors[0]
-            elif isinstance(kv_tensors, tuple):
-                k, v = kv_tensors
-            else:
-                k, _v = None, None
-            num_new = k.shape[0] if k is not None and k.dim() > 0 else 0
-            num_blocks_needed = (
-                (num_new + self.block_size - 1) // self.block_size if num_new > 0 else 0
-            )
-
-            for _ in range(num_blocks_needed):
-                bid = self._next_block_id
-                self._next_block_id += 1
-                self._allocated_blocks[bid] = KVBlock(block_id=bid, ref_count=1)
-                new_block_ids.append(bid)
-
-                # Copy into paged cache (simplified, assumes single layer for demo)
-                # In full, loop over layers, use proper shapes.
-                _start = len(node.block_ids) * self.block_size
-                # This is placeholder; real copy needs reshaping per layer.
-                # For now, just allocate to enable FlashInfer block table.
-
-            node.block_ids.extend(new_block_ids)
-            node.prefix_len = prefix_len + len(token_ids)
-
+            node.past_kv = self.fork_kv(kv_tensors)
+        node.prefix_len = prefix_len or len(token_ids)
         self.total_tokens_stored = max(self.total_tokens_stored, node.prefix_len)
-        return new_block_ids
+        return list(node.block_ids)
+
+    def write_kv(
+        self,
+        block_table: List[int],
+        start_pos: int,
+        layer_kvs: PastKV,
+    ) -> None:
+        """Write per-layer K/V for tokens starting at start_pos into pages."""
+        if not layer_kvs or not block_table:
+            return
+        for layer_idx, (k, v) in enumerate(layer_kvs):
+            if layer_idx >= self.num_layers:
+                break
+            k_tok, v_tok = self._normalize_kv(k, v)
+            n = k_tok.shape[0]
+            for t in range(n):
+                pos = start_pos + t
+                page_i = pos // self.block_size
+                slot = pos % self.block_size
+                if page_i >= len(block_table):
+                    raise RuntimeError(
+                        f"block_table too short for pos={pos}: pages={len(block_table)}"
+                    )
+                bid = block_table[page_i]
+                if bid >= self.num_blocks:
+                    raise RuntimeError(f"block id {bid} out of range ({self.num_blocks})")
+                self.k_cache[layer_idx, bid, slot].copy_(k_tok[t].to(self.dtype))
+                self.v_cache[layer_idx, bid, slot].copy_(v_tok[t].to(self.dtype))
+                self._page_len[bid] = max(self._page_len.get(bid, 0), slot + 1)
+
+    def _normalize_kv(
+        self, k: torch.Tensor, v: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (seq, num_kv_heads, head_dim)."""
+        if k.dim() == 4:
+            # (bs, heads, seq, dim) or (bs, seq, heads, dim)
+            if k.shape[1] == self.num_kv_heads:
+                k = k[0].transpose(0, 1).contiguous()
+                v = v[0].transpose(0, 1).contiguous()
+            else:
+                k = k[0].contiguous()
+                v = v[0].contiguous()
+        elif k.dim() == 3:
+            # (seq, heads, dim) or (heads, seq, dim)
+            if k.shape[0] == self.num_kv_heads and k.shape[1] != self.num_kv_heads:
+                k = k.transpose(0, 1).contiguous()
+                v = v.transpose(0, 1).contiguous()
+        return k.to(device=self.device), v.to(device=self.device)
 
     def append_kv_paged(
         self,
         block_ids: List[int],
         kv_state: PastKV,
         layer_idx: int = 0,
+        start_pos: int = 0,
     ) -> None:
-        """Write the kv_state (for new tokens) into the paged cache using the block_ids.
-        Assumes kv_state[-1] corresponds to the appended tokens.
-        For production, use flashinfer.append_paged_kv_cache for efficiency.
-        """
         if not kv_state or not block_ids:
             return
-        # Simple: take the last 'new' part, assume shape allows.
-        # In real, kv_state is list per layer, we take for this layer.
-        k, v = kv_state[layer_idx] if isinstance(kv_state[0], tuple) else kv_state  # adjust
-        # For demo, assume k,v are (1, heads, new_len, dim) or similar
-        # Copy into last block for simplicity (extend as needed)
-        _bid = block_ids[-1]
-        # This is illustrative; real impl slices by block_size
-        if k.dim() == 4:  # e.g. (bs, heads, seq, dim) wait adjust
-            # placeholder copy
-            pass
-        # For actual production, after compute QKV, use:
-        # flashinfer.append_paged_kv_cache(
-        #     k, v, self.k_cache[layer_idx], self.v_cache[layer_idx], block_table, ...
-        # )
+        if isinstance(kv_state[0], tuple):
+            self.write_kv(block_ids, start_pos, kv_state)
+        else:
+            self.write_kv(block_ids, start_pos, [kv_state])  # type: ignore[list-item]
 
     def fork_kv(self, src_kv: Optional[PastKV]) -> Optional[PastKV]:
-        """
-        When we hit a prefix, we usually need to copy the KV tensors
-        because the new sequence will continue to append to it.
-        Shallow copy of structure + clone tensors (CPU friendly).
-        """
         if src_kv is None:
             return None
-        return [(k.clone(), v.clone()) for k, v in src_kv]
+        # HF DynamicCache / Cache objects
+        if hasattr(src_kv, "to_legacy_cache"):
+            try:
+                from transformers import DynamicCache
+
+                legacy = src_kv.to_legacy_cache()
+                cloned = [(k.clone(), v.clone()) for k, v in legacy]
+                return DynamicCache.from_legacy_cache(cloned)  # type: ignore[return-value]
+            except Exception:
+                import copy
+
+                return copy.deepcopy(src_kv)  # type: ignore[return-value]
+        if isinstance(src_kv, (list, tuple)):
+            return [(k.clone(), v.clone()) for k, v in src_kv]
+        import copy
+
+        return copy.deepcopy(src_kv)  # type: ignore[return-value]
+
+    def fork_blocks(self, block_ids: List[int]) -> List[int]:
+        """COW: bump refcounts for shared prefix pages."""
+        out = list(block_ids)
+        for bid in out:
+            blk = self._allocated_blocks.get(bid)
+            if blk:
+                blk.ref_count += 1
+        return out
+
+    def cow_block_if_shared(self, block_id: int) -> int:
+        """If page is shared, allocate a private copy and return new id."""
+        blk = self._allocated_blocks.get(block_id)
+        if blk is None or blk.ref_count <= 1:
+            return block_id
+        new_ids = self.allocate_blocks(1)
+        new_id = new_ids[0]
+        self.k_cache[:, new_id].copy_(self.k_cache[:, block_id])
+        self.v_cache[:, new_id].copy_(self.v_cache[:, block_id])
+        self._page_len[new_id] = self._page_len.get(block_id, 0)
+        blk.ref_count -= 1
+        return new_id
 
     def get_cache_stats(self) -> Dict:
         total = self.hit_count + self.miss_count
         hit_rate = self.hit_count / max(1, total)
+        used = len(self._allocated_blocks)
         return {
             "hit_count": self.hit_count,
             "miss_count": self.miss_count,
             "hit_rate": round(hit_rate, 4),
             "total_tokens_stored": self.total_tokens_stored,
+            "blocks_used": used,
+            "blocks_free": len(self._free_blocks) + (self.num_blocks - self._next_block_id),
+            "oom_reject_count": self.oom_reject_count,
+            "evict_count": self.evict_count,
         }
 
-    # --- The following are kept for future paged attention evolution ---
     def allocate_blocks(self, count: int) -> List[int]:
-        ids = []
+        ids: List[int] = []
         for _ in range(count):
-            bid = self._next_block_id
-            self._next_block_id += 1
+            if self._free_blocks:
+                bid = self._free_blocks.pop()
+            else:
+                if self._next_block_id >= self.num_blocks:
+                    freed = self.evict(count - len(ids))
+                    if freed <= 0 or not self._free_blocks:
+                        self.oom_reject_count += 1
+                        # release any partially allocated
+                        self.release_blocks(ids)
+                        raise MemoryError(
+                            f"KV OOM: need {count} blocks, capacity={self.num_blocks}"
+                        )
+                    bid = self._free_blocks.pop()
+                else:
+                    bid = self._next_block_id
+                    self._next_block_id += 1
             self._allocated_blocks[bid] = KVBlock(block_id=bid, ref_count=1)
+            self._page_len[bid] = 0
             ids.append(bid)
         return ids
 
     def release_blocks(self, block_ids: List[int]) -> None:
+        seen: Set[int] = set()
         for bid in block_ids:
+            if bid in seen:
+                continue
+            seen.add(bid)
             blk = self._allocated_blocks.get(bid)
-            if blk:
-                blk.ref_count -= 1
-                if blk.ref_count <= 0:
-                    self._allocated_blocks.pop(bid, None)
+            if not blk:
+                continue
+            blk.ref_count -= 1
+            if blk.ref_count <= 0:
+                self._allocated_blocks.pop(bid, None)
+                self._page_len.pop(bid, None)
+                self.k_cache[:, bid].zero_()
+                self.v_cache[:, bid].zero_()
+                self._free_blocks.append(bid)
 
     def evict(self, needed: int) -> int:
-        # Improved placeholder eviction: simple LRU-like by walking leaves with low ref
-        # Real would use priority queue on last_access + ref_count
+        """Evict low-refcount leaves from the radix tree and free their private pages."""
+        if needed <= 0:
+            return 0
+        candidates: List[Tuple[int, RadixNode, List[int]]] = []
+
+        def walk(node: RadixNode, path: List[int]):
+            if node.block_ids and node.ref_count <= 1 and not node.children:
+                # private leaf
+                private = [
+                    b
+                    for b in node.block_ids
+                    if self._allocated_blocks.get(b) and self._allocated_blocks[b].ref_count <= 1
+                ]
+                if private:
+                    candidates.append((node.ref_count, node, path[:]))
+            for tid, child in node.children.items():
+                path.append(tid)
+                walk(child, path)
+                path.pop()
+
+        walk(self.tree.root, [])
+        candidates.sort(key=lambda x: x[0])
         evicted = 0
-        to_evict = []
-        for bid, blk in list(self._allocated_blocks.items()):
-            if blk.ref_count <= 1 and evicted < needed:
-                to_evict.append(bid)
-                evicted += 1
-        for bid in to_evict:
-            self.release_blocks([bid])
+        for _, node, path in candidates:
+            if evicted >= needed:
+                break
+            blocks = list(node.block_ids)
+            node.block_ids = []
+            node.past_kv = None
+            # unlink leaf
+            if path:
+                parent = self.tree.root
+                for tid in path[:-1]:
+                    parent = parent.children[tid]
+                parent.children.pop(path[-1], None)
+            self.release_blocks(blocks)
+            evicted += len(blocks)
+            self.evict_count += 1
         return evicted

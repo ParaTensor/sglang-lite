@@ -9,51 +9,34 @@
 - sglang-lite 必须能够独立运行；Unigateway 是可选的高级网关。
 - `serving/` 只提供：
   - 组合 `control/` 形成的官方 standalone wrapper
-  - 与 Unigateway 组合的薄胶水（import / HTTP / gRPC）
-  - 单引擎启动配置、健康/就绪、部署入口
+  - 启动 Python engine process、等待 `/readyz`、暴露 OpenAI 表面
+  - 单引擎启动配置、健康/就绪、优雅退出
 
 **不允许**在这里实现模型执行、跨后端 routing、auth、业务逻辑或宽 OpenAI 表面。
 
-## 目标实现方式与当前状态
-
-- 本目录（`serving/`）**完全用 Rust 实现**，作为正式可执行 wrapper：
-  - 依赖 `sglang-lite-control`（`../control`）获得薄控制面。
-  - 组合路由并启动 axum 服务。
-- 完成后，单独运行时提供最小、真实、可流式的推理服务。
-- 需要多后端 routing、auth、全局限流和策略时，可在上游部署 Unigateway。
-- 不再有任何 Python 代码或重型 serving 逻辑。
-
-当前仍默认使用 `StubEngineClient`，Python 转发也不是真实 token-level streaming，
-因此尚不属于生产可用服务。补齐顺序和退出标准见
-`docs/standalone-inference-service-roadmap.md`。
-
-## 目录结构
-
-- `Cargo.toml` + `src/main.rs`：薄 Rust serving 入口（仅组合，实际 serving 由 Unigateway 提供）。
-- 严禁在 `serving/` 实现完整 OpenAI 逻辑或控制面细节；这些属于 `control/`。
-
-## 推荐用法
-
-用户可以直接启动，也可以在 Unigateway 中把它注册为一个 local-inference backend。
-
-本地测试（从 workspace 根目录）：
+## 用法
 
 ```bash
-cargo run -p sglang-lite-serving
+# 真实 MoE（会 spawn: python -m sglang_lite.process）
+cargo run -p sglang-lite-serving -- serve \
+  --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
+  --device cuda \
+  --port 8000
+
+# 已有 engine process
+cargo run -p sglang-lite-serving -- serve \
+  --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
+  --engine-url http://127.0.0.1:9001 \
+  --port 8000
+
+# 控制面 stub（无 GPU / 无模型）
+cargo run -p sglang-lite-serving -- serve --stub --port 8000
 ```
 
-或指定端口/Python core：
+流式路径：Rust `HttpEngineClient` 消费 Python NDJSON `TokenDelta`，不再伪切分全文。
 
-```bash
-PORT=8000 SGLANG_LITE_PYTHON_CORE=http://localhost:9001 cargo run -p sglang-lite-serving
-```
-
-## 开发规则（必须遵守）
+## 开发规则
 
 - 这里**只用 Rust**。
-- 保持极薄：只做组合，不复制 Unigateway 核心 serving 逻辑。
-- standalone 必需的 chat/stream/models/health/readiness/metrics 和生命周期能力保留。
-- 多后端网关与业务能力必须上移到 Unigateway（Rust）或其他 gateway。
-- 新代码必须符合 `AGENTS.md` “模块边界定义”。
-
-参考 `AGENTS.md` 中的“模块边界定义”。
+- 保持极薄：只做组合与进程生命周期。
+- 参考 `AGENTS.md` 中的“模块边界定义”。
