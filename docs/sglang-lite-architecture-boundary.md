@@ -2,17 +2,20 @@
 
 ## 1. 总体定位
 
-sglang-lite 是**极简的纯 MoE 引擎库**（Token Factory）。
+sglang-lite 是一个可独立运行的极简 MoE inference backend；其中 `engine/` 是纯
+Token Factory 库，`control/` + `serving/` 是官方薄服务入口。
 
 **核心原则**：
 - 只保留三个高内聚构建块：RadixKVCache、BatchingScheduler、MoEModelRunner。
 - 内部允许进一步拆分以提升可组合性。
-- 编排（orchestration）、admission control、serving 等全部上移到驱动层（unigateway）。
+- engine 主循环、KV/调度/执行编排、engine-local admission/cancel 必须留在
+  sglang-lite；只有多后端 routing、auth、全局 policy 等上移到可选 gateway。
 - 保持代码量极小，专注 MoE 下的 Radix prefix sharing 和连续批处理。
 
 ## 2. 三个核心构建块的进一步内部拆分
 
-为方便 unigateway 作为 driver 进行灵活组合和策略替换，我们对三个组件进行内部模块化拆分：
+为方便 sglang-lite 自身的 composition root 进行组合和测试，我们对三个组件进行
+内部模块化拆分；跨进程 gateway 不直接操作这些 Python 类：
 
 ### RadixKVCache
 - RadixTree（纯 token 前缀树逻辑）
@@ -21,8 +24,8 @@ sglang-lite 是**极简的纯 MoE 引擎库**（Token Factory）。
 
 ### BatchingScheduler
 - SequenceTable（序列生命周期管理）
-- BatchFormer（批次形成策略，unigateway 可提供自定义实现）
-- （AdmissionController / 超时 / 队列逻辑建议剥离到 unigateway）
+- BatchFormer（批次形成策略）
+- engine-local admission、超时/取消清理、队列上限和 backpressure
 
 ### MoEModelRunner
 - ModelLoader
@@ -31,22 +34,28 @@ sglang-lite 是**极简的纯 MoE 引擎库**（Token Factory）。
 - DecodeExecutor（CUDA graph 可选、保守实现）
 - KernelBackend（attention 执行委托给 FlashInfer / Triton 等外部库）
 
-**LiteEngine** 将退化为极薄的 facade 或示例，主要用于简单 standalone 使用。真正的编排、主循环、请求生命周期由 unigateway driver 负责。
+**LiteEngine** 可保持薄 facade，但真正的编排、主循环和 sequence 生命周期必须由
+sglang-lite engine process 内的 composition root 负责。Rust 控制面负责外部请求
+生命周期并通过 HTTP/gRPC 传播 cancel、timeout 和 token delta。
 
-## 3. 与 unigateway 的关系（推荐分工）
+## 3. 独立运行与 UniGateway 的关系
 
-- **sglang-lite**：只提供可组合的 building blocks + 最小 factory。
-- **unigateway**（driver 代码放在 unigateway 仓库）：
-  - 直接使用/组合上述三个构建块。
-  - 负责主循环、admission control、request queuing、超时。
-  - 提供完整的 OpenAI 表面、routing、auth、rate-limit、metrics 聚合等。
-  - 所有 driver glue（如何加载、调用 sglang-lite）都放在 unigateway。
+- **sglang-lite engine**：直接组合三个构建块，拥有中央 continuous batching loop。
+- **sglang-lite control/serving**：提供最小 OpenAI chat/stream/models/health/readiness、
+  engine-local queue/timeout、错误和优雅退出。
+- **UniGateway（可选）**：
+  - 只通过 HTTP/gRPC 把 sglang-lite 当作一个 local-inference backend 调用。
+  - 负责多后端 routing、auth、全局 rate-limit、租户 policy、failover、metrics 聚合。
+  - 不直接 import、组合或替换 sglang-lite 的内部构建块。
 
-**目标**：让 sglang-lite 变得更小、更专注，unigateway 作为通用驱动层灵活集成。
+**目标**：用户不部署 UniGateway 也能直接使用 sglang-lite；需要统一多个 backend 时
+再选择 UniGateway。
 
 ### 与 vLLM 的兼容边界
 
-sglang-lite 不应被设计成 SGLang 专用后端，也不应追求 vLLM 功能面全兼容。更合理的定位是：sglang-lite 与 vLLM 都是 unigateway 下的 `local-inference` backend。
+sglang-lite 不应被设计成 SGLang 专用后端，也不应追求 vLLM 功能面全兼容。更合理的
+定位是：sglang-lite 与 vLLM 是同层级的 `local-inference` backend，可独立运行，也可
+由 UniGateway 统一管理。
 
 - unigateway core 使用通用抽象：`PrefixCache`、`BlockKVCache`、`ContinuousScheduler`、`ModelExecutor`、`BackendCapabilities`。
 - sglang-lite 内部继续保持 RadixKVCache + MoE-aware batching；vLLM 内部可使用 APC + PagedAttention。
@@ -55,19 +64,22 @@ sglang-lite 不应被设计成 SGLang 专用后端，也不应追求 vLLM 功能
 
 详细评估见 `docs/vllm-positioning-compatibility.md`。
 
-## 4. 进一步可剥离的内容
+## 4. 核心外的薄层与可选上游职责
 
-- Tokenizer：彻底外部化，由调用方负责。
-- 详细 metrics 采集逻辑：只保留 hook，导出和聚合由 unigateway 负责。
-- 配置策略（lite preset）：由 unigateway 控制。
-- 高级 batching policy：可由 unigateway 动态选择。
-- Attention backend 选择：由 sglang-lite 内部根据 hints 决定，unigateway 仅传递高层偏好。
+- Tokenizer/chat template：属于模型执行语义，由 sglang-lite engine 持有，避免调用方
+  与模型版本不一致。
+- Metrics：engine/control 暴露 standalone 必需指标；UniGateway 可选聚合。
+- 配置：standalone 提供最小启动配置；跨后端和租户策略由 UniGateway 控制。
+- Batching policy：必须在 engine 内执行；外部只能通过稳定协议传递高层 hint。
+- Attention backend：由 sglang-lite 内部根据模型、硬件和配置选择。
 
 ## 5. 演进建议
 
-1. 优先把 LiteEngine 编排逻辑剥离，unigateway 直接操作三个构建块。
-2. 在 unigateway 侧实现 SglangLiteDriver，使用上面拆分后的组件。
-3. sglang-lite 保持极简，只做 MoE 友好的 KV + 调度 + 执行。
+1. 在 sglang-lite engine process 内建立中央 async engine loop。
+2. 用真实 TokenDelta 协议连接 Rust control/serving 与 Python engine。
+3. 在 UniGateway 侧可选实现通用 LocalInferenceDriver，只调用独立服务接口。
 4. 持续内部拆分，提升可测试性和可替换性，但不要过度解耦影响性能。
+
+具体补齐路线见 `docs/standalone-inference-service-roadmap.md`。
 
 此文档用于 sglang-lite 团队内部对齐演进方向。

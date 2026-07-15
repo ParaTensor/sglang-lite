@@ -2,7 +2,10 @@
 
 ## Guiding Principle: High Cohesion + Composability
 
-sglang-lite remains a **pure library** whose job is to provide the three core capabilities for a MoE "Token Factory". These capabilities are not SGLang-specific; they are the same engine-level responsibilities found in vLLM:
+The `engine/` core remains a **pure library**, while sglang-lite as a product is an
+independent MoE inference backend with a thin Rust control/serving shell. It does not require
+SGLang, vLLM, or UniGateway. Its three core capabilities are not SGLang-specific; they are
+the same engine-level responsibilities found in vLLM:
 
 | Engine-neutral capability | sglang-lite / SGLang-oriented implementation | vLLM implementation |
 | --- | --- | --- |
@@ -12,36 +15,54 @@ sglang-lite remains a **pure library** whose job is to provide the three core ca
 
 The shared capability model does **not** imply implementation or internal API compatibility. Each backend owns its scheduler state, cache indexing, block lifecycle, and execution path. UniGateway should depend on capability and protocol contracts, not these internal classes.
 
-It also does not imply complete product equivalence. FlashInfer can provide attention, KV, sampling, and related GPU kernels, but it does not provide the scheduler, cache policy, model registry/loaders, distributed executor, broad feature surface, or production compatibility matrix that make up vLLM as a complete engine. `UniGateway + sglang-lite + FlashInfer` can replace vLLM only inside sglang-lite's deliberately narrow supported envelope.
+It also does not imply complete product equivalence. FlashInfer can provide attention, KV, sampling, and related GPU kernels, but it does not provide the scheduler, cache policy, model registry/loaders, distributed executor, broad feature surface, or production compatibility matrix that make up vLLM as a complete engine. A completed standalone `sglang-lite + FlashInfer` can replace vLLM only inside sglang-lite's deliberately narrow supported envelope; UniGateway is optional.
 
 sglang-lite realizes the three capabilities with these deeply coupled pieces:
 
 1. **RadixKVCache** (was KVCacheManager)
    - Composed of: RadixTree + KVAllocator + MemoryBudget + EvictionPolicy
 2. **BatchingScheduler** (was Scheduler)
-   - Composed of: SequenceTable + BatchFormer + (AdmissionController can be peeled to unigateway)
+   - Composed of: SequenceTable + BatchFormer + engine-local admission/backpressure
 3. **MoEModelRunner** (was ModelRunner)
    - Composed of: ModelLoader + MoERouter + PrefillExecutor + DecodeExecutor + KernelBackend
 
-unigateway (or any host) owns:
-- The main orchestration loop (what used to be LiteEngine)
-- Admission control, request queuing, timeouts
-- Higher-level batching policy selection
-- Metrics collection, logging context, lifecycle
+The sglang-lite engine process owns:
+- The central orchestration/engine loop
+- Waiting/running sequence state and token-budget batch formation
+- Engine-local queue bounds, cancellation, timeout cleanup, and OOM handling
+- KV/model execution hot-path composition and internal metrics
 
-sglang-lite only exports the fine-grained building blocks + a small default composition helper.
+An external gateway may own cross-backend admission and routing policy, but it never directly
+drives the engine's internal Python classes.
 
-## Layered Architecture (MVP) — sglang-lite as pure engine, unigateway as driver
+## Layered Architecture — Independent Backend, Optional Gateway
 
-**sglang-lite is now a pure library** (the "Token Factory").
+The direct-use topology is:
 
-All serving, routing, auth, rate-limiting, configuration, advanced observability, and driver integration are peeled to **unigateway** (or thin dedicated layers).
+```text
+OpenAI Client
+  ↓ HTTP/SSE
+sglang-lite-serving (Rust executable)
+  • minimal OpenAI validation and error shape
+  • request id, true SSE, disconnect/timeout/cancel propagation
+  • health, readiness, metrics, graceful drain
+  ↓ internal HTTP or gRPC stream
+sglang-lite engine process (Python)
+  • central engine loop
+  • RadixKVCache + BatchingScheduler + MoEModelRunner
+  • sampling + tokenizer/detokenizer
+  • FlashInfer / Triton / CUDA
+```
 
-unigateway acts as the **backend driver** for sglang-lite (the actual driver code lives in the unigateway repository):
-- It loads and manages the sglang-lite engine via standard protocols (HTTP or gRPC). Direct embedding is avoided to preserve unigateway's generality as an SDK.
-- It handles the OpenAI surface, streaming, validation, metrics, routing, auth, etc.
-- Any "sglang-lite backend" registration and connection logic moves to unigateway.
-- sglang-lite only exposes the minimal engine API.
+For a full gateway deployment:
+
+```text
+Clients → UniGateway → (sglang-lite | vLLM | SGLang)
+```
+
+UniGateway is optional. It adds multi-backend routing, auth, tenant/global rate limits,
+failover, policy, and metrics aggregation. It calls sglang-lite through HTTP or gRPC;
+direct embedding is prohibited.
 
 **Important note for the UniGateway team**:
 - Please keep UniGateway's core abstractions (`ProviderDriver`, registry, routing, etc.) completely general.
@@ -80,12 +101,9 @@ Non-goals:
 - Do not add dense, multimodal, LoRA, speculative decoding, or disaggregated serving to core for the sake of vLLM compatibility.
 
 ```
-Clients / unigateway (full gateway + driver)
-  • Owns: HTTP server, routing, auth, metrics, admission control,
-    request lifecycle, higher-level policies
-  • Composes sglang-lite building blocks
-        ↓ uses
-sglang-lite (pure library — only the three building blocks)
+sglang-lite engine process
+  • Owns engine loop, request/sequence state, token budget,
+    cancellation cleanup, KV lifecycle, and model execution
 
   RadixKVCache
     ├── RadixTree
@@ -94,7 +112,7 @@ sglang-lite (pure library — only the three building blocks)
 
   BatchingScheduler
     ├── SequenceTable
-    └── BatchFormer (unigateway can supply custom policy)
+    └── BatchFormer
 
   MoEModelRunner
     ├── ModelLoader
@@ -102,19 +120,23 @@ sglang-lite (pure library — only the three building blocks)
     ├── PrefillExecutor / DecodeExecutor
     └── KernelBackend
 
-Everything else (serving, config, observability export, driver glue)
-is in unigateway or host application.
+sglang-lite-control / serving
+  • Own minimal OpenAI/SSE, readiness, engine-local limits and lifecycle
+
+Optional UniGateway
+  • Own cross-backend routing, auth, global policy and aggregation
 ```
 
-**Key peelings to unigateway:**
-- All HTTP serving and OpenAI surface
+**Kept outside sglang-lite and optionally provided by UniGateway:**
 - Auth, rate limit, routing, semantic routing
-- Advanced metrics, structured logging, tracing
-- Configuration and presets
-- Graceful shutdown, health, timeouts coordination
-- Driver glue (how to load/call sglang-lite engine)
+- Cross-backend retry/failover and tenant policy
+- Broad OpenAI/other-provider API normalization
+- Advanced metrics aggregation and distributed tracing
+- Agent/tool/structured-output business logic
 
-sglang-lite only owns the three high-cohesion pieces inside the MoE engine.
+Minimal chat serving, real streaming, health/readiness, request cancellation, local
+backpressure, configuration, and graceful shutdown are required for standalone use and remain
+inside the thin sglang-lite service shell.
 
 ## Internal Protocol (to be defined precisely in code)
 

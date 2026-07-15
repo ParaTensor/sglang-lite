@@ -66,7 +66,8 @@ FlashInfer 的定位是 GPU kernel/backend library，主要覆盖 attention、pa
 
 | 层 | 组件 | 负责内容 |
 | --- | --- | --- |
-| Gateway/control plane | UniGateway | API、routing、auth、metrics、lifecycle |
+| Optional gateway | UniGateway | 多后端 routing、auth、全局 policy、metrics 聚合 |
+| Standalone control/serving | sglang-lite control/serving | 最小 OpenAI API、真实 streaming、单引擎 request lifecycle |
 | Engine core | sglang-lite | KV/cache policy、continuous scheduling、MoE model execution |
 | Kernel backend | FlashInfer/Triton/CUDA | attention、paged KV、sampling、MoE kernels |
 
@@ -109,9 +110,9 @@ vLLM V1 的公开设计重点包括：
 
 | 维度 | vLLM | sglang-lite |
 | --- | --- | --- |
-| 产品定位 | 通用 LLM/VLM serving engine + OpenAI-compatible server | 极简 MoE Token Factory / pure library |
+| 产品定位 | 通用 LLM/VLM serving engine + OpenAI-compatible server | 独立 MoE inference backend；pure engine core + thin standalone service |
 | 模型范围 | Dense、MoE、multimodal、pooling、audio 等广泛模型 | 只支持主流 MoE；dense/multimodal 不进 core |
-| API 面 | 宽 OpenAI-like 表面 + vLLM extra params | 最小 chat completions / models / health；完整 OpenAI 表面由 UniGateway 承担 |
+| API 面 | 宽 OpenAI-like 表面 + vLLM extra params | 独立提供最小 chat completions / streaming / models / health；宽 API 和多后端能力可由 UniGateway 承担 |
 | Prefix cache | Hash-based APC over full blocks | RadixKVCache 默认；可暴露 generic prefix-cache/block-KV capability |
 | KV cache | PagedAttention / KVCacheManager | RadixKVCache + allocator；可兼容 block table / paged KV 语义 |
 | Scheduler | 统一 token budget，支持多功能组合 | MoE-aware continuous batching；优先保持可理解与低复杂度 |
@@ -119,7 +120,9 @@ vLLM V1 的公开设计重点包括：
 
 因此，sglang-lite 不应该成为 “mini vLLM”，也不应该只做 “mini SGLang”。更准确的定位是：
 
-> 一个 MoE-only、prefix-heavy workloads 优先的 local inference backend；通过 UniGateway 与 vLLM 共享 OpenAI-compatible 协议、provider capability 和观测指标抽象。
+> 一个可独立运行、MoE-only、prefix-heavy workloads 优先的 local inference backend；
+> 与 vLLM 共享 OpenAI-compatible 协议、provider capability 和观测指标抽象，
+> UniGateway 可选。
 
 ## 5. 兼容层级
 
@@ -235,4 +238,5 @@ sglang-lite 内部仍可以使用 RadixKVCache，但对外不要暴露 RadixTree
 | 需要 SGLang frontend language / structured generation runtime | full SGLang |
 | Gateway 层统一多后端路由、auth、metrics、policy | UniGateway |
 
-sglang-lite 的核心价值不是替代 vLLM，而是在更窄的 MoE + prefix-heavy 生产场景里保持更小、更稳定、更容易调试；同时通过 UniGateway 与 vLLM 在协议、capability、metrics 层保持兼容。
+sglang-lite 的核心价值不是复制 vLLM，而是在更窄的 MoE + prefix-heavy 生产场景里
+独立提供更小、更稳定、更容易调试的推理服务；UniGateway 只在需要统一多后端时使用。

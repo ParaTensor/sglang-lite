@@ -2,7 +2,8 @@
 //!
 //! **Thin Rust wrapper** for the sglang-lite inference engine.
 //!
-//! - Full serving (detailed OpenAI protocol, drivers, auth, etc.) MUST be in Unigateway (external).
+//! - This binary is the official minimal standalone service.
+//! - Broad OpenAI protocol support, multi-backend routing, auth, and policy stay in an optional gateway.
 //! - This crate only composes the `sglang-lite-control` library into a runnable standalone server.
 //! - See `control/` for the actual control plane logic.
 

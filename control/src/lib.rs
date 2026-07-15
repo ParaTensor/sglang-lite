@@ -5,8 +5,9 @@
 //! - Early rejection of out-of-scope features
 //! - Clean internal request protocol to the engine core
 //!
-//! NOTE: Full OpenAI surface, drivers, and serving logic MUST be implemented in
-//! Unigateway (external Rust). This crate is only a thin adapter.
+//! NOTE: This crate owns only the minimal single-engine serving contract.
+//! Broad protocol normalization, multi-backend routing, auth, and policy belong
+//! in an optional gateway such as Unigateway.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -67,8 +68,8 @@ pub fn build_router(
 
 /// Run a standalone HTTP server with the given configuration.
 ///
-/// This is provided as a convenience for local testing and standalone deployments.
-/// Production serving should be handled by Unigateway.
+/// This is the minimal standalone serving entry point.
+/// Multi-backend gateway capabilities may be added by an upstream such as Unigateway.
 pub async fn serve(
     engine: Arc<StubEngineClient>,
     model_list: Arc<Vec<String>>,
