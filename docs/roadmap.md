@@ -1,6 +1,6 @@
 # sglang-lite Roadmap
 
-## Phase 0 — Core Verification (Current Focus)
+## Phase 0 — Core Verification
 
 Goal: A runnable system that proves the architecture and can serve real (small) models with basic continuous batching + Radix skeleton.
 
@@ -19,7 +19,7 @@ Goal: A runnable system that proves the architecture and can serve real (small) 
   - `ModelRunner` stub + simple real path (HF generate for tiny model on CPU/CUDA when available)
 - [ ] Integration: Rust can talk to Python (HTTP first)
 - [ ] Basic metrics emitted (even if stubbed): queue depth, batch size, fake t/s
-- [ ] Can run a full chat roundtrip for a small open model (e.g. Qwen2.5-0.5B or TinyLlama) and observe logs
+- [ ] Can run a full chat roundtrip for a small approved MoE model/test fixture and observe logs
 - [ ] CI skeleton (cargo check + fmt + clippy, python lint + basic test)
 
 **Success criteria**
@@ -33,18 +33,18 @@ Goal: A runnable system that proves the architecture and can serve real (small) 
 - Production metrics
 - Any multimodal or structured output
 
-## Phase 1 — Production Shell + Real Core
+## Phase 1 — Independent Streaming Service + Real Core (Current Focus)
 
-- Full RadixAttention implementation with block / page management, prefix matching, eviction policy
-- Scheduler that actually does continuous batching (add prefill, promote decode sequences, manage seq lens)
-- CUDA graph capture around decode forward (the big win)
-- Real quant support (at least AWQ + FP8 path with correct memory accounting)
-- Good model support matrix for popular MoE models only (DeepSeek, Qwen-MoE, Mixtral 等; up to 70B+ class). Dense models are out of scope.
-- Prometheus + /metrics, structured logging, graceful drain
-- Configuration system with "lite" preset (very few flags)
-- Request timeout, max concurrent, queue limits
-- Error normalization that matches OpenAI behavior closely
-- Basic benchmark script (share prefix chat workload)
+- [ ] One real MoE golden path with reference correctness
+- [ ] Full per-layer Radix/Paged KV implementation with prefix compute skip
+- [ ] Central token-budget continuous batching engine loop
+- [ ] Real Rust ↔ Python token/delta streaming with cancel and backpressure
+- [ ] Official standalone CLI and minimal OpenAI chat/stream/models surface
+- [ ] Readiness, Prometheus metrics, structured logging, graceful drain
+- [ ] Request timeout, local queue/max-concurrency limits, stable error normalization
+- [ ] CUDA graph decode
+- [ ] Verified quantization and MoE model support matrix
+- [ ] Prefix-heavy concurrency, cancellation, OOM and soak benchmarks
 
 **Stretch**
 - Optional Paged strategy selectable at startup
@@ -52,12 +52,12 @@ Goal: A runnable system that proves the architecture and can serve real (small) 
 
 ## Phase 2 — Polish + Integration + Hardening
 
-- Deep integration tests with unigateway (semantic routing + KV affinity hints)
+- Optional integration tests with UniGateway (semantic routing + KV affinity hints)
 - Rust control plane enhancements (more early filters, intent metadata passthrough)
 - Optional future: consider Rust components only if needed for extreme performance (no PyO3 embedding planned for unigateway integration)
 - Performance parity target vs SGLang on prefix-heavy chat workloads (within 10-15% on same hardware)
 - Packaging: docker images, helm chart skeleton
-- Documentation: operator guide, "when to choose sglang-lite vs full SGLang"
+- Documentation: operator guide, "when to choose sglang-lite vs vLLM vs full SGLang"
 - Formal support policy for model families
 
 ## Later / Optional
@@ -80,16 +80,14 @@ Current status: **Phase 1 in progress — MoE-only scope** (reassessed 2026-06-2
 
 **Phase 0 complete** — v0.1.0
 
-Reassessed boundary: sglang-lite now targets **MoE models only**. Dense models are explicitly out of scope. Primary focus on popular MoE (DeepSeek, Qwen-MoE, Mixtral-style, etc.). The engine is a pure library. Serving and cross-cutting concerns are peeled to unigateway or thin layers. The engine remains high-cohesion and "lite".
+Reassessed boundary: sglang-lite targets **MoE models only**. Dense models are explicitly out
+of scope. The engine core is a pure library, and the repository ships a thin standalone
+service so users do not need SGLang, vLLM, or UniGateway. Advanced gateway concerns remain
+outside.
 
-## Phase 1 Deliverables (all completed)
-- [x] Prometheus + /metrics (Python + Rust)
-- [x] Structured logging + request_id
-- [x] Config system ("lite" preset + env/CLI)
-- [x] Robustness: timeouts, max_concurrent, queue limits
-- [x] Benchmark script
-- [x] Scheduler improvements (batching, eviction)
-- [x] OpenAI error normalization
-- [x] Graceful shutdown via server runtimes
+Existing Phase 1 shells (metrics endpoints, config, request IDs, timeout/concurrency fields,
+benchmark scripts, and shutdown hooks) are **not completion evidence** while execution,
+KV paging, batching, and streaming still use stub or placeholder paths.
 
-Non-goals for Phase 1: CUDA graph, 70B perf, full paged attention.
+Detailed milestones and exit criteria:
+[`standalone-inference-service-roadmap.md`](./standalone-inference-service-roadmap.md).

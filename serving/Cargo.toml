@@ -3,7 +3,7 @@ name = "sglang-lite-serving"
 version = "0.1.0"
 edition = "2021"
 authors = ["sglang-lite contributors"]
-description = "Thin executable wrapper for sglang-lite. Full serving is provided by Unigateway (external Rust)."
+description = "Official thin standalone serving wrapper for the sglang-lite inference engine."
 license = "Apache-2.0"
 rust-version = "1.75"
 

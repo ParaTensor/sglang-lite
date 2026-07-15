@@ -2,52 +2,108 @@
 
 ## Guiding Principle: High Cohesion + Composability
 
-sglang-lite remains a **pure library** whose job is to provide the three core building blocks for a MoE "Token Factory". These three must stay reasonably cohesive for performance, but we further decompose them internally so that unigateway (as the driver) can compose and control higher-level policies.
+The `engine/` core remains a **pure library**, while sglang-lite as a product is an
+independent MoE inference backend with a thin Rust control/serving shell. It does not require
+SGLang, vLLM, or UniGateway. Its three core capabilities are not SGLang-specific; they are
+the same engine-level responsibilities found in vLLM:
 
-Core three (still the only deeply coupled pieces):
+| Engine-neutral capability | sglang-lite / SGLang-oriented implementation | vLLM implementation |
+| --- | --- | --- |
+| KV lifecycle + prefix reuse | RadixKVCache / RadixAttention | KVCacheManager + APC + PagedAttention blocks |
+| Continuous token scheduling | BatchingScheduler | vLLM V1 Scheduler |
+| Model execution | MoEModelRunner + CUDA graph/kernel backend | GPUModelRunner / Worker + CUDA graph/compile |
+
+The shared capability model does **not** imply implementation or internal API compatibility. Each backend owns its scheduler state, cache indexing, block lifecycle, and execution path. UniGateway should depend on capability and protocol contracts, not these internal classes.
+
+It also does not imply complete product equivalence. FlashInfer can provide attention, KV, sampling, and related GPU kernels, but it does not provide the scheduler, cache policy, model registry/loaders, distributed executor, broad feature surface, or production compatibility matrix that make up vLLM as a complete engine. A completed standalone `sglang-lite + FlashInfer` can replace vLLM only inside sglang-lite's deliberately narrow supported envelope; UniGateway is optional.
+
+sglang-lite realizes the three capabilities with these deeply coupled pieces:
 
 1. **RadixKVCache** (was KVCacheManager)
    - Composed of: RadixTree + KVAllocator + MemoryBudget + EvictionPolicy
 2. **BatchingScheduler** (was Scheduler)
-   - Composed of: SequenceTable + BatchFormer + (AdmissionController can be peeled to unigateway)
+   - Composed of: SequenceTable + BatchFormer + engine-local admission/backpressure
 3. **MoEModelRunner** (was ModelRunner)
    - Composed of: ModelLoader + MoERouter + PrefillExecutor + DecodeExecutor + KernelBackend
 
-unigateway (or any host) owns:
-- The main orchestration loop (what used to be LiteEngine)
-- Admission control, request queuing, timeouts
-- Higher-level batching policy selection
-- Metrics collection, logging context, lifecycle
+The sglang-lite engine process owns:
+- The central orchestration/engine loop
+- Waiting/running sequence state and token-budget batch formation
+- Engine-local queue bounds, cancellation, timeout cleanup, and OOM handling
+- KV/model execution hot-path composition and internal metrics
 
-sglang-lite only exports the fine-grained building blocks + a small default composition helper.
+An external gateway may own cross-backend admission and routing policy, but it never directly
+drives the engine's internal Python classes.
 
-## Layered Architecture (MVP) — sglang-lite as pure engine, unigateway as driver
+## Layered Architecture — Independent Backend, Optional Gateway
 
-**sglang-lite is now a pure library** (the "Token Factory").
+The direct-use topology is:
 
-All serving, routing, auth, rate-limiting, configuration, advanced observability, and driver integration are peeled to **unigateway** (or thin dedicated layers).
+```text
+OpenAI Client
+  ↓ HTTP/SSE
+sglang-lite-serving (Rust executable)
+  • minimal OpenAI validation and error shape
+  • request id, true SSE, disconnect/timeout/cancel propagation
+  • health, readiness, metrics, graceful drain
+  ↓ internal HTTP or gRPC stream
+sglang-lite engine process (Python)
+  • central engine loop
+  • RadixKVCache + BatchingScheduler + MoEModelRunner
+  • sampling + tokenizer/detokenizer
+  • FlashInfer / Triton / CUDA
+```
 
-unigateway acts as the **backend driver** for sglang-lite (the actual driver code lives in the unigateway repository):
-- It loads and manages the sglang-lite engine via standard protocols (HTTP or gRPC). Direct embedding is avoided to preserve unigateway's generality as an SDK.
-- It handles the OpenAI surface, streaming, validation, metrics, routing, auth, etc.
-- Any "sglang-lite backend" registration and connection logic moves to unigateway.
-- sglang-lite only exposes the minimal engine API.
+For a full gateway deployment:
+
+```text
+Clients → UniGateway → (sglang-lite | vLLM | SGLang)
+```
+
+UniGateway is optional. It adds multi-backend routing, auth, tenant/global rate limits,
+failover, policy, and metrics aggregation. It calls sglang-lite through HTTP or gRPC;
+direct embedding is prohibited.
 
 **Important note for the UniGateway team**:
 - Please keep UniGateway's core abstractions (`ProviderDriver`, registry, routing, etc.) completely general.
 - Do **not** introduce sglang-lite specific concepts into the core engine or protocol layers.
 - All MoE/Radix-specific logic must stay inside the sglang-lite driver implementation.
-- Treat sglang-lite the same way you would treat any other local or remote LLM backend.
+- Treat sglang-lite the same way you would treat any other local or remote LLM backend, including vLLM.
+- Prefer generic local-inference concepts (`PrefixCache`, `BlockKVCache`, `ContinuousScheduler`, `ModelExecutor`, `BackendCapabilities`) over SGLang/Radix-specific terms in UniGateway core.
 - **Critical boundary**: PyO3, direct Python embedding, or any in-process library calls are explicitly not used. All communication must go through HTTP or gRPC. This boundary is to keep UniGateway as a general-purpose embeddable SDK.
 - Detailed requirements document: `docs/unigateway-sglang-lite-requirements.md`
+- vLLM positioning document: `docs/vllm-positioning-compatibility.md`
+
+## vLLM-compatible positioning
+
+sglang-lite's external position should be compatible with vLLM as another `local-inference` backend, while its internal implementation remains MoE-only and Radix-first.
+
+The primary conclusion is that the original three sglang-lite core capabilities also apply to vLLM. Compatibility therefore starts from a shared capability model:
+
+1. KV allocation, eviction, block lifecycle, and optional prefix reuse.
+2. Continuous scheduling across prefill/decode token work.
+3. Model execution, kernel selection, CUDA graph/compile, and MoE routing where supported.
+
+RadixAttention is only one implementation of the first capability; it must not define the generic backend contract.
+
+Compatibility target:
+
+- **Protocol**: keep the minimal OpenAI-compatible chat completions surface aligned with vLLM's local server shape where in scope: `/v1/chat/completions`, streaming chunks, `/v1/models`, health, request-id passthrough, and OpenAI-shaped errors.
+- **Capabilities**: expose generic backend capabilities (`chat_completions`, `streaming`, `prefix_cache`, `prefix_cache_metric`, `moe_optimized`) rather than backend-name-specific checks.
+- **Metrics**: treat `usage.cache_hit_tokens` as a generic prefix-cache metric. It should be usable for both sglang-lite RadixKVCache and vLLM Automatic Prefix Caching.
+- **KV abstraction**: keep RadixKVCache as the default internal structure, but make block/page terminology compatible with vLLM-style KVCacheManager/PagedAttention concepts.
+
+Non-goals:
+
+- Do not implement vLLM's broad API surface in sglang-lite core (`/v1/responses`, audio, multimodal, embeddings for non-core models).
+- Do not expose vLLM-specific request parameters as stable sglang-lite contract unless they are part of the shared minimal sampling surface.
+- Do not import vLLM internals or copy its scheduler/KV manager wholesale.
+- Do not add dense, multimodal, LoRA, speculative decoding, or disaggregated serving to core for the sake of vLLM compatibility.
 
 ```
-Clients / unigateway (full gateway + driver)
-  • Owns: HTTP server, routing, auth, metrics, admission control,
-    request lifecycle, higher-level policies
-  • Composes sglang-lite building blocks
-        ↓ uses
-sglang-lite (pure library — only the three building blocks)
+sglang-lite engine process
+  • Owns engine loop, request/sequence state, token budget,
+    cancellation cleanup, KV lifecycle, and model execution
 
   RadixKVCache
     ├── RadixTree
@@ -56,7 +112,7 @@ sglang-lite (pure library — only the three building blocks)
 
   BatchingScheduler
     ├── SequenceTable
-    └── BatchFormer (unigateway can supply custom policy)
+    └── BatchFormer
 
   MoEModelRunner
     ├── ModelLoader
@@ -64,19 +120,23 @@ sglang-lite (pure library — only the three building blocks)
     ├── PrefillExecutor / DecodeExecutor
     └── KernelBackend
 
-Everything else (serving, config, observability export, driver glue)
-is in unigateway or host application.
+sglang-lite-control / serving
+  • Own minimal OpenAI/SSE, readiness, engine-local limits and lifecycle
+
+Optional UniGateway
+  • Own cross-backend routing, auth, global policy and aggregation
 ```
 
-**Key peelings to unigateway:**
-- All HTTP serving and OpenAI surface
+**Kept outside sglang-lite and optionally provided by UniGateway:**
 - Auth, rate limit, routing, semantic routing
-- Advanced metrics, structured logging, tracing
-- Configuration and presets
-- Graceful shutdown, health, timeouts coordination
-- Driver glue (how to load/call sglang-lite engine)
+- Cross-backend retry/failover and tenant policy
+- Broad OpenAI/other-provider API normalization
+- Advanced metrics aggregation and distributed tracing
+- Agent/tool/structured-output business logic
 
-sglang-lite only owns the three high-cohesion pieces inside the MoE engine.
+Minimal chat serving, real streaming, health/readiness, request cancellation, local
+backpressure, configuration, and graceful shutdown are required for standalone use and remain
+inside the thin sglang-lite service shell.
 
 ## Internal Protocol (to be defined precisely in code)
 
@@ -133,6 +193,7 @@ class Scheduler:
 - Use HF `AutoModelForCausalLM` + `AutoTokenizer` initially for loading.
 - Later: direct safetensors weight loading + custom modeling files for speed (like nano-vLLM style).
 - Extension point: small model registry + loader trait.
+- vLLM compatibility is handled through protocol/capability mapping, not by expanding sglang-lite model scope to match vLLM.
 
 ## Observability
 

@@ -1,17 +1,23 @@
 # sglang-lite Optimization Priorities (2026-07-06)
 
-This document records the current optimization summary after pausing unigateway integration work.
+This document records the current optimization summary. The authoritative plan for turning
+sglang-lite into an independent streaming inference service is
+[`standalone-inference-service-roadmap.md`](./standalone-inference-service-roadmap.md).
 
 ## Current State Summary
 
-- 架构方向正确：LiteEngine 是薄 facade，推荐 unigateway 直接组合 RadixKVCache、BatchingScheduler、MoEModelRunner 三个块。
+- 核心三块的方向正确，但旧的“由 unigateway 直接组合内部类并拥有主循环”与
+  HTTP/gRPC 进程边界冲突。主循环和三块热路径组合必须由 sglang-lite engine process
+  自己拥有；UniGateway 只能作为可选上游。
 - 核心实现仍以 stub 为主：
   - runner 用 tiny stub transformer
   - kv_cache 有基础 radix tree 但 eviction/paging 是 placeholder
   - scheduler 有框架但很多逻辑简化
 - Phase 0 基本完成，Phase 1 roadmap 上很多标 “completed”，但实际距离“可用于真实 MoE 生产负载”还有明显差距。
 - 最近 gRPC 相关文件（pb2 等）留在 engine/ 里，属于集成副产品。
-- 原来 Rust 侧的独立 OpenAI 兼容服务器代码已移动到 serving/control/（main.rs + openai.rs + stub_engine），作为薄控制面保留。完整 serving 应由 unigateway 提供，与“serving 剥离”原则一致。建议逐步标记为 legacy 或瘦身成协议定义。
+- Rust `control/` + `serving/` 应成为官方的薄 standalone 入口，而不是 legacy/demo。
+  它只需要形成单引擎可用闭环；多后端 routing、auth 和业务逻辑继续留给可选
+  UniGateway。
 
 ## 优先需要优化的领域（按对核心价值的影响排序）
 
@@ -32,20 +38,24 @@ This document records the current optimization summary after pausing unigateway 
   - Decode 阶段的 CUDA graph（scope 里明确允许 conservative 使用，这是 perf 大头）。
   - 准确的 KV 管理与 runner 交互。
 
-**建议**：先挑一个小真实 MoE 模型（例如 Qwen2.5-0.5B 或类似 MoE 变体）打通真实路径，再做 stub 分支。目标：至少能跑一个小真实 MoE 模型 + 观察 prefix cache 命中。
+**建议**：先选择一个可运行的小型 MoE checkpoint，或用缩小配置构造受支持 MoE
+家族的测试 fixture，打通真实路径。目标：至少能跑一个真实 MoE 模型并验证 prefix
+cache 对实际 prefill 计算的减少。
 
-### 2. 内部进一步分解 + 清晰接口（为 unigateway 驱动做准备）
-scope 和 architecture 都反复强调要分解，让 driver 可以替换/组合策略。
+### 2. 内部进一步分解 + 清晰接口（为 engine loop 和跨进程协议做准备）
+内部仍需要清晰接口，但外部 gateway 不直接组合 Python 类。
 
 当前分解已经开始（RadixTree / KVAllocator、SequenceTable / BatchFormer、MoERouter / Executors 等），但还不够显式和干净。
 
 - 给三个主类定义稳定的公开接口（dataclass / Protocol / ABC）。
-- 把可替换策略（eviction policy、batch formation policy、router）明确暴露出来。
+- 把可替换策略（eviction policy、batch formation policy、router）明确暴露给
+  sglang-lite 自己的 composition root。
 - 减少 LiteEngine 里的隐式状态（目前 _seq_map 等还是在 facade 里）。
 
 ### 3. 清理与集成暂停相关的遗留
 - engine/ 里的 sglang_lite_pb2* 文件：既然 unigateway 集成暂停，建议移到 examples/ 或做成可选 feature，否则污染纯库包。
-- serving/control/ 下的独立服务器代码（main.rs + openai.rs + stub_engine）：明确标记为“standalone demo / legacy”或瘦身成只剩协议定义。完整 serving 由 unigateway 负责。
+- `serving/control/`：删除 stub 默认路径，接入真实 `GenerationRequest` /
+  `TokenDelta` 流；把 standalone wrapper 提升为正式用户入口。
 - 文档状态漂移：
   - roadmap.md 里 Phase 1 大量标 completed，但代码现实不符，需要诚实更新。
   - scope.md 和 architecture.md 很好，但要和实际类名（RadixCache vs 文档里的 RadixKVCache 等）保持同步。
@@ -67,10 +77,15 @@ scope 和 architecture 都反复强调要分解，让 driver 可以替换/组合
 - PyO3 直接嵌入
 
 ## 推荐的下一步优先级
-1. 把三个核心块的真实骨架打通（至少能跑一个小真实 MoE 模型 + 观察 prefix cache 命中）。
-2. 明确导出三个块的接口 + 更新 LiteEngine 为“仅示例兼容层”。
-3. 清理 gRPC 生成文件 + 修正 roadmap/文档状态。
-4. 补一个可用的 benchmark + 少量真实模型测试。
+1. 一个真实 MoE 模型的 reference correctness。
+2. 真实 per-layer paged KV、prefix skip、回收与 OOM。
+3. sglang-lite engine process 内的中央 async continuous batching loop。
+4. Rust ↔ Python 真实 TokenDelta streaming、cancel 和 backpressure。
+5. 官方 standalone CLI、readiness、metrics、错误与 graceful drain。
+6. CUDA graph、量化/TP、模型矩阵、benchmark 和 soak test。
+
+完整退出标准见
+[`standalone-inference-service-roadmap.md`](./standalone-inference-service-roadmap.md)。
 
 ---
 
