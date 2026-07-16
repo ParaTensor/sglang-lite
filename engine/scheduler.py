@@ -20,6 +20,7 @@ class Sequence:
     cache_hit_tokens: int = 0
     block_table: List[int] = field(default_factory=list)
     kv_state: Optional[PastKV] = None
+    last_logits: Optional[object] = None  # torch.Tensor; logits after last prompt token
     created_ts: float = field(default_factory=time.time)
     last_token_ts: float = field(default_factory=time.time)
     finished: bool = False
@@ -111,17 +112,19 @@ class Scheduler:
         )
         self._next_seq_id += 1
 
-        matched, matched_len, _remaining, block_ids, past_kv = self.radix.match_prefix(input_ids)
+        matched, matched_len, _remaining, block_ids, past_kv, last_logits = self.radix.match_prefix(
+            input_ids
+        )
         seq.cached_len = matched_len
-        seq.cache_hit_tokens = matched_len if (past_kv is not None or block_ids) else 0
+        # Hit counts when paged prefix blocks are reusable (rebuild past from pages).
+        seq.cache_hit_tokens = matched_len if block_ids else 0
         if block_ids:
             seq.block_table = list(block_ids)
+        # Prefer paged rebuild; keep forked HF past only as fallback
         if past_kv is not None:
             seq.kv_state = past_kv
-
-        if matched and (past_kv is not None or block_ids):
-            # Keep tree node refs warm
-            self.radix.insert_or_update(matched, None, matched_len, block_ids=block_ids or None)
+        if last_logits is not None:
+            seq.last_logits = last_logits
 
         self.waiting.append(seq)
         self._by_request[request_id] = seq
@@ -170,7 +173,11 @@ class Scheduler:
         seq.prefill_tokens += len(new_tokens)
         full_prompt = seq.input_ids[: seq.cached_len]
         self.radix.insert_or_update(
-            full_prompt, new_kv_state, seq.cached_len, block_ids=list(seq.block_table)
+            full_prompt,
+            new_kv_state,
+            seq.cached_len,
+            block_ids=list(seq.block_table),
+            last_logits=getattr(seq, "last_logits", None),
         )
 
     def update_after_decode(

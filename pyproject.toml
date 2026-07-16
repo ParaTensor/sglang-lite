@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang-lite"
-version = "0.2.0"
+version = "0.2.1"
 description = "sglang-lite Python execution core (pure library): Radix KV + MoE-aware continuous batching scheduler + model runner for popular MoE models"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,6 +15,7 @@ dependencies = [
     "pydantic>=2.0",
     "torch>=2.3",
     "transformers>=4.40",
+    "accelerate>=0.30",
     "sentencepiece>=0.2",
     # gRPC support for unigateway integration (optional in practice, but included for completeness)
     "grpcio>=1.60",

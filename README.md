@@ -208,10 +208,18 @@ Apache-2.0 (to be confirmed)
 
 ## Status
 
-Phase 0 P0 standalone path is implemented: real MoE load (no silent stub fallback),
-Radix/paged KV with prefix skip, central engine loop, true Rust↔Python TokenDelta
-streaming, and `sglang-lite-serving serve`. P1 items (CUDA graph, quant matrix, TP)
-remain. Not a vLLM feature-parity substitute.
+**P0+ execution path** (v0.2.x): standalone Rust→Python serve, true NDJSON/SSE deltas,
+central scheduler loop, **tensor-batched HF forward** (same cached_len groups), and
+**paged KV as rebuildable attention state** (decode/prefill rebuild past from pages).
+
+Current limits (still not full SGLang/vLLM parity):
+- Logits still produced by HuggingFace MoE modules; FlashInfer is used for paged append
+  when installed+CUDA, not yet a full custom attention+MoE kernel stack.
+- Prefill/decode batching requires equal sequence lengths within a group (otherwise serial).
+- Popular hub MoE + CUDA: enable with GPU and optional `SGLANG_LITE_POPULAR_MOE=<id>`.
+
+P1 remains: FlashInfer attention in the hot path, CUDA graph decode, quant/TP.
+Not a vLLM feature-parity substitute.
 
 See git history and docs for detailed design discussions.
 

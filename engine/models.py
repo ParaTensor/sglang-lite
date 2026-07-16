@@ -1,28 +1,26 @@
 """MoE model registry for sglang-lite.
 
 Only popular MoE families are in scope. Dense models are rejected.
+Verified ids are those successfully loaded in this process (plus explicit register).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
+from typing import List, Optional, Set
 
 
 @dataclass(frozen=True)
 class MoEFamily:
     name: str
-    # HF model_type values that map to this family
     model_types: frozenset
-    # Example hub ids (documented / listed in /v1/models when verified)
-    verified_ids: frozenset
+    example_ids: frozenset
 
 
-# Families we explicitly support (architecture-level).
 MIXTRAL = MoEFamily(
     name="mixtral",
     model_types=frozenset({"mixtral"}),
-    verified_ids=frozenset(
+    example_ids=frozenset(
         {
             "mistralai/Mixtral-8x7B-Instruct-v0.1",
             "mistralai/Mixtral-8x22B-Instruct-v0.1",
@@ -33,7 +31,7 @@ MIXTRAL = MoEFamily(
 QWEN_MOE = MoEFamily(
     name="qwen_moe",
     model_types=frozenset({"qwen2_moe", "qwen3_moe"}),
-    verified_ids=frozenset(
+    example_ids=frozenset(
         {
             "Qwen/Qwen1.5-MoE-A2.7B-Chat",
             "Qwen/Qwen2-57B-A14B-Instruct",
@@ -44,7 +42,7 @@ QWEN_MOE = MoEFamily(
 DEEPSEEK_MOE = MoEFamily(
     name="deepseek_moe",
     model_types=frozenset({"deepseek_v2", "deepseek_v3", "deepseek_moe"}),
-    verified_ids=frozenset(
+    example_ids=frozenset(
         {
             "deepseek-ai/DeepSeek-V2-Lite-Chat",
             "deepseek-ai/DeepSeek-V2-Chat",
@@ -54,11 +52,8 @@ DEEPSEEK_MOE = MoEFamily(
 
 FAMILIES: List[MoEFamily] = [MIXTRAL, QWEN_MOE, DEEPSEEK_MOE]
 
-# Ids that may appear in /v1/models once verified on this build.
-# Tiny local fixtures use the special prefix "fixture:" and bypass hub checks.
+# Only ids that successfully loaded (or were explicitly registered) this process.
 _VERIFIED: Set[str] = set()
-for fam in FAMILIES:
-    _VERIFIED |= set(fam.verified_ids)
 
 
 def is_fixture_model(model_id: str) -> bool:
@@ -66,12 +61,20 @@ def is_fixture_model(model_id: str) -> bool:
 
 
 def register_verified(model_id: str) -> None:
-    """Mark a model id as verified for this process (e.g. after load succeeds)."""
+    """Mark a model id as verified for this process (after load succeeds)."""
     _VERIFIED.add(model_id)
 
 
 def list_verified_models() -> List[str]:
     return sorted(_VERIFIED)
+
+
+def known_example_ids() -> List[str]:
+    """Documented example hub ids (not automatically advertised)."""
+    out: Set[str] = set()
+    for fam in FAMILIES:
+        out |= set(fam.example_ids)
+    return sorted(out)
 
 
 def family_for_model_type(model_type: Optional[str]) -> Optional[MoEFamily]:
@@ -87,14 +90,12 @@ def family_for_model_type(model_type: Optional[str]) -> Optional[MoEFamily]:
 def assert_moe_supported(model_id: str, model_type: Optional[str] = None) -> MoEFamily:
     """Raise ValueError if the model is not an allowed MoE family."""
     if is_fixture_model(model_id) or model_id == "stub":
-        # stub only when explicitly requested; fixture treated as Mixtral-style
         return MIXTRAL
 
     fam = family_for_model_type(model_type)
     if fam is not None:
         return fam
 
-    # Hub id heuristic for known families before config is loaded
     lower = model_id.lower()
     if "mixtral" in lower:
         return MIXTRAL
@@ -110,5 +111,4 @@ def assert_moe_supported(model_id: str, model_type: Optional[str] = None) -> MoE
 
 
 def default_serving_model_list() -> List[str]:
-    """Models advertised on GET /v1/models (verified MoE only)."""
     return list_verified_models()

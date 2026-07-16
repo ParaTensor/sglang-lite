@@ -5,12 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import time
-import uuid
 from typing import Dict, Generator, List, Optional
 
-import torch
 
-from .kv_cache import RadixCache
 from .loop import EngineLoop, GenParams
 from .runner import ModelRunner
 from .scheduler import Sequence
@@ -41,20 +38,11 @@ class LiteEngine:
         self.runner = ModelRunner(
             model_name, device=device, max_batch=max_batch_size, allow_stub=allow_stub
         )
-        self.radix = RadixCache(
-            max_tokens=65536,
-            block_size=16,
-            num_layers=self.runner.num_layers,
-            num_kv_heads=self.runner.num_kv_heads,
-            head_dim=self.runner.head_dim,
-            dtype=torch.float32 if device == "cpu" else torch.float16,
-            device=device if device != "cpu" else "cpu",
-        )
         self.loop = EngineLoop(
             self.runner,
-            radix=self.radix,
             max_batch_size=max_batch_size,
         )
+        self.radix = self.loop.radix
         self.scheduler = self.loop.scheduler
         if start_loop:
             self.loop.start()

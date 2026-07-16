@@ -15,11 +15,11 @@ from typing import Any, Dict, List, Optional
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field, field_validator
 
 from .loop import EngineLoop, GenParams
-from .models import list_verified_models
+from .models import list_verified_models, register_verified
 from .runner import ModelRunner
 
 logger = logging.getLogger("sglang_lite.process")
@@ -49,6 +49,27 @@ class GenerationRequest(BaseModel):
     stream: bool = True
     timeout_s: float = 300.0
 
+    @field_validator("max_tokens")
+    @classmethod
+    def _max_tokens(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("max_tokens must be >= 1")
+        return v
+
+    @field_validator("temperature")
+    @classmethod
+    def _temperature(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("temperature must be >= 0")
+        return v
+
+    @field_validator("top_p")
+    @classmethod
+    def _top_p(cls, v: float) -> float:
+        if not (0.0 < v <= 1.0):
+            raise ValueError("top_p must be in (0, 1]")
+        return v
+
 
 class CancelRequest(BaseModel):
     request_id: str
@@ -77,22 +98,25 @@ async def readyz():
 @app.get("/metrics")
 async def metrics():
     if LOOP is None:
-        return "# no engine\n"
-    stats = LOOP.get_stats()
-    lines = [
-        "# sglang-lite engine metrics",
-        f"sglang_lite_up 1",
-        f"sglang_lite_ready {1 if READY else 0}",
-        f"sglang_lite_waiting_requests {stats['waiting']}",
-        f"sglang_lite_running_requests {stats['running']}",
-        f"sglang_lite_engine_steps {stats['steps']}",
-        f"sglang_lite_multi_request_batches {stats['multi_request_batches']}",
-        f"sglang_lite_cache_hit_count {stats['cache'].get('hit_count', 0)}",
-        f"sglang_lite_cache_miss_count {stats['cache'].get('miss_count', 0)}",
-        f"sglang_lite_kv_blocks_used {stats['cache'].get('blocks_used', 0)}",
-        f"sglang_lite_oom_reject_count {stats['cache'].get('oom_reject_count', 0)}",
-    ]
-    return "\n".join(lines) + "\n"
+        body = "# no engine\n"
+    else:
+        stats = LOOP.get_stats()
+        lines = [
+            "# HELP sglang_lite_up Engine process up",
+            "# TYPE sglang_lite_up gauge",
+            "sglang_lite_up 1",
+            f"sglang_lite_ready {1 if READY else 0}",
+            f"sglang_lite_waiting_requests {stats['waiting']}",
+            f"sglang_lite_running_requests {stats['running']}",
+            f"sglang_lite_engine_steps {stats['steps']}",
+            f"sglang_lite_multi_request_batches {stats['multi_request_batches']}",
+            f"sglang_lite_cache_hit_count {stats['cache'].get('hit_count', 0)}",
+            f"sglang_lite_cache_miss_count {stats['cache'].get('miss_count', 0)}",
+            f"sglang_lite_kv_blocks_used {stats['cache'].get('blocks_used', 0)}",
+            f"sglang_lite_oom_reject_count {stats['cache'].get('oom_reject_count', 0)}",
+        ]
+        body = "\n".join(lines) + "\n"
+    return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.get("/v1/models")
@@ -122,10 +146,31 @@ async def generate(req: GenerationRequest, request: Request):
             {"error": "engine not ready"},
             status_code=503,
         )
+    if req.model and req.model != MODEL_NAME and req.model not in list_verified_models():
+        return JSONResponse(
+            {
+                "error": {
+                    "message": f"model '{req.model}' is not loaded (loaded={MODEL_NAME})",
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                }
+            },
+            status_code=400,
+        )
+    if not req.input_ids and not req.messages:
+        return JSONResponse(
+            {"error": {"message": "messages or input_ids required", "type": "invalid_request_error"}},
+            status_code=400,
+        )
     try:
         input_ids = _input_ids_from_req(req)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+    if not input_ids:
+        return JSONResponse(
+            {"error": {"message": "empty prompt after tokenization", "type": "invalid_request_error"}},
+            status_code=400,
+        )
 
     params = GenParams(
         max_tokens=req.max_tokens,
@@ -196,22 +241,21 @@ def build_loop(model: str, device: str, allow_stub: bool, max_batch_size: int) -
     runner = ModelRunner(model, device=device, max_batch=max_batch_size, allow_stub=allow_stub)
     loop = EngineLoop(runner, max_batch_size=max_batch_size)
     loop.start()
-    # Warmup: one tiny forward if real model
-    if runner._is_real and runner.tokenizer is not None:
-        try:
-            ids = runner.tokenize("hi")[:4] or [1, 2]
-            sub = loop.submit(
-                "warmup",
-                ids,
-                GenParams(max_tokens=1, temperature=0.0, timeout_s=60.0),
-            )
-            # drain
-            while True:
-                item = sub.delta_queue.get(timeout=60.0)
-                if item.get("finish_reason") is not None:
-                    break
-        except Exception as e:
-            logger.warning("warmup skipped: %s", e)
+    # Warmup required for readiness when a real model is loaded
+    if runner._is_real:
+        ids = runner.tokenize("hi")[:4] or [1, 2]
+        sub = loop.submit(
+            "warmup",
+            ids,
+            GenParams(max_tokens=1, temperature=0.0, timeout_s=60.0),
+        )
+        while True:
+            item = sub.delta_queue.get(timeout=60.0)
+            if item.get("error"):
+                raise RuntimeError(f"warmup failed: {item['error']}")
+            if item.get("finish_reason") is not None:
+                break
+    register_verified(model)
     return loop
 
 
@@ -228,8 +272,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = p.parse_args(argv)
 
     MODEL_NAME = args.model
-    LOOP = build_loop(args.model, args.device, args.allow_stub, args.max_batch_size)
-    READY = True
+    READY = False
+    try:
+        LOOP = build_loop(args.model, args.device, args.allow_stub, args.max_batch_size)
+        READY = True
+    except Exception:
+        READY = False
+        logger.exception("engine failed to become ready")
+        raise
     logger.info("engine ready model=%s device=%s port=%s", args.model, args.device, args.port)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

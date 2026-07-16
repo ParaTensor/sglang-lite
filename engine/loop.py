@@ -60,8 +60,11 @@ class EngineLoop:
     ):
         self.runner = runner
         if radix is None:
+            # Modest page pool for the HF-cache prototype (paged tensors are mirrors only).
+            # Full 64k prealloc is too large for tiny CPU fixtures / single-GPU demos.
+            max_tokens = 4096 if runner.device == "cpu" else 16384
             radix = RadixCache(
-                max_tokens=65536,
+                max_tokens=max_tokens,
                 block_size=16,
                 num_layers=runner.num_layers,
                 num_kv_heads=runner.num_kv_heads,
@@ -83,6 +86,7 @@ class EngineLoop:
         self._delta_qs: Dict[str, queue.Queue] = {}
         self._prev_text: Dict[str, str] = {}
         self._deadlines: Dict[str, float] = {}
+        self._cancelled: set = set()
         self._lock = threading.Lock()
         self._ready = False
         self._stopping = False
@@ -113,6 +117,16 @@ class EngineLoop:
         if self._stopping:
             raise RuntimeError("engine is draining; not accepting new requests")
         params = params or GenParams()
+        if params.max_tokens <= 0:
+            raise ValueError("max_tokens must be >= 1")
+        if params.temperature < 0:
+            raise ValueError("temperature must be >= 0")
+        if not (0.0 < params.top_p <= 1.0):
+            raise ValueError("top_p must be in (0, 1]")
+        if params.top_k is not None and params.top_k < 0:
+            raise ValueError("top_k must be >= 0")
+        if not input_ids:
+            raise ValueError("input_ids must be non-empty")
         dq: queue.Queue = queue.Queue(maxsize=256)
         pending = _Pending(
             request_id=request_id,
@@ -129,18 +143,24 @@ class EngineLoop:
         return SubmitResult(request_id=request_id, delta_queue=dq, seq=None)  # type: ignore[arg-type]
 
     def cancel(self, request_id: str) -> bool:
+        """Cancel a request whether it is pending, waiting, or running."""
+        with self._lock:
+            self._cancelled.add(request_id)
+            had_delta = request_id in self._delta_qs
         ok = self.scheduler.cancel(request_id)
-        self._emit(
-            request_id,
-            {
-                "text": "",
-                "finish_reason": "cancelled",
-                "usage": None,
-                "error": None,
-            },
-            final=True,
-        )
-        return ok
+        # Always notify client if we still own a delta queue
+        if had_delta or ok:
+            self._emit(
+                request_id,
+                {
+                    "text": "",
+                    "finish_reason": "cancelled",
+                    "usage": None,
+                    "error": None,
+                },
+                final=True,
+            )
+        return True
 
     def _emit(self, request_id: str, payload: Dict[str, Any], final: bool = False) -> None:
         dq = self._delta_qs.get(request_id)
@@ -166,6 +186,10 @@ class EngineLoop:
             if item is None:
                 self._stopping = True
                 break
+            with self._lock:
+                if item.request_id in self._cancelled:
+                    self._cancelled.discard(item.request_id)
+                    continue
             try:
                 seq = self.scheduler.add_request(
                     item.request_id,
@@ -224,22 +248,58 @@ class EngineLoop:
             "cache_hit_tokens": int(getattr(seq, "cache_hit_tokens", 0) or 0),
         }
 
-    def _finish_if_needed(self, seq: Sequence, tok: int) -> bool:
+    def _apply_stop_and_limits(
+        self, seq: Sequence, tok: int, prev_text: str
+    ) -> tuple[bool, str, Optional[int]]:
+        """After appending tok: return (finished, delta_text, emit_token).
+
+        Stop strings / EOS are trimmed so they are not leaked to the client.
+        """
         if seq.cancelled:
-            return True
+            return True, "", None
+        if seq.max_tokens <= 0 or len(seq.output_ids) > seq.max_tokens:
+            # overshoot: drop the last token if we exceeded max_tokens
+            if seq.max_tokens <= 0:
+                seq.output_ids.clear()
+                self.scheduler.mark_finished(seq, "length")
+                return True, "", None
+            if len(seq.output_ids) > seq.max_tokens:
+                seq.output_ids.pop()
+                self.scheduler.mark_finished(seq, "length")
+                full = self.runner.detokenize(seq.output_ids)
+                delta = full[len(prev_text) :] if full.startswith(prev_text) else full
+                return True, delta, tok if delta else None
         if len(seq.output_ids) >= seq.max_tokens:
             self.scheduler.mark_finished(seq, "length")
-            return True
+            full = self.runner.detokenize(seq.output_ids)
+            delta = full[len(prev_text) :] if full.startswith(prev_text) else full
+            return True, delta, tok
+
         if tok in (seq.stop_token_ids or []):
+            if seq.output_ids and seq.output_ids[-1] == tok:
+                seq.output_ids.pop()
             self.scheduler.mark_finished(seq, "stop")
-            return True
+            full = self.runner.detokenize(seq.output_ids)
+            delta = full[len(prev_text) :] if full.startswith(prev_text) else ""
+            return True, delta, None
+
+        full = self.runner.detokenize(seq.output_ids)
         if seq.stop_strings:
-            text = self.runner.detokenize(seq.output_ids)
             for s in seq.stop_strings:
-                if s and s in text:
+                if s and s in full:
+                    trimmed = full[: full.find(s)]
+                    while seq.output_ids and len(self.runner.detokenize(seq.output_ids)) > len(
+                        trimmed
+                    ):
+                        seq.output_ids.pop()
                     self.scheduler.mark_finished(seq, "stop")
-                    return True
-        return seq.finished
+                    delta = (
+                        trimmed[len(prev_text) :] if trimmed.startswith(prev_text) else ""
+                    )
+                    return True, delta, tok if delta else None
+
+        delta = full[len(prev_text) :] if full.startswith(prev_text) else full
+        return False, delta, tok
 
     def _run(self) -> None:
         while not self._stopping or self.scheduler.waiting or self.scheduler.running:
@@ -276,18 +336,31 @@ class EngineLoop:
             for seq, tok, pre in zip(batch, next_tokens, is_prefill):
                 if seq.finished or tok is None:
                     continue
+                with self._lock:
+                    if seq.request_id in self._cancelled:
+                        self.scheduler.mark_finished(seq, "cancelled")
+                        self._emit(
+                            seq.request_id,
+                            {
+                                "text": "",
+                                "finish_reason": "cancelled",
+                                "usage": self._usage(seq),
+                                "error": None,
+                            },
+                            final=True,
+                        )
+                        continue
                 if pre:
                     self.scheduler.update_after_prefill(seq, [], seq.kv_state)
                 self.scheduler.update_after_decode(seq, tok, seq.kv_state)
 
                 prev = self._prev_text.get(seq.request_id, "")
-                delta_text = self.runner.detokenize_delta(seq.output_ids, prev)
+                finished, delta_text, emit_tok = self._apply_stop_and_limits(seq, tok, prev)
                 self._prev_text[seq.request_id] = self.runner.detokenize(seq.output_ids)
 
-                finished = self._finish_if_needed(seq, tok)
                 payload = {
                     "text": delta_text,
-                    "token": tok,
+                    "token": emit_tok,
                     "finish_reason": seq.finish_reason if finished else None,
                     "usage": self._usage(seq) if finished else None,
                     "error": None,
@@ -307,4 +380,7 @@ class EngineLoop:
             "cache": self.radix.get_cache_stats(),
             "model": self.runner.model_name,
             "device": self.runner.device,
+            "last_model_forward_size": getattr(self.runner, "last_model_forward_size", 0),
+            "model_forward_count": getattr(self.runner, "model_forward_count", 0),
+            "paged_rebuild_count": getattr(self.runner, "paged_rebuild_count", 0),
         }

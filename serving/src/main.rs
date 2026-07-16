@@ -49,10 +49,6 @@ enum Commands {
         /// Do not spawn Python; connect to an already-running engine at this URL
         #[arg(long)]
         engine_url: Option<String>,
-
-        /// Extra verified model ids to advertise on GET /v1/models
-        #[arg(long)]
-        advertise: Vec<String>,
     },
 }
 
@@ -62,6 +58,19 @@ struct EngineChild {
 
 impl Drop for EngineChild {
     fn drop(&mut self) {
+        // Prefer graceful SIGTERM so the engine can stop accepting work.
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .args(["-TERM", &self.child.id().to_string()])
+                .status();
+            for _ in 0..50 {
+                if let Ok(Some(_)) = self.child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -131,10 +140,7 @@ async fn main() -> Result<()> {
             engine_port,
             stub,
             engine_url,
-            advertise,
-        } => {
-            run_serve(model, device, port, engine_port, stub, engine_url, advertise).await
-        }
+        } => run_serve(model, device, port, engine_port, stub, engine_url).await,
     }
 }
 
@@ -145,7 +151,6 @@ async fn run_serve(
     engine_port: u16,
     stub: bool,
     engine_url: Option<String>,
-    advertise: Vec<String>,
 ) -> Result<()> {
     let ready = Arc::new(AtomicBool::new(false));
     let draining = Arc::new(AtomicBool::new(false));
@@ -167,12 +172,7 @@ async fn run_serve(
         let model_id = model.ok_or_else(|| anyhow!("--model is required with --engine-url"))?;
         info!("using external engine at {}", url);
         wait_engine_ready(&url, Duration::from_secs(120)).await?;
-        (
-            EngineClient::http(url.clone()),
-            Some(url),
-            model_id,
-            None,
-        )
+        (EngineClient::http(url.clone()), Some(url), model_id, None)
     } else {
         let model_id = model.ok_or_else(|| anyhow!("--model is required (or pass --stub)"))?;
         let url = format!("http://127.0.0.1:{}", engine_port);
@@ -190,14 +190,8 @@ async fn run_serve(
         )
     };
 
-    let mut supported_models = vec![model_id.clone()];
-    for m in advertise {
-        if !supported_models.contains(&m) {
-            supported_models.push(m);
-        }
-    }
-    // MoE-only defaults that may be advertised once verified; never dense.
-    // Only include the active model unless explicitly advertised.
+    // Only the actually loaded model is advertised — no alias remapping.
+    let supported_models = vec![model_id.clone()];
 
     ready.store(true, Ordering::Relaxed);
 

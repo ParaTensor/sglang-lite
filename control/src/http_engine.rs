@@ -51,7 +51,12 @@ impl HttpEngineClient {
 
     pub async fn cancel(&self, request_id: &str) -> Result<()> {
         let body = serde_json::json!({ "request_id": request_id });
-        let resp = self.client.post(self.cancel_url()).json(&body).send().await?;
+        let resp = self
+            .client
+            .post(self.cancel_url())
+            .json(&body)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             warn!("cancel failed: {}", resp.status());
         }
@@ -131,15 +136,22 @@ impl HttpEngineClient {
                 }
 
                 let mut byte_stream = resp.bytes_stream();
-                let mut buf = String::new();
+                let mut buf: Vec<u8> = Vec::new();
 
                 while let Some(item) = byte_stream.next().await {
                     let chunk = item.map_err(|e| anyhow!("stream read: {}", e))?;
-                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                    buf.extend_from_slice(&chunk);
 
-                    while let Some(pos) = buf.find('\n') {
-                        let line = buf[..pos].trim().to_string();
-                        buf = buf[pos + 1..].to_string();
+                    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                        let line_bytes = buf[..pos].to_vec();
+                        buf = buf[pos + 1..].to_vec();
+                        if line_bytes.is_empty() {
+                            continue;
+                        }
+                        let line = std::str::from_utf8(&line_bytes)
+                            .map_err(|e| anyhow!("utf-8 TokenDelta line: {}", e))?
+                            .trim()
+                            .to_string();
                         if line.is_empty() {
                             continue;
                         }
@@ -161,7 +173,7 @@ impl HttpEngineClient {
                         }
                     }
                 }
-                Ok(())
+                Err(anyhow!("engine stream ended without finish_reason"))
             }
             .await;
 

@@ -27,7 +27,7 @@ pub mod stub_engine;
 pub use engine_client::EngineClient;
 pub use http_engine::HttpEngineClient;
 pub use openai::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Delta, Role};
-pub use protocol::GenerationRequest;
+pub use protocol::{GenerationRequest, TokenDelta, Usage};
 pub use stub_engine::StubEngineClient;
 
 #[derive(Clone)]
@@ -94,75 +94,107 @@ pub async fn serve(
 pub async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<impl IntoResponse, (axum::http::StatusCode, String)> {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, Json<serde_json::Value>)> {
     use std::sync::atomic::Ordering;
 
     if state.draining.load(Ordering::Relaxed) {
-        return Err((
+        return Err(api_err(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            json_error(
-                "server_error",
-                "server is draining; not accepting new requests",
-                "draining",
-            ),
+            "server_error",
+            "server is draining; not accepting new requests",
+            "draining",
         ));
     }
 
     if !state.ready.load(Ordering::Relaxed) {
-        return Err((
+        return Err(api_err(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            json_error(
-                "server_error",
-                "model not ready",
-                "not_ready",
-            ),
+            "server_error",
+            "model not ready",
+            "not_ready",
         ));
     }
 
     if !state.model_list.iter().any(|m| m == &req.model) {
-        return Err((
+        return Err(api_err(
             axum::http::StatusCode::BAD_REQUEST,
-            json_error(
-                "invalid_request_error",
-                &format!(
-                    "model '{}' not supported in sglang-lite (see GET /v1/models).",
-                    req.model
-                ),
-                "model_not_found",
+            "invalid_request_error",
+            &format!(
+                "model '{}' not supported in sglang-lite (see GET /v1/models).",
+                req.model
             ),
+            "model_not_found",
+        ));
+    }
+
+    if req.messages.is_empty() {
+        return Err(api_err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "messages must be non-empty",
+            "invalid_messages",
         ));
     }
 
     if req.messages.iter().any(|m| {
         matches!(m, ChatMessage::User { content: c, .. } if c.contains("data:image") || c.contains("<image>"))
     }) {
-        return Err((
+        return Err(api_err(
             axum::http::StatusCode::BAD_REQUEST,
-            json_error("invalid_request_error", "Multimodal content is not supported in sglang-lite core.", "multimodal_not_supported"),
+            "invalid_request_error",
+            "Multimodal content is not supported in sglang-lite core.",
+            "multimodal_not_supported",
         ));
     }
 
     if req.response_format.is_some() {
-        return Err((
+        return Err(api_err(
             axum::http::StatusCode::BAD_REQUEST,
-            json_error(
-                "invalid_request_error",
-                "response_format / structured output is not supported inside the engine.",
-                "structured_output_not_supported",
-            ),
+            "invalid_request_error",
+            "response_format / structured output is not supported inside the engine.",
+            "structured_output_not_supported",
         ));
+    }
+
+    if let Some(mt) = req.max_tokens {
+        if mt < 1 {
+            return Err(api_err(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "max_tokens must be >= 1",
+                "invalid_max_tokens",
+            ));
+        }
+    }
+    if let Some(t) = req.temperature {
+        if t < 0.0 {
+            return Err(api_err(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "temperature must be >= 0",
+                "invalid_temperature",
+            ));
+        }
+    }
+    if let Some(p) = req.top_p {
+        if !(0.0 < p && p <= 1.0) {
+            return Err(api_err(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "top_p must be in (0, 1]",
+                "invalid_top_p",
+            ));
+        }
     }
 
     // Reject clearly out-of-scope extras
     for key in ["tools", "tool_choice", "logit_bias", "n", "functions"] {
         if req.extra.contains_key(key) {
-            return Err((
+            return Err(api_err(
                 axum::http::StatusCode::BAD_REQUEST,
-                json_error(
-                    "invalid_request_error",
-                    &format!("parameter '{}' is not supported in sglang-lite", key),
-                    "unsupported_parameter",
-                ),
+                "invalid_request_error",
+                &format!("parameter '{}' is not supported in sglang-lite", key),
+                "unsupported_parameter",
             ));
         }
     }
@@ -190,9 +222,11 @@ pub async fn chat_completions(
             .into_response())
     } else {
         let resp = state.engine.generate_blocking(gen_req).await.map_err(|e| {
-            (
+            api_err(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                json_error("server_error", &format!("engine error: {}", e), "engine_error"),
+                "server_error",
+                &format!("engine error: {}", e),
+                "engine_error",
             )
         })?;
 
@@ -371,14 +405,21 @@ pub async fn metrics(
     Ok(output)
 }
 
-fn json_error(typ: &str, message: &str, code: &str) -> String {
-    serde_json::json!({
-        "error": {
-            "message": message,
-            "type": typ,
-            "param": null,
-            "code": code
-        }
-    })
-    .to_string()
+fn api_err(
+    status: axum::http::StatusCode,
+    typ: &str,
+    message: &str,
+    code: &str,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "message": message,
+                "type": typ,
+                "param": null,
+                "code": code
+            }
+        })),
+    )
 }

@@ -117,8 +117,11 @@ sglang-lite engine process
   MoEModelRunner
     ├── ModelLoader
     ├── MoERouter
-    ├── PrefillExecutor / DecodeExecutor
-    └── KernelBackend
+    ├── PrefillExecutor / DecodeExecutor  (tensor-batched HF forward by cached_len)
+    └── KernelBackend (paged rebuild → HF attn; FlashInfer append on CUDA when present)
+
+  Execution note: paged K/V is the rebuildable attention store; equal-length groups
+  share one model forward. Full FlashInfer attention + CUDA graph remain P1.
 
 sglang-lite-control / serving
   • Own minimal OpenAI/SSE, readiness, engine-local limits and lifecycle

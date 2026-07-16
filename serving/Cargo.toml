@@ -1,6 +1,6 @@
 [package]
 name = "sglang-lite-serving"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["sglang-lite contributors"]
 description = "Official thin standalone serving wrapper for the sglang-lite inference engine."

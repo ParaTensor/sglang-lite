@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def test_concurrent_requests_multi_batch(tiny_mixtral_id):
     from sglang_lite import LiteEngine
-    from sglang_lite.loop import GenParams
 
     engine = LiteEngine(tiny_mixtral_id, device="cpu", max_batch_size=16)
     try:

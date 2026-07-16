@@ -8,7 +8,15 @@ This is the authoritative reference for what belongs in core vs. what gets pushe
 
 The engine focuses exclusively on popular MoE architectures (Mixtral-style, DeepSeek-style, Qwen-MoE, etc.). Dense models are out of scope. MoE support is first-class.
 
-**Verified / advertised MoE families** (see `engine/models.py`): Mixtral-style (`mistralai/Mixtral-8x7B-Instruct-v0.1`, …), Qwen-MoE, DeepSeek-MoE. Unverified ids are not listed on `GET /v1/models` until load succeeds. Local CI uses `fixture:<path>` tiny Mixtral weights. Dense models (Llama, Qwen2.5 dense, Mistral dense, …) are rejected.
+**MoE families** (see `engine/models.py`): Mixtral-style, Qwen-MoE, DeepSeek-MoE. Only the model
+successfully loaded in the current process is advertised on `GET /v1/models`. Local CI uses
+`fixture:<path>` tiny Mixtral weights. Dense models are rejected.
+
+**Execution status**: prefix reuse stores paged K/V + `last_logits`; the runner rebuilds HF
+attention state from pages before forward (pages are required, not optional mirrors).
+Scheduler groups requests; the runner issues **tensor-batched** HF forwards when sequences share
+the same `cached_len` (and prefill new-length). FlashInfer paged-append is used when available
+on CUDA; full FlashInfer attention/MoE kernels remain P1.
 
 The `engine/` core is a **pure library** exposing three further-decomposed building blocks (RadixKVCache, BatchingScheduler, MoEModelRunner). The sglang-lite product also ships a thin standalone control/serving shell so it can serve users without SGLang, vLLM, or UniGateway.
 

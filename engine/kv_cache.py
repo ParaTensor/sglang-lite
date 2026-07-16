@@ -24,8 +24,10 @@ class RadixNode:
     ref_count: int = 0
     block_ids: List[int] = field(default_factory=list)
     prefix_len: int = 0
-    # HF-compatible KV snapshot at this node (cloned on fork)
+    # Optional HF snapshot (legacy). Prefer rebuilding from paged tensors + last_logits.
     past_kv: Optional[PastKV] = None
+    # Logits at the last prompt position — required for exact-prefix hits (no re-forward).
+    last_logits: Optional[torch.Tensor] = None
 
 
 class RadixTree:
@@ -109,51 +111,62 @@ class RadixCache:
 
     def match_prefix(
         self, token_ids: List[int]
-    ) -> Tuple[List[int], int, List[int], List[int], Optional[PastKV]]:
-        """Return matched tokens/len/remaining/block_ids/past_kv.
+    ) -> Tuple[List[int], int, List[int], List[int], Optional[PastKV], Optional[torch.Tensor]]:
+        """Return matched tokens/len/remaining/block_ids/past_kv/last_logits.
 
-        cache hit only counts when matched_len > 0 and reusable KV exists
-        (past_kv or non-empty block_ids).
+        A reusable hit requires paged block_ids covering the matched prefix.
+        past_kv is optional; runners rebuild attention state from pages.
+        Exact hits also need last_logits for the first sample.
         """
         node, matched, i = self.tree.walk(token_ids)
         remaining = token_ids[i:]
         block_ids = list(node.block_ids) if node.block_ids else []
         past_kv = self.fork_kv(node.past_kv) if node.past_kv is not None else None
+        last_logits = node.last_logits.clone() if node.last_logits is not None else None
 
-        # Walk upward for nearest ancestor with KV if leaf has none
-        if past_kv is None and i > 0:
+        # Walk upward for nearest ancestor with committed pages if leaf has none
+        if (not block_ids) and i > 0:
             cur = self.tree.root
-            best_kv = None
             best_blocks: List[int] = []
+            best_logits = None
+            best_kv = None
             best_len = 0
             for j, tid in enumerate(matched):
                 cur = cur.children.get(tid)
                 if cur is None:
                     break
-                if cur.past_kv is not None:
-                    best_kv = cur.past_kv
+                if cur.block_ids:
                     best_blocks = list(cur.block_ids)
+                    best_logits = cur.last_logits
+                    best_kv = cur.past_kv
                     best_len = j + 1
-            if best_kv is not None and best_len == i:
-                past_kv = self.fork_kv(best_kv)
+            if best_blocks and best_len == i:
                 block_ids = best_blocks
+                last_logits = best_logits.clone() if best_logits is not None else None
+                past_kv = self.fork_kv(best_kv) if best_kv is not None else None
+                matched = matched[:best_len]
+                i = best_len
+                remaining = token_ids[i:]
 
-        reusable = past_kv is not None or bool(block_ids)
-        if i > 0 and reusable:
+        pages_needed = (i + self.block_size - 1) // self.block_size if i > 0 else 0
+        reusable = i > 0 and len(block_ids) >= pages_needed
+        if remaining == [] and reusable and last_logits is None and past_kv is None:
+            # Exact hit without logits cannot sample correctly
+            reusable = False
+
+        if reusable:
             self.hit_count += 1
+            block_ids = block_ids[: max(pages_needed, 1)] if pages_needed else block_ids
         else:
             self.miss_count += 1
-            if not reusable:
-                # No real KV → treat as full miss for skip purposes
-                return [], 0, token_ids, [], None
+            return [], 0, token_ids, [], None, None
 
-        # Share block refs
         for bid in block_ids:
             blk = self._allocated_blocks.get(bid)
             if blk:
                 blk.ref_count += 1
 
-        return matched, i, remaining, block_ids, past_kv
+        return matched, i, remaining, block_ids, past_kv, last_logits
 
     def insert_or_update(
         self,
@@ -161,6 +174,7 @@ class RadixCache:
         kv_tensors: Optional[PastKV] = None,
         prefix_len: int = 0,
         block_ids: Optional[List[int]] = None,
+        last_logits: Optional[torch.Tensor] = None,
     ) -> List[int]:
         if not token_ids:
             return list(block_ids or [])
@@ -174,6 +188,8 @@ class RadixCache:
                 node.block_ids = self.fork_blocks(new_list)
         if kv_tensors is not None:
             node.past_kv = self.fork_kv(kv_tensors)
+        if last_logits is not None:
+            node.last_logits = last_logits.detach().float().cpu().clone()
         node.prefix_len = prefix_len or len(token_ids)
         self.total_tokens_stored = max(self.total_tokens_stored, node.prefix_len)
         return list(node.block_ids)
@@ -186,7 +202,7 @@ class RadixCache:
     ) -> None:
         """Write per-layer K/V for tokens starting at start_pos into pages."""
         if not layer_kvs or not block_table:
-            return
+            raise ValueError("write_kv requires layer_kvs and block_table")
         for layer_idx, (k, v) in enumerate(layer_kvs):
             if layer_idx >= self.num_layers:
                 break
@@ -206,6 +222,44 @@ class RadixCache:
                 self.k_cache[layer_idx, bid, slot].copy_(k_tok[t].to(self.dtype))
                 self.v_cache[layer_idx, bid, slot].copy_(v_tok[t].to(self.dtype))
                 self._page_len[bid] = max(self._page_len.get(bid, 0), slot + 1)
+
+    def read_kv(self, block_table: List[int], length: int) -> PastKV:
+        """Read length tokens from pages as HF legacy list[(k,v)] with shape (1,H,S,D)."""
+        if length <= 0:
+            return []
+        pages_needed = (length + self.block_size - 1) // self.block_size
+        if len(block_table) < pages_needed:
+            raise RuntimeError(
+                f"read_kv: need {pages_needed} pages, have {len(block_table)} for length={length}"
+            )
+        out: PastKV = []
+        for layer_idx in range(self.num_layers):
+            k = torch.empty(
+                (1, self.num_kv_heads, length, self.head_dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            v = torch.empty_like(k)
+            for pos in range(length):
+                page_i = pos // self.block_size
+                slot = pos % self.block_size
+                bid = block_table[page_i]
+                k[0, :, pos, :] = self.k_cache[layer_idx, bid, slot]
+                v[0, :, pos, :] = self.v_cache[layer_idx, bid, slot]
+            out.append((k, v))
+        return out
+
+    def build_cache(self, block_table: List[int], length: int):
+        """Rebuild a transformers DynamicCache (or legacy list) from paged KV."""
+        legacy = self.read_kv(block_table, length)
+        if not legacy:
+            return None
+        try:
+            from transformers import DynamicCache
+
+            return DynamicCache.from_legacy_cache(legacy)
+        except Exception:
+            return legacy
 
     def _normalize_kv(
         self, k: torch.Tensor, v: torch.Tensor
