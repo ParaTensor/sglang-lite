@@ -14,7 +14,9 @@ dependencies = [
     "uvicorn[standard]>=0.29",
     "pydantic>=2.0",
     "torch>=2.3",
-    "transformers>=4.40",
+    # Cache API: support both 4.x (to_legacy_cache) and 5.x (layers.keys/values).
+    # Cap <6 until a newer major is explicitly verified.
+    "transformers>=4.40,<6",
     "accelerate>=0.30",
     "sentencepiece>=0.2",
     # gRPC support for unigateway integration (optional in practice, but included for completeness)

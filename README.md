@@ -208,15 +208,19 @@ Apache-2.0 (to be confirmed)
 
 ## Status
 
-**P0+ execution path** (v0.2.x): standalone Rust→Python serve, true NDJSON/SSE deltas,
-central scheduler loop, **tensor-batched HF forward** (same cached_len groups), and
-**paged KV as rebuildable attention state** (decode/prefill rebuild past from pages).
+**Execution path** (v0.2.x): standalone Rust→Python serve, true NDJSON/SSE deltas,
+central scheduler loop, tensor-batched HF forward (same `cached_len` groups), and
+paged KV as rebuildable attention state. Transformers cache extraction supports both
+4.x (`to_legacy_cache`) and 5.x (`layers.keys` / `layers.values`); pin is
+`transformers>=4.40,<6`.
 
 Current limits (still not full SGLang/vLLM parity):
 - Logits still produced by HuggingFace MoE modules; FlashInfer is used for paged append
   when installed+CUDA, not yet a full custom attention+MoE kernel stack.
 - Prefill/decode batching requires equal sequence lengths within a group (otherwise serial).
 - Popular hub MoE + CUDA: enable with GPU and optional `SGLANG_LITE_POPULAR_MOE=<id>`.
+- Strict P0 DoD (OpenAI E2E on real MoE, concurrent batch evidence on clean install)
+  requires re-audit after this DynamicCache fix; do not treat rust/ruff alone as P0 done.
 
 P1 remains: FlashInfer attention in the hot path, CUDA graph decode, quant/TP.
 Not a vLLM feature-parity substitute.

@@ -69,7 +69,8 @@ class EngineLoop:
                 num_layers=runner.num_layers,
                 num_kv_heads=runner.num_kv_heads,
                 head_dim=runner.head_dim,
-                dtype=torch.float32 if runner.device == "cpu" else torch.float16,
+                dtype=getattr(runner, "torch_dtype", None)
+                or (torch.float32 if runner.device == "cpu" else torch.bfloat16),
                 device=runner.device if runner.device != "cpu" else "cpu",
             )
         self.radix = radix

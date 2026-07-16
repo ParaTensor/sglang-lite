@@ -30,17 +30,10 @@ def test_decode_batch_uses_tensor_batch_dim(tiny_mixtral_id):
 
         stats = engine.get_stats()
         assert stats["multi_request_batches"] >= 1
-        # At least one model forward saw batch dim > 1
-        assert engine.runner.last_model_forward_size >= 2 or any(
-            # during the run, forward size was recorded; check count grew with concurrency
-            True
-            for _ in [0]
-        )
-        # Stronger: paged rebuilds happened (pages are attention source)
         assert stats["paged_rebuild_count"] >= 1
         assert engine.runner.model_forward_count >= 1
-        # Prove a multi-seq forward occurred at some point in this engine
-        # by driving a synchronous same-length decode batch through the runner API
+
+        # Prove multi-seq tensor forward: equal cached_len decode batch on runner.
         from sglang_lite.scheduler import Sequence
 
         radix = engine.radix
@@ -49,11 +42,10 @@ def test_decode_batch_uses_tensor_batch_dim(tiny_mixtral_id):
         for i in range(4):
             ids = engine.tokenize(f"sync {i}")
             s = Sequence(seq_id=100 + i, request_id=f"s{i}", input_ids=ids)
-            # Prefill each once serially to populate pages + align for decode
             tok = runner._prefill_one(s, radix)
+            assert tok is not None
             s.output_ids.append(tok)
             seqs.append(s)
-        # Force equal cached_len
         cl = seqs[0].cached_len
         for s in seqs:
             assert s.cached_len == cl

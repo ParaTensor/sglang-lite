@@ -54,6 +54,8 @@ class ModelRunner:
         self.model_forward_count = 0
         self.paged_rebuild_count = 0
         self.use_paged_as_source = True
+        # Must match model compute dtype; fp16 pages + bf16 activations promote to fp32 in SDPA.
+        self.torch_dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
 
         if model_name == "stub":
             if not allow_stub:
@@ -87,7 +89,7 @@ class ModelRunner:
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
+        dtype = self.torch_dtype
         load_kwargs = {
             "dtype": dtype,
             "trust_remote_code": True,
@@ -464,7 +466,10 @@ class ModelRunner:
         self, seq: Sequence, radix: RadixCache, start: int, write_kv: PastKV
     ) -> None:
         if not write_kv:
-            raise RuntimeError("empty KV write")
+            raise RuntimeError(
+                "empty KV write: past_key_values could not be converted to legacy "
+                "(check Transformers DynamicCache / Cache API compatibility)"
+            )
         # FlashInfer append when available (CUDA); else tensor copy write_kv
         if HAS_FLASHINFER and self.device != "cpu":
             self._flashinfer_append(seq, radix, start, write_kv)
@@ -479,8 +484,8 @@ class ModelRunner:
         for layer_idx, (k, v) in enumerate(write_kv):
             k_tok, v_tok = radix._normalize_kv(k, v)
             # (S, H, D) float16
-            k_new = k_tok.to(device=self.device, dtype=torch.float16)
-            v_new = v_tok.to(device=self.device, dtype=torch.float16)
+            k_new = k_tok.to(device=self.device, dtype=radix.dtype)
+            v_new = v_tok.to(device=self.device, dtype=radix.dtype)
             batch_indices = torch.zeros(append_len, dtype=torch.int32, device=self.device)
             positions = torch.arange(start, start + append_len, dtype=torch.int32, device=self.device)
             pages_after = (start + append_len + radix.block_size - 1) // radix.block_size
@@ -511,7 +516,10 @@ class ModelRunner:
         for p in pasts:
             if p is None:
                 raise RuntimeError("cannot batch None past with non-None peers")
-            legacies.append(self._to_legacy_kv(p))
+            leg = self._to_legacy_kv(p)
+            if not leg:
+                raise RuntimeError("empty KV in batch_caches")
+            legacies.append(leg)
         # All same seq length (caller guarantees)
         n_layers = len(legacies[0])
         batched = []
@@ -519,12 +527,7 @@ class ModelRunner:
             ks = torch.cat([leg[layer][0] for leg in legacies], dim=0)
             vs = torch.cat([leg[layer][1] for leg in legacies], dim=0)
             batched.append((ks, vs))
-        try:
-            from transformers import DynamicCache
-
-            return DynamicCache.from_legacy_cache(batched)
-        except Exception:
-            return batched
+        return self._as_model_cache(batched)
 
     def _split_batch_cache(self, past, index: int, batch_size: int):
         legacy = self._to_legacy_kv(past)
@@ -533,12 +536,7 @@ class ModelRunner:
         sliced = []
         for k, v in legacy:
             sliced.append((k[index : index + 1].contiguous(), v[index : index + 1].contiguous()))
-        try:
-            from transformers import DynamicCache
-
-            return DynamicCache.from_legacy_cache(sliced)
-        except Exception:
-            return sliced
+        return self._as_model_cache(sliced)
 
     def _sample(self, logits: torch.Tensor, seq: Sequence) -> int:
         temperature = float(getattr(seq, "temperature", 0.0) or 0.0)
@@ -583,27 +581,98 @@ class ModelRunner:
         total = past_len + input_ids.shape[-1]
         return torch.ones((input_ids.shape[0], total), dtype=torch.long, device=input_ids.device)
 
+    def _cast_legacy_kv(self, past: PastKV) -> PastKV:
+        """Ensure K/V match model dtype (avoids bf16×fp16 → fp32 SDPA promotion)."""
+        dt = self.torch_dtype
+        out: PastKV = []
+        for k, v in past:
+            if k.dtype != dt:
+                k = k.to(dtype=dt)
+            if v.dtype != dt:
+                v = v.to(dtype=dt)
+            out.append((k, v))
+        return out
+
     def _as_model_cache(self, past):
         if past is None:
             return None
-        if hasattr(past, "get_seq_length"):
-            return past
         if isinstance(past, (list, tuple)):
+            past = self._cast_legacy_kv(list(past))
             try:
                 from transformers import DynamicCache
 
-                return DynamicCache.from_legacy_cache(past)
+                if hasattr(DynamicCache, "from_legacy_cache"):
+                    return DynamicCache.from_legacy_cache(past)
+            except Exception:
+                pass
+            try:
+                from transformers import DynamicCache
+
+                cache = DynamicCache()
+                for layer_idx, (k, v) in enumerate(past):
+                    cache.update(k, v, layer_idx)
+                return cache
             except Exception:
                 return past
+        # Existing Cache object: rebuild if dtype mismatches model
+        if hasattr(past, "get_seq_length") or hasattr(past, "layers"):
+            legacy = self._to_legacy_kv(past)
+            if legacy and any(k.dtype != self.torch_dtype for k, _ in legacy):
+                return self._as_model_cache(legacy)
+            return past
         return past
 
     def _to_legacy_kv(self, past) -> Optional[PastKV]:
+        """Normalize HF cache → list[(k,v)] for page commit.
+
+        Transformers 4.x: DynamicCache.to_legacy_cache().
+        Transformers 5.x: to_legacy_cache may be absent; use layers[i].keys/values
+        or Cache.__getitem__ instead.
+        """
         if past is None:
             return None
-        if hasattr(past, "to_legacy_cache"):
-            return list(past.to_legacy_cache())
         if isinstance(past, (list, tuple)):
-            return list(past)
+            if not past:
+                return None
+            if isinstance(past[0], (list, tuple)) and len(past[0]) >= 2:
+                return list(past)
+            return None
+        # Prefer official conversion when present and non-empty.
+        if hasattr(past, "to_legacy_cache"):
+            try:
+                legacy = past.to_legacy_cache()
+                if legacy:
+                    return list(legacy)
+            except Exception:
+                pass
+        # Transformers 5+ / Cache API: per-layer .keys / .values
+        layers = getattr(past, "layers", None)
+        if layers is not None:
+            out: PastKV = []
+            for layer in layers:
+                k = getattr(layer, "keys", None)
+                v = getattr(layer, "values", None)
+                if k is None or v is None:
+                    continue
+                out.append((k, v))
+            if out:
+                return out
+        # Cache protocol: past[i] -> (k, v)
+        try:
+            n = len(past)
+        except Exception:
+            n = 0
+        if n > 0:
+            out = []
+            for i in range(n):
+                try:
+                    pair = past[i]
+                except Exception:
+                    break
+                if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                    out.append((pair[0], pair[1]))
+            if out:
+                return out
         return None
 
     def sample_next(
