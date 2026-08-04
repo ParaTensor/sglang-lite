@@ -1,4 +1,4 @@
-"""MoEModelRunner: batched HF forward with paged-KV as rebuildable attention state."""
+"""MoEModelRunner: batched HF forward with paged KV as attention source of truth."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from .kernel_backend import create_kernel_backend
+from .kernel_backend import PagedAttnContext, create_kernel_backend
 from .kv_cache import PastKV, RadixCache
 from .models import assert_moe_supported, is_fixture_model, register_verified
 from .sampling import make_generator, sample_logits
@@ -89,11 +89,18 @@ class ModelRunner:
             "trust_remote_code": True,
             "low_cpu_mem_usage": True,
         }
+        use_device_map = False
         if self.device != "cpu":
-            load_kwargs["device_map"] = "auto"
+            try:
+                import accelerate  # noqa: F401
+
+                load_kwargs["device_map"] = "auto"
+                use_device_map = True
+            except ImportError:
+                use_device_map = False
         self.model = AutoModelForCausalLM.from_pretrained(load_id, **load_kwargs)
-        if self.device == "cpu":
-            self.model = self.model.to("cpu")
+        if not use_device_map:
+            self.model = self.model.to(self.device)
         self.model.eval()
         self._is_real = True
         self.vocab_size = int(self.model.config.vocab_size)
@@ -113,6 +120,13 @@ class ModelRunner:
         )
 
         print(f"[sglang-lite] Kernel backend: {self.kernel_backend.name}")
+        if self.kernel_backend.supports_paged_attention:
+            sm_scale = self.head_dim**-0.5
+            n_heads = int(self.model.config.num_attention_heads)
+            n = self.kernel_backend.attach_to_model(
+                self.model, num_qo_heads=n_heads, head_dim=self.head_dim, sm_scale=sm_scale
+            )
+            print(f"[sglang-lite] Paged attention hooks attached: {n} modules")
 
         register_verified(model_name)
         print(f"[sglang-lite] MoE model '{model_name}' ready on {self.device}")
@@ -313,18 +327,32 @@ class ModelRunner:
             return
 
         input_ids = torch.tensor(news, dtype=torch.long, device=self.device)
+        max_past = past_lens[0]
+        for s in seqs:
+            self._ensure_blocks(s, radix, s.cached_len + max_new)
+
+        if self._use_paged_attention():
+            outputs = self._model_forward_paged(input_ids, seqs, radix, is_decode=False)
+            for b, (seq, i) in enumerate(zip(seqs, idxs)):
+                nlen = new_lens[b]
+                logits = outputs.logits[b, nlen - 1, :]
+                start = seq.cached_len
+                seq.last_logits = logits.detach().float().cpu().clone()
+                seq.kv_state = None
+                seq.cached_len = start + nlen
+                seq.prefill_tokens = getattr(seq, "prefill_tokens", 0) + nlen
+                results[i] = self._sample(logits, seq)
+            return
+
         pasts = [self._past_for_seq(s, radix) for s in seqs]
         batched_past = self._batch_caches(pasts) if past_lens[0] > 0 else None
-        max_past = past_lens[0]
         attn = torch.ones((B, max_past + max_new), dtype=torch.long, device=self.device)
-
         outputs = self._model_forward(input_ids, batched_past, attn)
         for b, (seq, i) in enumerate(zip(seqs, idxs)):
             nlen = new_lens[b]
             logits = outputs.logits[b, nlen - 1, :]
             full_kv = self._split_batch_cache(outputs.past_key_values, b, B)
             start = seq.cached_len
-            self._ensure_blocks(seq, radix, start + nlen)
             write_kv = self._slice_kv_tail(self._to_legacy_kv(full_kv), nlen)
             self._commit_pages(seq, radix, start, write_kv)
             seq.last_logits = logits.detach().float().cpu().clone()
@@ -358,7 +386,6 @@ class ModelRunner:
         B = len(seqs)
         lasts = [s.output_ids[-1] if s.output_ids else s.input_ids[-1] for s in seqs]
         input_ids = torch.tensor([[t] for t in lasts], dtype=torch.long, device=self.device)
-        pasts = [self._past_for_seq(s, radix) for s in seqs]
         # COW last page before append
         for s in seqs:
             pos = s.cached_len
@@ -367,6 +394,16 @@ class ModelRunner:
             if page_i < len(s.block_table):
                 s.block_table[page_i] = radix.cow_block_if_shared(s.block_table[page_i])
 
+        if self._use_paged_attention():
+            outputs = self._model_forward_paged(input_ids, seqs, radix, is_decode=True)
+            for b, (seq, i) in enumerate(zip(seqs, idxs)):
+                logits = outputs.logits[b, -1, :]
+                seq.kv_state = None
+                seq.cached_len = seq.cached_len + 1
+                results[i] = self._sample(logits, seq)
+            return
+
+        pasts = [self._past_for_seq(s, radix) for s in seqs]
         batched_past = self._batch_caches(pasts)
         past_len = seqs[0].cached_len
         attn = torch.ones((B, past_len + 1), dtype=torch.long, device=self.device)
@@ -392,8 +429,16 @@ class ModelRunner:
                 raise RuntimeError("exact hit without last_logits")
             return self._sample(seq.last_logits.to(self.device), seq)
         self._ensure_blocks(seq, radix, len(prompt))
-        past = self._past_for_seq(seq, radix)
         input_ids = torch.tensor([new_tokens], dtype=torch.long, device=self.device)
+        if self._use_paged_attention():
+            outputs = self._model_forward_paged(input_ids, [seq], radix, is_decode=False)
+            logits = outputs.logits[0, -1, :]
+            seq.last_logits = logits.detach().float().cpu().clone()
+            seq.kv_state = None
+            seq.cached_len = len(prompt)
+            seq.prefill_tokens = getattr(seq, "prefill_tokens", 0) + len(new_tokens)
+            return self._sample(logits, seq)
+        past = self._past_for_seq(seq, radix)
         attn = self._attention_mask(input_ids, past, past_len_hint=start)
         outputs = self._model_forward(input_ids, past, attn)
         logits = outputs.logits[0, -1, :]
@@ -418,6 +463,12 @@ class ModelRunner:
             page_i = pos // radix.block_size
             if page_i < len(seq.block_table):
                 seq.block_table[page_i] = radix.cow_block_if_shared(seq.block_table[page_i])
+        if self._use_paged_attention():
+            outputs = self._model_forward_paged(input_ids, [seq], radix, is_decode=True)
+            logits = outputs.logits[0, -1, :]
+            seq.kv_state = None
+            seq.cached_len = pos + 1
+            return self._sample(logits, seq)
         past = self._past_for_seq(seq, radix)
         attn = self._attention_mask(input_ids, past, past_len_hint=pos)
         outputs = self._model_forward(input_ids, past, attn)
@@ -428,6 +479,57 @@ class ModelRunner:
         seq.kv_state = None if self.use_paged_as_source else new_kv
         seq.cached_len = pos + 1
         return self._sample(logits, seq)
+
+    def _use_paged_attention(self) -> bool:
+        return bool(
+            self._is_real
+            and getattr(self.kernel_backend, "supports_paged_attention", False)
+        )
+
+    def _model_forward_paged(
+        self,
+        input_ids: torch.Tensor,
+        seqs: List[Sequence],
+        radix: RadixCache,
+        is_decode: bool,
+    ):
+        """Forward with FlashInfer paged attention; no DynamicCache rebuild."""
+        self.model_forward_count += 1
+        self.last_model_forward_size = int(input_ids.shape[0])
+        B, q_len = input_ids.shape
+        cached_lens = [s.cached_len for s in seqs]
+        q_lens = [q_len] * B
+        past_len = cached_lens[0]
+        position_ids = (
+            torch.arange(past_len, past_len + q_len, device=self.device, dtype=torch.long)
+            .unsqueeze(0)
+            .expand(B, -1)
+        )
+        attn = torch.ones((B, past_len + q_len), dtype=torch.long, device=self.device)
+        n_heads = int(self.model.config.num_attention_heads)
+        sm_scale = float(self.head_dim**-0.5)
+        ctx = PagedAttnContext(
+            radix=radix,
+            block_tables=[list(s.block_table) for s in seqs],
+            cached_lens=cached_lens,
+            q_lens=q_lens,
+            is_decode=is_decode,
+            num_qo_heads=n_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            sm_scale=sm_scale,
+        )
+        self.kernel_backend.begin_forward(ctx)
+        try:
+            return self.model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=False,
+                attention_mask=attn,
+            )
+        finally:
+            self.kernel_backend.end_forward()
 
     def _model_forward(self, input_ids, past, attention_mask):
         self.model_forward_count += 1
@@ -440,7 +542,7 @@ class ModelRunner:
         )
 
     def _past_for_seq(self, seq: Sequence, radix: RadixCache):
-        """Attention state: rebuild from paged KV when enabled."""
+        """CPU/stub path: rebuild HF cache from paged KV when enabled."""
         if self.use_paged_as_source and seq.block_table and seq.cached_len > 0:
             self.paged_rebuild_count += 1
             return radix.build_cache(seq.block_table, seq.cached_len)

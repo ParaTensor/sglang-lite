@@ -41,3 +41,8 @@ package-dir = { "sglang_lite" = "engine" }
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: tests that require CUDA + FlashInfer",
+]

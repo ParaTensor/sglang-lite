@@ -215,8 +215,9 @@ paged KV as rebuildable attention state. Transformers cache extraction supports 
 `transformers>=4.40,<6`.
 
 Current limits (still not full SGLang/vLLM parity):
-- Logits still produced by HuggingFace MoE modules; FlashInfer is used for paged append
-  when installed+CUDA, not yet a full custom attention+MoE kernel stack.
+- Logits still produced by HuggingFace MoE modules; on CUDA, FlashInfer paged
+  prefill/decode attention reads paged KV directly (no DynamicCache rebuild).
+  FlashInfer MoE kernels remain P1.
 - Prefill/decode batching requires equal sequence lengths within a group (otherwise serial).
 - Popular hub MoE + CUDA: enable with GPU and optional `SGLANG_LITE_POPULAR_MOE=<id>`.
 - Strict P0 DoD (OpenAI E2E on real MoE, concurrent batch evidence on clean install)
