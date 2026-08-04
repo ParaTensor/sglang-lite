@@ -7,18 +7,11 @@ from typing import Dict, List, Optional
 
 import torch
 
+from .kernel_backend import create_kernel_backend
 from .kv_cache import PastKV, RadixCache
 from .models import assert_moe_supported, is_fixture_model, register_verified
 from .sampling import make_generator, sample_logits
 from .scheduler import Sequence
-
-try:
-    import flashinfer
-
-    HAS_FLASHINFER = True
-except ImportError:
-    HAS_FLASHINFER = False
-    flashinfer = None
 
 
 class MoERouter:
@@ -56,6 +49,7 @@ class ModelRunner:
         self.use_paged_as_source = True
         # Must match model compute dtype; fp16 pages + bf16 activations promote to fp32 in SDPA.
         self.torch_dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
+        self.kernel_backend = create_kernel_backend(self.device)
 
         if model_name == "stub":
             if not allow_stub:
@@ -118,17 +112,7 @@ class ModelRunner:
             self.model.config, "eos_token_id", 2
         )
 
-        if HAS_FLASHINFER and self.device != "cpu":
-            self.workspace_buffer = torch.empty(
-                128 * 1024 * 1024, dtype=torch.uint8, device=self.device
-            )
-            self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                self.workspace_buffer, kv_layout="NHD"
-            )
-            self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                self.workspace_buffer, kv_layout="NHD"
-            )
-            print("[sglang-lite] FlashInfer paged wrappers ready (append/decode kernels)")
+        print(f"[sglang-lite] Kernel backend: {self.kernel_backend.name}")
 
         register_verified(model_name)
         print(f"[sglang-lite] MoE model '{model_name}' ready on {self.device}")
@@ -470,43 +454,9 @@ class ModelRunner:
                 "empty KV write: past_key_values could not be converted to legacy "
                 "(check Transformers DynamicCache / Cache API compatibility)"
             )
-        # FlashInfer append when available (CUDA); else tensor copy write_kv
-        if HAS_FLASHINFER and self.device != "cpu":
-            self._flashinfer_append(seq, radix, start, write_kv)
-        else:
-            radix.write_kv(seq.block_table, start, write_kv)
-
-    def _flashinfer_append(
-        self, seq: Sequence, radix: RadixCache, start: int, write_kv: PastKV
-    ) -> None:
-        """Append into paged cache via FlashInfer; falls back to write_kv on shape issues."""
         append_len = write_kv[0][0].shape[-2] if write_kv[0][0].dim() == 4 else write_kv[0][0].shape[0]
-        for layer_idx, (k, v) in enumerate(write_kv):
-            k_tok, v_tok = radix._normalize_kv(k, v)
-            # (S, H, D) float16
-            k_new = k_tok.to(device=self.device, dtype=radix.dtype)
-            v_new = v_tok.to(device=self.device, dtype=radix.dtype)
-            batch_indices = torch.zeros(append_len, dtype=torch.int32, device=self.device)
-            positions = torch.arange(start, start + append_len, dtype=torch.int32, device=self.device)
-            pages_after = (start + append_len + radix.block_size - 1) // radix.block_size
-            while len(seq.block_table) < pages_after:
-                seq.block_table.extend(radix.allocate_blocks(1))
-            active = seq.block_table[:pages_after]
-            kv_indices = torch.tensor(active, dtype=torch.int32, device=self.device)
-            kv_indptr = torch.tensor([0, kv_indices.numel()], dtype=torch.int32, device=self.device)
-            last_len = start % radix.block_size if start > 0 else 0
-            kv_last = torch.tensor([last_len], dtype=torch.int32, device=self.device)
-            flashinfer.append_paged_kv_cache(
-                k_new,
-                v_new,
-                batch_indices,
-                positions,
-                (radix.k_cache[layer_idx], radix.v_cache[layer_idx]),
-                kv_indices,
-                kv_indptr,
-                kv_last,
-                kv_layout="NHD",
-            )
+        self._ensure_blocks(seq, radix, start + append_len)
+        self.kernel_backend.append_paged_kv(radix, seq.block_table, start, write_kv)
 
     def _batch_caches(self, pasts: List):
         """Stack per-seq caches into one batched DynamicCache/legacy list."""
