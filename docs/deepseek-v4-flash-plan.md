@@ -83,6 +83,53 @@ SGLang 的完整 ModelRunner/EPLB/spec-decode 体系。若需要从 SGLang 借�
 
 待实测确认：sgl-kernel 与 flashinfer 对 V4-Flash 新 attention 形态
 （CSA/HCA）的覆盖程度；deep-gemm 与 5090（sm_120）的兼容性。
+具体测法与验收标准见 3.0.1。
+
+#### 3.0.1 叶子组件实测计划（GPU 环境，逐项验收）
+
+统一前提：8×5090（sm_120）、CUDA/torch 版本与仓库固定的依赖矩阵一致；
+每项先做"能装能跑"再做"数值对齐"；任何失败都记录具体版本与报错，
+不带病接入 KernelBackend。
+
+**T1 flashinfer-python（attention 主路径，已部分接入）**
+
+- 测法：现有 `tests/test_gpu_paged_attention.py` 为基线；补充
+  MLA wrapper 冒烟（`BatchMLAPagedAttentionWrapper` 或等价接口），用
+  DeepSeek-V2-Lite 的 head 配置构造随机 KV，对比 torch 朴素实现的输出。
+- 验收：paged prefill/decode 数值与参考实现 atol≤1e-2（bf16）；MLA wrapper
+  在 sm_120 上可编译可运行。
+- 回退：MLA 不可用则暂时用"解压回标准 KV + 普通 paged attention"的慢路径，
+  并记 issue 跟踪上游。
+
+**T2 sgl-kernel（MoE 与量化算子，S2+ 接入）**
+
+- 测法：`pip install sgl-kernel` 后跑最小算子冒烟：`fused_moe`/topk 用
+  Mixtral 小配置对比 HF 参考 MoE 层输出；FP8 GEMM 对比 bf16 GEMM 的
+  相对误差。
+- 验收：sm_120 上可安装（有预编译 wheel 或可源码编译）；fused_moe 输出与
+  HF 参考 rel-err≤1e-2；单算子调用不依赖 SGLang runtime（import 仅
+  sgl_kernel）。
+- 回退：装不上或算子缺失时，MoE 先走 HF 模型图内的朴素实现，仅损失性能。
+
+**T3 deep-gemm（FP8 grouped GEMM，V4 expert 候选）**
+
+- 测法：安装后跑其自带 benchmark/测试；重点确认 sm_120 支持（该库最初面向
+  Hopper sm_90，Blackwell 支持需实测）；FP8 grouped GEMM 数值对比 bf16 参考。
+- 验收：sm_120 可运行且数值达标；不达标则明确记录"5090 不支持"。
+- 回退：用 sgl-kernel 的 FP8 GEMM 或 cuBLASLt 路径替代。
+
+**T4 官方模型图（V2-Lite 先导 → V4）**
+
+- 测法：transformers remote code 加载 DeepSeek-V2-Lite，短 prompt greedy
+  输出与 HF 参考一致（现有 reference correctness 测试的 GPU 版）；确认其
+  attention/MoE 调用点可被 KernelBackend monkeypatch 接管（同 PR #4 手法）。
+- 验收：V2-Lite 走 paged 路径 `paged_rebuild_count==0` 且逐 token 对齐；
+  MLA 的 KV 进 RadixCache 需要的 layout 描述符明确（这是 S2 的输入）。
+- 回退：remote code 不可控时 vendor 模型定义进仓库（标注来源与 license）。
+
+产出要求：每项一份简短记录（版本、命令、结果、结论），汇总回填本文档
+3.0 表格的"待实测确认"栏；全部通过后才把 sgl-kernel / deep-gemm 写进
+`pyproject.toml` 可选依赖。
 
 ### 3.1 硬件后端隔离（非 NVIDIA 卡的前置设计）
 
