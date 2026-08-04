@@ -68,22 +68,33 @@ SGLang 的完整 ModelRunner/EPLB/spec-decode 体系。若需要从 SGLang 借�
 - **ModelLoader**：分片与量化布局；
 - Prefill/Decode 执行逻辑暂留在 `ModelRunner` 内（保持 2 跳可追踪）。
 
-### 3.0 可复用叶子组件清单（已核实存在，待 GPU 实测）
+### 3.0 可复用叶子组件清单（GPU 实测已回填，2026-08-04 / 8×5090）
 
 以下均为独立可 pip 安装 / vendor 的叶子件，不携带外部调度或全局状态
-（版本为 2026-08 核实的 PyPI 最新版，接入时在 KernelBackend 内固定版本
-并做 capability 探测）：
+（接入时在 KernelBackend 内固定版本并做 capability 探测）。实测环境：
+torch `2.11.0+cu130`、CUDA 13.0、GPU RTX 5090（sm_120 / capability 12.0）。
+测法见 3.0.1，逐项记录见 3.0.2；复现脚本 `scripts/leaf_component_probe.py`。
 
-| 组件 | 版本 | 提供能力 | 接入点 |
-| --- | --- | --- | --- |
-| `flashinfer-python` | 0.6.x | paged attention prefill/decode、MLA wrapper、`append_paged_kv_cache`、采样 | KernelBackend（已接入 append 与 paged prefill/decode） |
-| `sgl-kernel` | 0.3.x | MoE fused kernel（fused_moe/topk）、FP8/FP4 量化 GEMM、norm/rope、采样算子 | KernelBackend（MoE 与量化路径，S2+） |
-| `deep-gemm` | 1.0.0 | DeepSeek 官方 FP8 grouped GEMM | KernelBackend 量化 GEMM 后端（V4 FP4/FP8 expert 候选） |
-| DeepSeek 官方 `inference/` / transformers remote code | — | V2-Lite/V4 模型图定义、weight mapping | ModelLoader / 模型图 vendor（Hybrid） |
+| 组件 | 实测版本 | 提供能力 | 接入点 | sm_120 结论 |
+| --- | --- | --- | --- | --- |
+| `flashinfer-python` | **0.6.12** | paged prefill/decode、`BatchMLAPagedAttentionWrapper`、`append_paged_kv_cache`；另有 `trtllm_batch_decode_sparse_mla_dsv4`（V4 sparse MLA） | KernelBackend（paged 已接入；MLA 可接 S2） | **标准 MLA/paged：可用**；**V4 sparse MLA（CSA 路径）：API 有、sm_120 跑不通**（`Unsupported architecture`） |
+| `sgl-kernel` | **0.4.4** | `topk_softmax` / MoE 辅助、`fp8_*_mm`、`dsv4_fused_*`、`cutlass_mla_decode`、norm/rope | KernelBackend（MoE/量化，S2+） | **可安装可 import**；topk 路由 id 与 torch 一致；**无 CSA/HCA 公开符号**，有 dsv4 融合算子 |
+| `deep-gemm` | **0.1.4** | DeepSeek FP8/FP4 grouped GEMM API 面齐全 | **暂不接入**（见下） | **5090 不支持**：`bf16_gemm_nt` 即报 `Unsupported architecture` |
+| DeepSeek 官方 `inference/` / transformers remote code | 本机有 `ds-v4-flash`；**无 V2-Lite 权重** | V4 模型图含 Indexer/Compressor/`sparse_attn`/HC(Sinkhorn) | ModelLoader / vendor（Hybrid） | V4 图可对照；**V2-Lite greedy/paged 验收 BLOCKED（缺权重）** |
 
-待实测确认：sgl-kernel 与 flashinfer 对 V4-Flash 新 attention 形态
-（CSA/HCA）的覆盖程度；deep-gemm 与 5090（sm_120）的兼容性。
-具体测法与验收标准见 3.0.1。
+**待实测确认（已实测）**：
+
+- flashinfer / sgl-kernel 对 V4-Flash 新 attention（官方代码表现为
+  **Indexer + compressed KV + `sparse_attn`**，以及 **HC / `hc_split_sinkhorn`**；
+  文档简称 CSA/HCA）：flashinfer 提供 DSV4 sparse MLA API，但 **TRTLLM-GEN
+  路径在 sm_120 上报 Unsupported architecture**；sgl-kernel 提供 `dsv4_fused_*`
+  与 MLA 辅助，**无以 CSA/HCA 命名的完整 attention 入口**。S5 前需以官方
+  `inference/kernel.py:sparse_attn` 或上游修复作为回退。
+- deep-gemm 与 5090（sm_120）：**不兼容**（0.1.4）。回退：`sgl-kernel` 的
+  `fp8_*_mm` / `fp8_blockwise_scaled_grouped_mm` 或 cuBLASLt。
+- **因此暂不把 `sgl-kernel` / `deep-gemm` 写入 `pyproject.toml` 可选依赖**
+  （sgl-kernel 可用但 fused_moe 对 HF Mixtral 的完整数值对齐尚未做完；
+  deep-gemm 明确不达标）。
 
 #### 3.0.1 叶子组件实测计划（GPU 环境，逐项验收）
 
@@ -130,6 +141,62 @@ SGLang 的完整 ModelRunner/EPLB/spec-decode 体系。若需要从 SGLang 借�
 产出要求：每项一份简短记录（版本、命令、结果、结论），汇总回填本文档
 3.0 表格的"待实测确认"栏；全部通过后才把 sgl-kernel / deep-gemm 写进
 `pyproject.toml` 可选依赖。
+
+#### 3.0.2 实测记录（2026-08-04，5090 / sm_120）
+
+**T1 flashinfer-python — PASS（标准路径）/ FAIL（V4 sparse）**
+
+- 版本：flashinfer `0.6.12`；torch `2.11.0+cu130`
+- 命令：`pytest tests/test_gpu_paged_attention.py`；
+  `PYTHONPATH=. python scripts/leaf_component_probe.py`；
+  另手测 `flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4`
+- 结果：
+  - 既有 GPU paged 基线 **3 passed**（`paged_rebuild_count==0`）
+  - `BatchMLAPagedAttentionWrapper`（fa2）在 sm_120 可跑；vs torch 参考
+    `max_abs≈0.0078`（bf16，≤1e-2）
+  - `is_sm12x_supported(cuda)=True`
+  - `trtllm_batch_decode_sparse_mla_dsv4`（64 heads / dim 512）→
+    `TllmGenFmhaRunner ... Unsupported architecture`
+- 结论：S2 可接标准 MLA wrapper；V4 CSA 类 sparse MLA **不能**依赖当前
+  flashinfer TRTLLM-GEN 路径上 5090。
+
+**T2 sgl-kernel — PARTIAL PASS（可装可跑，MoE 数值对齐未闭环）**
+
+- 版本：sgl-kernel `0.4.4`（import 仅 `sgl_kernel`，无 SGLang runtime）
+- 命令：probe 脚本 + `topk_softmax` / `fused_add_rmsnorm` 手测
+- 结果：
+  - 安装/import OK；暴露 `moe.*`、`fp8_*_mm`、`dsv4_fused_*`、`cutlass_mla_*`
+  - `topk_softmax`：top-k **id 集合 8/8 与 torch.topk(softmax) 一致**
+    （renormalize 后权重尺度不同，属预期）
+  - `fused_add_rmsnorm` 在 sm_120 正常
+  - 公开 API **无 CSA/HCA 命名**；有 V4 相关 `dsv4_fused_q_norm_rope` 等
+- 结论：可作为 S2+ MoE/量化叶子候选；完整 `fused_moe`↔HF Mixtral rel-err
+  验收仍待补；**暂不写入 pyproject**。
+
+**T3 deep-gemm — FAIL（5090 不支持）**
+
+- 版本：deep-gemm / `deep_gemm` `0.1.4`；`get_cuda_arch()==12.0`
+- 命令：`deep_gemm.bf16_gemm_nt(a,b,d)`（256² bf16）
+- 结果：`Assertion error (.../gemm.hpp:436): Unsupported architecture`
+  （FP8 API 面存在但未再测——bf16 入口已失败）
+- 结论：**明确记录「5090 / sm_120 不支持 deep-gemm 0.1.4」**；V4 expert
+  GEMM 回退 sgl-kernel FP8 或 cuBLASLt；**不写入 pyproject**。
+
+**T4 官方模型图 — BLOCKED（V2-Lite）/ 可对照（V4-Flash）**
+
+- 本机：`~/models/ds-v4-flash`（含 `inference/model.py`）；
+  `deepseek-ai/DeepSeek-V4-Flash`；**无 DeepSeek-V2-Lite 权重/缓存**
+- V4 图要点（S2/S5 输入）：`Attention` = MLA + sliding window +
+  可选 `Compressor`/`Indexer` + `sparse_attn`；Block 侧 HC
+ （`hc_mult` + `hc_split_sinkhorn`）；expert `fp4` + attention 侧 FP8 量化配置
+- S2 layout 描述符需求（在缺 V2-Lite 权重时仍成立）：
+  - 标准：`[layers, blocks, block_size, kv_heads, head_dim]`
+  - MLA compressed：`ckv [blocks, page_size, kv_lora_rank]` +
+    `kpe [blocks, page_size, qk_rope_head_dim]`（常见 `page_size=1`）
+  - V4 另需 SWA 窗口池 + compressed 池 + sparse index（与当前单一
+    isomorphic page 布局不兼容）
+- 结论：V2-Lite greedy / `paged_rebuild_count==0` **未跑**（缺权重）；
+  取得 V2-Lite 后再补 T4 闭环。
 
 ### 3.1 硬件后端隔离（非 NVIDIA 卡的前置设计）
 
