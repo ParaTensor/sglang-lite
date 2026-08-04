@@ -68,6 +68,22 @@ SGLang 的完整 ModelRunner/EPLB/spec-decode 体系。若需要从 SGLang 借�
 - **ModelLoader**：分片与量化布局；
 - Prefill/Decode 执行逻辑暂留在 `ModelRunner` 内（保持 2 跳可追踪）。
 
+### 3.0 可复用叶子组件清单（已核实存在，待 GPU 实测）
+
+以下均为独立可 pip 安装 / vendor 的叶子件，不携带外部调度或全局状态
+（版本为 2026-08 核实的 PyPI 最新版，接入时在 KernelBackend 内固定版本
+并做 capability 探测）：
+
+| 组件 | 版本 | 提供能力 | 接入点 |
+| --- | --- | --- | --- |
+| `flashinfer-python` | 0.6.x | paged attention prefill/decode、MLA wrapper、`append_paged_kv_cache`、采样 | KernelBackend（已接入 append 与 paged prefill/decode） |
+| `sgl-kernel` | 0.3.x | MoE fused kernel（fused_moe/topk）、FP8/FP4 量化 GEMM、norm/rope、采样算子 | KernelBackend（MoE 与量化路径，S2+） |
+| `deep-gemm` | 1.0.0 | DeepSeek 官方 FP8 grouped GEMM | KernelBackend 量化 GEMM 后端（V4 FP4/FP8 expert 候选） |
+| DeepSeek 官方 `inference/` / transformers remote code | — | V2-Lite/V4 模型图定义、weight mapping | ModelLoader / 模型图 vendor（Hybrid） |
+
+待实测确认：sgl-kernel 与 flashinfer 对 V4-Flash 新 attention 形态
+（CSA/HCA）的覆盖程度；deep-gemm 与 5090（sm_120）的兼容性。
+
 ### 3.1 硬件后端隔离（非 NVIDIA 卡的前置设计）
 
 未来需要支持华为昇腾（Ascend/CANN）及其他非 NVIDIA GPU，因此硬件隔离边界必须在
