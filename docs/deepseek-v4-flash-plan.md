@@ -68,6 +68,26 @@ SGLang 的完整 ModelRunner/EPLB/spec-decode 体系。若需要从 SGLang 借�
 - **ModelLoader**：分片与量化布局；
 - Prefill/Decode 执行逻辑暂留在 `ModelRunner` 内（保持 2 跳可追踪）。
 
+### 3.1 硬件后端隔离（非 NVIDIA 卡的前置设计）
+
+未来需要支持华为昇腾（Ascend/CANN）及其他非 NVIDIA GPU，因此硬件隔离边界必须在
+KernelBackend 设计时一次划清，避免事后剥离 CUDA 假设：
+
+- **KernelBackend 是唯一的硬件抽象点**。attention、MoE、量化、采样 kernel 与
+  TP 通信原语全部收口在此；CUDA + FlashInfer/sgl-kernel 只是它的第一个实现
+  （`CudaKernelBackend`），昇腾对应 `AscendKernelBackend`（torch_npu + CANN 算子/
+  MindIE kernel），其他卡同理各自成模块。
+- **KernelBackend 之外禁止硬件特有假设**：RadixKVCache、scheduler、loader、
+  engine loop 只依赖 torch device 语义与 layout 描述符，不 import flashinfer、
+  不写 `torch.cuda.*` 直调、不假定 NCCL（通信后端由 KernelBackend 声明，
+  如 NCCL/HCCL）。现状中 runner 顶层 `import flashinfer` 与 CUDA-only 分支
+  是要在 S1 重构中清掉的典型例子。
+- **能力声明而非 if-else**：每个后端声明自己支持的 dtype（FP4/FP8 是否可用）、
+  KV layout、CUDA graph 等价物等 capability；上层按声明降级（如昇腾初期
+  BF16-only），不在核心路径散落设备判断。
+- **优先级**：Phase 0/1 只实现和验证 CUDA 后端；昇腾等以"接口预留 + 不阻塞"的
+  方式对待——即接口设计时用上述规则审查，但不提前实现，避免抽象空转。
+
 ## 4. 实施顺序
 
 ```text
