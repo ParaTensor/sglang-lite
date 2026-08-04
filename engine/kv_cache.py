@@ -206,22 +206,30 @@ class RadixCache:
         for layer_idx, (k, v) in enumerate(layer_kvs):
             if layer_idx >= self.num_layers:
                 break
-            k_tok, v_tok = self._normalize_kv(k, v)
+            k_tok, v_tok = self.normalize_kv(k, v)
             n = k_tok.shape[0]
-            for t in range(n):
+            end_pos = start_pos + n
+            pages_needed = (end_pos + self.block_size - 1) // self.block_size
+            if pages_needed > len(block_table):
+                raise RuntimeError(
+                    f"block_table too short for pos={end_pos - 1}: pages={len(block_table)}"
+                )
+            k_tok = k_tok.to(dtype=self.dtype)
+            v_tok = v_tok.to(dtype=self.dtype)
+            # Copy contiguous per-page segments instead of per-token slots
+            t = 0
+            while t < n:
                 pos = start_pos + t
                 page_i = pos // self.block_size
                 slot = pos % self.block_size
-                if page_i >= len(block_table):
-                    raise RuntimeError(
-                        f"block_table too short for pos={pos}: pages={len(block_table)}"
-                    )
+                span = min(self.block_size - slot, n - t)
                 bid = block_table[page_i]
                 if bid >= self.num_blocks:
                     raise RuntimeError(f"block id {bid} out of range ({self.num_blocks})")
-                self.k_cache[layer_idx, bid, slot].copy_(k_tok[t].to(self.dtype))
-                self.v_cache[layer_idx, bid, slot].copy_(v_tok[t].to(self.dtype))
-                self._page_len[bid] = max(self._page_len.get(bid, 0), slot + 1)
+                self.k_cache[layer_idx, bid, slot : slot + span].copy_(k_tok[t : t + span])
+                self.v_cache[layer_idx, bid, slot : slot + span].copy_(v_tok[t : t + span])
+                self._page_len[bid] = max(self._page_len.get(bid, 0), slot + span)
+                t += span
 
     def read_kv(self, block_table: List[int], length: int) -> PastKV:
         """Read length tokens from pages as HF legacy list[(k,v)] with shape (1,H,S,D)."""
@@ -232,20 +240,28 @@ class RadixCache:
             raise RuntimeError(
                 f"read_kv: need {pages_needed} pages, have {len(block_table)} for length={length}"
             )
+        pages = torch.tensor(
+            block_table[:pages_needed], dtype=torch.long, device=self.device
+        )
         out: PastKV = []
         for layer_idx in range(self.num_layers):
-            k = torch.empty(
-                (1, self.num_kv_heads, length, self.head_dim),
-                dtype=self.dtype,
-                device=self.device,
+            # (pages, block_size, H, D) -> (1, H, length, D)
+            k = (
+                self.k_cache[layer_idx]
+                .index_select(0, pages)
+                .reshape(-1, self.num_kv_heads, self.head_dim)[:length]
+                .permute(1, 0, 2)
+                .unsqueeze(0)
+                .contiguous()
             )
-            v = torch.empty_like(k)
-            for pos in range(length):
-                page_i = pos // self.block_size
-                slot = pos % self.block_size
-                bid = block_table[page_i]
-                k[0, :, pos, :] = self.k_cache[layer_idx, bid, slot]
-                v[0, :, pos, :] = self.v_cache[layer_idx, bid, slot]
+            v = (
+                self.v_cache[layer_idx]
+                .index_select(0, pages)
+                .reshape(-1, self.num_kv_heads, self.head_dim)[:length]
+                .permute(1, 0, 2)
+                .unsqueeze(0)
+                .contiguous()
+            )
             out.append((k, v))
         return out
 
@@ -261,7 +277,7 @@ class RadixCache:
         except Exception:
             return legacy
 
-    def _normalize_kv(
+    def normalize_kv(
         self, k: torch.Tensor, v: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (seq, num_kv_heads, head_dim)."""

@@ -384,4 +384,7 @@ class EngineLoop:
             "last_model_forward_size": getattr(self.runner, "last_model_forward_size", 0),
             "model_forward_count": getattr(self.runner, "model_forward_count", 0),
             "paged_rebuild_count": getattr(self.runner, "paged_rebuild_count", 0),
+            "kernel_backend": getattr(
+                getattr(self.runner, "kernel_backend", None), "name", "unknown"
+            ),
         }
