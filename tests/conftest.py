@@ -20,15 +20,50 @@ def tiny_mixtral_id(tiny_mixtral_path) -> str:
     return f"fixture:{tiny_mixtral_path}"
 
 
+def _build_offline_tokenizer(path: Path, vocab_size: int = 256):
+    """Build a tiny BPE tokenizer without network access."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import BPE
+    from tokenizers.pre_tokenizers import Whitespace
+    from tokenizers.trainers import BpeTrainer
+    from transformers import PreTrainedTokenizerFast
+
+    special = ["<unk>", "<pad>", "<eos>", "<bos>"]
+    tok_model = Tokenizer(BPE(unk_token="<unk>"))
+    tok_model.pre_tokenizer = Whitespace()
+    trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=special)
+    corpus = [f"hello world {i} test token cache prefix" for i in range(64)]
+    tok_model.train_from_iterator(corpus, trainer=trainer)
+    tok_path = path / "tokenizer.json"
+    path.mkdir(parents=True, exist_ok=True)
+    tok_model.save(str(tok_path))
+    tok = PreTrainedTokenizerFast(
+        tokenizer_file=str(tok_path),
+        unk_token="<unk>",
+        pad_token="<pad>",
+        eos_token="<eos>",
+        bos_token="<bos>",
+    )
+    return tok
+
+
 def _build_tiny_mixtral(path: Path) -> None:
     import torch
-    from transformers import GPT2TokenizerFast, MixtralConfig, MixtralForCausalLM
+    from transformers import MixtralConfig, MixtralForCausalLM
 
-    tok = GPT2TokenizerFast.from_pretrained("gpt2")
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        from transformers import GPT2TokenizerFast
+
+        tok = GPT2TokenizerFast.from_pretrained("gpt2", local_files_only=True)
+    except Exception:
+        tok = _build_offline_tokenizer(path)
+
+    # head_dim must be FlashInfer-supported (64/128/…); 16 is rejected by paged kernels.
     config = MixtralConfig(
         vocab_size=len(tok),
-        hidden_size=64,
-        intermediate_size=128,
+        hidden_size=256,
+        intermediate_size=512,
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -45,7 +80,6 @@ def _build_tiny_mixtral(path: Path) -> None:
     torch.manual_seed(0)
     model = MixtralForCausalLM(config)
     model.eval()
-    path.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(path)
     tok.save_pretrained(path)
     (path / "sglang_lite_moe_family").write_text("mixtral\n")

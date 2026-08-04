@@ -12,11 +12,11 @@ The engine focuses exclusively on popular MoE architectures (Mixtral-style, Deep
 successfully loaded in the current process is advertised on `GET /v1/models`. Local CI uses
 `fixture:<path>` tiny Mixtral weights. Dense models are rejected.
 
-**Execution status**: prefix reuse stores paged K/V + `last_logits`; the runner rebuilds HF
-attention state from pages before forward (pages are required, not optional mirrors).
-Scheduler groups requests; the runner issues **tensor-batched** HF forwards when sequences share
-the same `cached_len` (and prefill new-length). FlashInfer paged-append is used when available
-on CUDA; full FlashInfer attention/MoE kernels remain P1.
+**Execution status**: prefix reuse stores paged K/V + `last_logits`. On CUDA with FlashInfer,
+paged KV is the sole attention source (FlashInfer prefill/decode kernels; no per-step
+DynamicCache rebuild). On CPU, the runner rebuilds HF attention state from pages before forward.
+Scheduler groups requests; the runner issues **tensor-batched** forwards when sequences share
+the same `cached_len` (and prefill new-length). FlashInfer MoE kernels remain P1.
 
 The `engine/` core is a **pure library** exposing three further-decomposed building blocks (RadixKVCache, BatchingScheduler, MoEModelRunner). The sglang-lite product also ships a thin standalone control/serving shell so it can serve users without SGLang, vLLM, or UniGateway.
 

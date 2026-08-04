@@ -206,30 +206,44 @@ class RadixCache:
         for layer_idx, (k, v) in enumerate(layer_kvs):
             if layer_idx >= self.num_layers:
                 break
-            k_tok, v_tok = self.normalize_kv(k, v)
-            n = k_tok.shape[0]
-            end_pos = start_pos + n
-            pages_needed = (end_pos + self.block_size - 1) // self.block_size
-            if pages_needed > len(block_table):
-                raise RuntimeError(
-                    f"block_table too short for pos={end_pos - 1}: pages={len(block_table)}"
-                )
-            k_tok = k_tok.to(dtype=self.dtype)
-            v_tok = v_tok.to(dtype=self.dtype)
-            # Copy contiguous per-page segments instead of per-token slots
-            t = 0
-            while t < n:
-                pos = start_pos + t
-                page_i = pos // self.block_size
-                slot = pos % self.block_size
-                span = min(self.block_size - slot, n - t)
-                bid = block_table[page_i]
-                if bid >= self.num_blocks:
-                    raise RuntimeError(f"block id {bid} out of range ({self.num_blocks})")
-                self.k_cache[layer_idx, bid, slot : slot + span].copy_(k_tok[t : t + span])
-                self.v_cache[layer_idx, bid, slot : slot + span].copy_(v_tok[t : t + span])
-                self._page_len[bid] = max(self._page_len.get(bid, 0), slot + span)
-                t += span
+            self.write_kv_layer(block_table, start_pos, layer_idx, k, v)
+
+    def write_kv_layer(
+        self,
+        block_table: List[int],
+        start_pos: int,
+        layer_idx: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        """Write a single layer's K/V for tokens starting at start_pos into pages."""
+        if not block_table:
+            raise ValueError("write_kv_layer requires block_table")
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise ValueError(f"layer_idx {layer_idx} out of range ({self.num_layers})")
+        k_tok, v_tok = self.normalize_kv(k, v)
+        n = k_tok.shape[0]
+        end_pos = start_pos + n
+        pages_needed = (end_pos + self.block_size - 1) // self.block_size
+        if pages_needed > len(block_table):
+            raise RuntimeError(
+                f"block_table too short for pos={end_pos - 1}: pages={len(block_table)}"
+            )
+        k_tok = k_tok.to(dtype=self.dtype)
+        v_tok = v_tok.to(dtype=self.dtype)
+        t = 0
+        while t < n:
+            pos = start_pos + t
+            page_i = pos // self.block_size
+            slot = pos % self.block_size
+            span = min(self.block_size - slot, n - t)
+            bid = block_table[page_i]
+            if bid >= self.num_blocks:
+                raise RuntimeError(f"block id {bid} out of range ({self.num_blocks})")
+            self.k_cache[layer_idx, bid, slot : slot + span].copy_(k_tok[t : t + span])
+            self.v_cache[layer_idx, bid, slot : slot + span].copy_(v_tok[t : t + span])
+            self._page_len[bid] = max(self._page_len.get(bid, 0), slot + span)
+            t += span
 
     def read_kv(self, block_table: List[int], length: int) -> PastKV:
         """Read length tokens from pages as HF legacy list[(k,v)] with shape (1,H,S,D)."""
