@@ -408,7 +408,20 @@ S5  注册 deepseek_v4 家族：tokenizer 直接引用；模型图 Hybrid
   双池。
 - **内核现状**：生产 decode 维持官方 `sparse_attn`；FI SM120 sparse MLA
   仍 blocked（§6.3），默认 `SGLANG_LITE_V4_DISABLE_FI_SPARSE=1`。
-- **下一阶段**：逐层 logits atol；增量 decode UTF-8 稳态；Radix 双池；FI 换核。
+- **数值稳态 / logits 门禁（2026-08-05）**：`scripts/v4_logits_compare.py`
+  （`torchrun` TP=8，`SGLANG_LITE_V4_DISABLE_FI_SPARSE=1`，seed 与 align
+  同源）。8×5090 / prompt `Hello`（5 tok）Lite prefill 末步：argmax=`你好`
+  (27.574) vs top2 `Hello` (27.483)，**top2 Δ≈0.09**；`gate_soft=true`
+  （英文 lead 仍在 top5）。摘要 `/tmp/v4_logits_compare.json`，可选
+  `--official-logits` 填 `max_abs` / `argmax_match` / `top5_overlap`。
+  全层逐层 hook 仍不做（官方 Transformer 未暴露 per-layer API）。CVD
+  remap 导致与官方 `set_device(local_rank)` 贪心首 token 可翻牌，属已知软门槛。
+- **增量 decode UTF-8（2026-08-05）**：`ModelRunner.detokenize_delta` 收紧
+  （不完整多字节空 delta；发散改写不回吐整段；lone `�` 抑制）；
+  `SchedulerLoop._apply_stop_and_limits` 全分支走 delta；NDJSON
+  `ensure_ascii=True`。单测 `tests/test_detokenize_delta.py`。
+- **下一阶段**：Radix compressed+SWA 双池 COW 真写；FI SM120 换核（等上游
+  absmean≠0）。
 
 ### 6.3 SM120 sparse MLA decode 换核（2026-08-05）
 
