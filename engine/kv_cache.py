@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
@@ -15,6 +16,70 @@ class KVBlock:
 
 
 PastKV = List[Tuple[torch.Tensor, torch.Tensor]]
+
+
+class KvLayoutKind(str, Enum):
+    """Per-pool KV physical layout (Radix owns lifecycle; kernels consume pages)."""
+
+    MHA = "mha"  # standard K/V: [blocks, page, kv_heads, head_dim]
+    MLA_COMPRESSED = "mla_compressed"  # ckv + kpe pages
+    SWA = "swa"  # sliding-window pool (V4)
+    DSV4_PACKED = "dsv4_packed"  # FlashInfer SM120 packed uint8 last-dim 584
+
+
+@dataclass(frozen=True)
+class KvLayout:
+    """Layout descriptor for one KV pool.
+
+    Standard MHA uses a single pool. V4 sparse MLA needs SWA + compressed
+    (and optionally packed) pools selected per layer via ``compress_ratios``.
+    """
+
+    kind: KvLayoutKind = KvLayoutKind.MHA
+    num_kv_heads: int = 8
+    head_dim: int = 128
+    # MLA: latent ckv dim and rope dim (DeepSeek V2/V3/V4 style).
+    ckv_dim: int = 0
+    kpe_dim: int = 0
+    # FlashInfer DSV4 packed page last-dim (SM120 path uses 584).
+    packed_last_dim: int = 0
+    dtype_name: str = "bfloat16"
+
+    @staticmethod
+    def mha(num_kv_heads: int, head_dim: int, dtype_name: str = "bfloat16") -> "KvLayout":
+        return KvLayout(
+            kind=KvLayoutKind.MHA,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype_name=dtype_name,
+        )
+
+    @staticmethod
+    def mla_compressed(
+        ckv_dim: int = 512,
+        kpe_dim: int = 64,
+        dtype_name: str = "bfloat16",
+    ) -> "KvLayout":
+        return KvLayout(
+            kind=KvLayoutKind.MLA_COMPRESSED,
+            num_kv_heads=1,
+            head_dim=ckv_dim,
+            ckv_dim=ckv_dim,
+            kpe_dim=kpe_dim,
+            dtype_name=dtype_name,
+        )
+
+    @staticmethod
+    def dsv4_packed(packed_last_dim: int = 584) -> "KvLayout":
+        return KvLayout(
+            kind=KvLayoutKind.DSV4_PACKED,
+            num_kv_heads=1,
+            head_dim=512,
+            ckv_dim=512,
+            kpe_dim=64,
+            packed_last_dim=packed_last_dim,
+            dtype_name="uint8",
+        )
 
 
 @dataclass
@@ -75,6 +140,10 @@ class RadixCache:
         head_dim: int = 128,
         dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
+        layout: Optional[KvLayout] = None,
+        # Optional secondary pools for V4 SWA / packed pages (allocated lazily).
+        swa_layout: Optional[KvLayout] = None,
+        compressed_layout: Optional[KvLayout] = None,
     ):
         self.max_tokens = max_tokens
         self.block_size = block_size
@@ -83,6 +152,9 @@ class RadixCache:
         self.head_dim = head_dim
         self.dtype = dtype
         self.device = device
+        self.layout = layout or KvLayout.mha(num_kv_heads, head_dim)
+        self.swa_layout = swa_layout
+        self.compressed_layout = compressed_layout
 
         self.tree = RadixTree()
         self._allocated_blocks: Dict[int, KVBlock] = {}
@@ -100,6 +172,33 @@ class RadixCache:
             dtype=dtype,
             device=device,
         )
+        # Optional MLA latent pages: [layers, blocks, page, ckv_dim] / kpe
+        self.ckv_cache: Optional[torch.Tensor] = None
+        self.kpe_cache: Optional[torch.Tensor] = None
+        if self.layout.kind == KvLayoutKind.MLA_COMPRESSED or compressed_layout is not None:
+            cl = compressed_layout or self.layout
+            self.ckv_cache = torch.zeros(
+                (num_layers, self.num_blocks, block_size, cl.ckv_dim),
+                dtype=dtype,
+                device=device,
+            )
+            self.kpe_cache = torch.zeros(
+                (num_layers, self.num_blocks, block_size, cl.kpe_dim),
+                dtype=dtype,
+                device=device,
+            )
+        # Optional packed SWA/compressed pool for SM120 DSV4 (uint8 last-dim 584)
+        self.packed_kv_cache: Optional[torch.Tensor] = None
+        if self.layout.kind == KvLayoutKind.DSV4_PACKED or (
+            swa_layout is not None and swa_layout.kind == KvLayoutKind.DSV4_PACKED
+        ):
+            pl = swa_layout if swa_layout and swa_layout.packed_last_dim else self.layout
+            last = pl.packed_last_dim or 584
+            self.packed_kv_cache = torch.zeros(
+                (num_layers, self.num_blocks, 1, block_size, last),
+                dtype=torch.uint8,
+                device=device,
+            )
         # Token occupancy per physical page (for append position)
         self._page_len: Dict[int, int] = {}
 

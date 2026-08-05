@@ -75,13 +75,17 @@ class ModelRunner:
         print(f"[sglang-lite] Loading MoE model: {load_id}")
         config = AutoConfig.from_pretrained(load_id, trust_remote_code=True)
         model_type = getattr(config, "model_type", None)
-        assert_moe_supported(model_name, model_type)
+        fam = assert_moe_supported(model_name, model_type)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             load_id, trust_remote_code=True, use_fast=True
         )
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        if fam.name == "deepseek_v4" or (model_type or "").lower() == "deepseek_v4":
+            self._load_deepseek_v4_hybrid(model_name, load_id, config)
+            return
 
         dtype = self.torch_dtype
         load_kwargs = {
@@ -113,7 +117,8 @@ class ModelRunner:
             )
         )
         self.head_dim = int(
-            self.model.config.hidden_size // self.model.config.num_attention_heads
+            getattr(self.model.config, "head_dim", None)
+            or (self.model.config.hidden_size // self.model.config.num_attention_heads)
         )
         self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None) or getattr(
             self.model.config, "eos_token_id", 2
@@ -130,6 +135,58 @@ class ModelRunner:
 
         register_verified(model_name)
         print(f"[sglang-lite] MoE model '{model_name}' ready on {self.device}")
+
+    def _load_deepseek_v4_hybrid(self, model_name: str, load_id: str, config) -> None:
+        """Hybrid: official inference Transformer + TP shard from convert.py."""
+        import os
+
+        from .kv_cache import KvLayout
+        from .model_loader import load_v4_hybrid_model, resolve_v4_paths
+
+        rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        paths = resolve_v4_paths(hf_ckpt=load_id)
+        if paths.converted_ckpt is None:
+            raise RuntimeError(
+                "deepseek_v4 Hybrid load requires converted MP shards. "
+                "Run scripts/v4_official_smoke.sh then set "
+                "SGLANG_LITE_DSV4_CONVERTED=/tmp/ds-v4-mp8 (and torchrun for TP)."
+            )
+        if world_size < 2:
+            raise RuntimeError(
+                "deepseek_v4 requires tensor parallel (WORLD_SIZE>=2, typically 8). "
+                "Use: torchrun --nproc-per-node=8 -m sglang_lite.process ... "
+                "or scripts/v4_lite_short_gen.py"
+            )
+        model, cfg, plan = load_v4_hybrid_model(
+            paths, rank=rank, world_size=world_size, device=self.device
+        )
+        self.model = model
+        self._is_real = True
+        self._v4_hybrid = True
+        self._tp_plan = plan
+        self.vocab_size = int(cfg.get("vocab_size", 129280))
+        self.num_layers = int(cfg.get("n_layers") or cfg.get("num_hidden_layers", 43))
+        self.num_kv_heads = int(cfg.get("num_key_value_heads", 1))
+        self.head_dim = int(cfg.get("head_dim", 512))
+        self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None) or int(
+            cfg.get("eos_token_id", 1)
+        )
+        # V4 uses MLA / sparse pools — standard MHA hooks do not apply.
+        self.use_paged_as_source = False
+        self._kv_layout = KvLayout.mla_compressed(
+            ckv_dim=int(cfg.get("head_dim", 512)),
+            kpe_dim=int(cfg.get("rope_head_dim") or cfg.get("qk_rope_head_dim", 64)),
+        )
+        self._swa_layout = KvLayout.dsv4_packed(584)
+        kb = self.kernel_backend
+        print(
+            f"[sglang-lite] deepseek_v4 Hybrid rank={plan.rank}/{plan.world_size} "
+            f"arch={kb.arch_family.value} sparse_mla={kb.sparse_mla_backend.value} "
+            f"moe_gemm={kb.moe_gemm_backend.value}"
+        )
+        register_verified(model_name)
+        print(f"[sglang-lite] MoE model '{model_name}' Hybrid ready on {plan.local_device}")
 
     def _init_tiny_stub_model(self):
         import torch.nn as nn

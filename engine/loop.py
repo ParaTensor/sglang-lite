@@ -387,4 +387,24 @@ class EngineLoop:
             "kernel_backend": getattr(
                 getattr(self.runner, "kernel_backend", None), "name", "unknown"
             ),
+            "arch_family": getattr(
+                getattr(getattr(self.runner, "kernel_backend", None), "arch_family", None),
+                "value",
+                "unknown",
+            ),
+            "sparse_mla_backend": getattr(
+                getattr(
+                    getattr(self.runner, "kernel_backend", None), "sparse_mla_backend", None
+                ),
+                "value",
+                "none",
+            ),
+            "moe_gemm_backend": getattr(
+                getattr(
+                    getattr(self.runner, "kernel_backend", None), "moe_gemm_backend", None
+                ),
+                "value",
+                "none",
+            ),
+            "v4_hybrid": bool(getattr(self.runner, "_v4_hybrid", False)),
         }

@@ -8,9 +8,10 @@ This is the authoritative reference for what belongs in core vs. what gets pushe
 
 The engine focuses exclusively on popular MoE architectures (Mixtral-style, DeepSeek-style, Qwen-MoE, etc.). Dense models are out of scope. MoE support is first-class.
 
-**MoE families** (see `engine/models.py`): Mixtral-style, Qwen-MoE, DeepSeek-MoE. Only the model
-successfully loaded in the current process is advertised on `GET /v1/models`. Local CI uses
-`fixture:<path>` tiny Mixtral weights. Dense models are rejected.
+**MoE families** (see `engine/models.py`): Mixtral-style, Qwen-MoE, DeepSeek-MoE, DeepSeek-V4.
+Only the model successfully loaded in the current process is advertised on `GET /v1/models`.
+Local CI uses `fixture:<path>` tiny Mixtral weights. Dense models are rejected. V4 uses Hybrid
+official `inference/` + leaf kernels (FlashInfer/sgl-kernel); see `docs/deepseek-v4-flash-plan.md`.
 
 **Execution status**: prefix reuse stores paged K/V + `last_logits`. On CUDA with FlashInfer,
 paged KV is the sole attention source (FlashInfer prefill/decode kernels; no per-step
