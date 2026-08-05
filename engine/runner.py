@@ -376,21 +376,34 @@ class ModelRunner:
         return "".join([chr(97 + (t % 26)) for t in token_ids[:20]])
 
     def detokenize_delta(self, token_ids: List[int], prev_text: str = "") -> str:
-        """Incremental decode; tolerate tokenizer rewriting incomplete UTF-8 tails."""
+        """Incremental decode; never re-emit the whole string on tokenizer churn.
+
+        - Prefers ``full[len(prev):]`` when ``full`` extends ``prev``.
+        - If ``full`` is a prefix of ``prev`` (incomplete multi-byte piece), wait.
+        - Otherwise emit only the suffix after the longest common prefix.
+        - If there is no common prefix and ``prev`` is non-empty, emit nothing
+          (avoids dumping a rewritten full sentence / ``�`` storms to SSE).
+        """
         if not token_ids:
             return ""
         full = self.detokenize(token_ids)
         if full.startswith(prev_text):
-            return full[len(prev_text) :]
-        # Incomplete multi-byte piece: full shrank vs prev — wait for more tokens.
-        if prev_text.startswith(full):
+            delta = full[len(prev_text) :]
+        elif prev_text.startswith(full):
+            # Incomplete UTF-8 / multi-token glyph — hold until decode grows.
             return ""
-        # Longest common prefix; emit only the stable new suffix.
-        n = 0
-        limit = min(len(prev_text), len(full))
-        while n < limit and prev_text[n] == full[n]:
-            n += 1
-        return full[n:]
+        else:
+            n = 0
+            limit = min(len(prev_text), len(full))
+            while n < limit and prev_text[n] == full[n]:
+                n += 1
+            if n == 0 and prev_text:
+                return ""
+            delta = full[n:]
+        # Lone U+FFFD is an incomplete decode artifact — do not stream it.
+        if delta == "\ufffd":
+            return ""
+        return delta
 
     @torch.no_grad()
     def run_batch(

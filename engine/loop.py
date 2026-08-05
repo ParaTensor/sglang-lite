@@ -296,21 +296,18 @@ class EngineLoop:
             if len(seq.output_ids) > seq.max_tokens:
                 seq.output_ids.pop()
                 self.scheduler.mark_finished(seq, "length")
-                full = self.runner.detokenize(seq.output_ids)
-                delta = full[len(prev_text) :] if full.startswith(prev_text) else full
+                delta = self.runner.detokenize_delta(seq.output_ids, prev_text)
                 return True, delta, tok if delta else None
         if len(seq.output_ids) >= seq.max_tokens:
             self.scheduler.mark_finished(seq, "length")
-            full = self.runner.detokenize(seq.output_ids)
-            delta = full[len(prev_text) :] if full.startswith(prev_text) else full
-            return True, delta, tok
+            delta = self.runner.detokenize_delta(seq.output_ids, prev_text)
+            return True, delta, tok if delta else None
 
         if tok in (seq.stop_token_ids or []):
             if seq.output_ids and seq.output_ids[-1] == tok:
                 seq.output_ids.pop()
             self.scheduler.mark_finished(seq, "stop")
-            full = self.runner.detokenize(seq.output_ids)
-            delta = full[len(prev_text) :] if full.startswith(prev_text) else ""
+            delta = self.runner.detokenize_delta(seq.output_ids, prev_text)
             return True, delta, None
 
         full = self.runner.detokenize(seq.output_ids)
@@ -323,9 +320,7 @@ class EngineLoop:
                     ):
                         seq.output_ids.pop()
                     self.scheduler.mark_finished(seq, "stop")
-                    delta = (
-                        trimmed[len(prev_text) :] if trimmed.startswith(prev_text) else ""
-                    )
+                    delta = self.runner.detokenize_delta(seq.output_ids, prev_text)
                     return True, delta, tok if delta else None
 
         delta = self.runner.detokenize_delta(seq.output_ids, prev_text)
