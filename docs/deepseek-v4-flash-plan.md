@@ -282,7 +282,7 @@ capability 探测 + 内核路由**，不引入 vLLM 调度/内存管理框架。
 - [x] SM120 sparse MLA 入口可 import + 随机 KV 冒烟（FI 0.6.16.post1 隔离前缀；atol 另定）
 - [~] `B12xMoEWrapper` 小配置：`run` 已通 / vs HF MoE rel-err **未闭环**（scale 约定）
 - [x] DeepGEMM SM120 版：无（0.1.4 FAIL）→ 维持 B12x/sgl-kernel 回退
-- [ ] KernelBackend 单测：伪造 sm100/sm120 capability 时路由表断言
+- [x] KernelBackend 单测：伪造 sm100/sm120 capability 时路由表断言（`tests/test_capability_routing.py`）
 
 ### 3.1 硬件后端隔离（非 NVIDIA 卡的前置设计）
 
@@ -310,21 +310,23 @@ KernelBackend 设计时一次划清，避免事后剥离 CUDA 假设：
 S1  M2/M3 补完：paged KV 成为唯一真相（去掉 DynamicCache 重建），
     FlashInfer prefill/decode kernel 进入 hot path，中央 async engine loop。
     验证模型：fixture / Mixtral 小模型。
-S2  KV layout 抽象 + DeepSeek-V2-Lite 先导：
-    RadixKVCache 增加 per-layer layout 描述符（标准 KV / MLA compressed），
-    KernelBackend 收口 MLA attention（FlashInfer MLA wrapper）。
-S3  单机 TP=8（受控拓扑，5090×8）：loader 分片 + KernelBackend TP shape；
+S2  KV layout 抽象（跳过 V2-Lite 先导，直接用 V4 形状）：
+    RadixKVCache 增加 layout 描述符（标准 KV / MLA compressed / DSV4 packed），
+    KernelBackend 收口 MLA + arch_family 路由（见 3.0.3）。
+S3  单机 TP=8（受控拓扑，5090×8）：ModelLoader 分片 + 官方 convert 契约；
     EP 只做最小可用，不做 expert load-balancing 调度。
-S4  数值路径：BF16 → FP8；量化计算全部走 KernelBackend。
+S4  数值路径：BF16 → FP8；量化计算全部走 KernelBackend（B12x / sgl-kernel）。
 S5  注册 deepseek_v4 家族：tokenizer 直接引用；模型图 Hybrid
-    （官方 inference/ 或 remote code）；FP4 expert + FP8 attention 接入；
+    （官方 inference/）；FP4 expert + FP8 attention 经 KernelBackend 门面；
     CSA/HCA 的 KV 形态以 S2 的 layout 描述符承接；
     KernelBackend 按 arch_family 路由 SM120 sparse MLA + B12x/MoE（见 3.0.3）。
     mHC、hash routing 等留在模型图内部，scheduler 不感知。
 ```
 
-V2-Lite 比 Mixtral 更适合当先导，因为它同时踩中 MoE + MLA 两个 V4 前置依赖，
-且单卡可跑，能在 CI/开发机验证正确性。
+**决策（2026-08-05）**：跳过 DeepSeek-V2-Lite 先导（无权重且对 V4 终局价值低）。
+叶子能力通过 FlashInfer / sgl-kernel / 官方 `inference/` **小包引用**接入，
+禁止整段引入 vLLM/SGLang 调度。P0 脚本：`scripts/v4_official_smoke.sh`；
+短生成：`scripts/v4_lite_short_gen.py`。
 
 ## 5. 明确不做或后置
 
@@ -345,6 +347,23 @@ V2-Lite 比 Mixtral 更适合当先导，因为它同时踩中 MoE + MLA 两个 
 4. standalone serving 能真实 SSE 流式输出。
 
 任何一条达不到，说明底座还没好，不应继续堆 V4 特例。
+
+### 6.1 P0 官方基线进度（2026-08-05 / 8×5090）
+
+- **convert PASS**：`inference/convert.py --model-parallel 8` →
+  `/tmp/ds-v4-mp8/model{0..7}-mp8.safetensors`。
+- **generate PASS**：`torchrun --nproc-per-node=8 generate.py`，prompt
+  `Hello`，greedy 输出：`Hello! How can I help you today`（max_new_tokens=8）。
+- **环境要点**：
+  1. `--config` 必须用 `inference/config.json`（ModelArgs 形），不是 HF config；
+  2. TileLang JIT 只用系统 CUDA（`PATH=/usr/local/cuda/bin`，
+     `CPATH=/usr/local/cuda/include`），禁止混入 pip `nvidia/cu13` 头；
+  3. `fast_hadamard_transform`：需
+     `pip install --no-build-isolation` + `TORCH_CUDA_ARCH_LIST=12.0` 从源码装。
+- 脚本：`scripts/v4_official_smoke.sh`、`scripts/v4_lite_short_gen.py`。
+- 引擎侧已落地：`arch_family` 路由、`KvLayout`、`deepseek_v4` 注册、
+  `ModelLoader` TP=8 / Hybrid 入口（需 `WORLD_SIZE` +
+  `SGLANG_LITE_DSV4_CONVERTED`）。
 
 ## 7. 风险与开放问题
 

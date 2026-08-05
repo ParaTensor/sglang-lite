@@ -4,6 +4,9 @@ Everything hardware-specific (FlashInfer, CUDA-only kernels, future Ascend/CANN
 backends) lives behind this interface. The rest of the engine (RadixCache,
 Scheduler, ModelRunner composition) stays device-agnostic and must not import
 kernel libraries or branch on device types directly.
+
+Architecture-family routing (SM90/SM100/SM120) lives in ``capability`` and is
+exposed on each backend instance — runners must not write ``if major == 10``.
 """
 
 from __future__ import annotations
@@ -13,6 +16,13 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 
+from .capability import (
+    ArchFamily,
+    KernelCapabilities,
+    MoeGemmBackend,
+    SparseMlaBackend,
+    probe_kernel_capabilities,
+)
 from .kv_cache import PastKV, RadixCache
 
 
@@ -40,6 +50,26 @@ class KernelBackend:
 
     name = "torch"
     supports_paged_attention = False
+    supports_mla = False
+    supports_sparse_mla = False
+
+    def __init__(self, capabilities: Optional[KernelCapabilities] = None):
+        self.capabilities = capabilities or KernelCapabilities(
+            arch_family=ArchFamily.UNKNOWN,
+            cuda_capability=(0, 0),
+        )
+
+    @property
+    def arch_family(self) -> ArchFamily:
+        return self.capabilities.arch_family
+
+    @property
+    def sparse_mla_backend(self) -> SparseMlaBackend:
+        return self.capabilities.sparse_mla_backend
+
+    @property
+    def moe_gemm_backend(self) -> MoeGemmBackend:
+        return self.capabilities.moe_gemm_backend
 
     def append_paged_kv(
         self,
@@ -107,16 +137,34 @@ class KernelBackend:
     ) -> torch.Tensor:
         raise NotImplementedError("paged_decode requires FlashInferBackend")
 
+    def mla_paged_run(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        ckv: torch.Tensor,
+        kpe: torch.Tensor,
+        **plan_kwargs: Any,
+    ) -> torch.Tensor:
+        """Standard FlashInfer BatchMLA paged attention (non-sparse)."""
+        raise NotImplementedError("mla_paged_run requires FlashInferBackend")
+
+    def sparse_mla_decode_dsv4(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        """DeepSeek-V4 sparse MLA decode — routed by arch_family."""
+        raise NotImplementedError("sparse_mla_decode_dsv4 requires FlashInferBackend")
+
 
 class FlashInferBackend(KernelBackend):
     """CUDA backend using FlashInfer paged-KV kernels."""
 
     name = "flashinfer"
     supports_paged_attention = True
+    supports_mla = True
 
-    def __init__(self, device: str):
+    def __init__(self, device: str, capabilities: Optional[KernelCapabilities] = None):
         import flashinfer
 
+        caps = capabilities or probe_kernel_capabilities(device)
+        super().__init__(caps)
         self._flashinfer = flashinfer
         self.device = device
         self.workspace_buffer = torch.empty(
@@ -127,6 +175,18 @@ class FlashInferBackend(KernelBackend):
         )
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer, kv_layout="NHD"
+        )
+        self._mla_wrapper = None
+        try:
+            self._mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer, backend="fa2"
+            )
+        except Exception:
+            self._mla_wrapper = None
+            self.supports_mla = False
+        self.supports_sparse_mla = (
+            self.sparse_mla_backend == SparseMlaBackend.FLASHINFER_SPARSE_SM120
+            or self.sparse_mla_backend == SparseMlaBackend.FLASHINFER_SPARSE_SM100
         )
         self._attn_ctx: Optional[PagedAttnContext] = None
         self._page_indices: Optional[torch.Tensor] = None
@@ -464,13 +524,48 @@ class FlashInferBackend(KernelBackend):
 
         return forward
 
+    def mla_paged_run(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        ckv: torch.Tensor,
+        kpe: torch.Tensor,
+        **plan_kwargs: Any,
+    ) -> torch.Tensor:
+        if self._mla_wrapper is None:
+            raise NotImplementedError("BatchMLAPagedAttentionWrapper unavailable")
+        self._mla_wrapper.plan(**plan_kwargs)
+        return self._mla_wrapper.run(q_nope, q_pe, ckv, kpe)
+
+    def sparse_mla_decode_dsv4(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        """Route V4 sparse MLA by arch_family — never SM100 TRTLLM on SM120."""
+        backend = self.sparse_mla_backend
+        if backend == SparseMlaBackend.FLASHINFER_SPARSE_SM100 and self.arch_family == ArchFamily.SM120:
+            raise RuntimeError(
+                "refusing SM100 sparse MLA on SM120; upgrade FlashInfer or use "
+                "official sparse_attn fallback"
+            )
+        if backend in (
+            SparseMlaBackend.FLASHINFER_SPARSE_SM120,
+            SparseMlaBackend.FLASHINFER_SPARSE_SM100,
+        ):
+            import flashinfer.mla as mla
+
+            return mla.trtllm_batch_decode_sparse_mla_dsv4(*args, **kwargs)
+        if backend == SparseMlaBackend.OFFICIAL_SPARSE_ATTN:
+            raise NotImplementedError(
+                "official sparse_attn fallback not wired; set FI≥0.6.16 with "
+                "SM120 sparse module or pass SGLANG_LITE_DSV4_INFER"
+            )
+        raise NotImplementedError(f"sparse MLA backend unavailable: {backend}")
+
 
 def create_kernel_backend(device: str) -> KernelBackend:
     """Pick the best backend the current hardware supports."""
     if device != "cpu":
         try:
-            backend: Optional[KernelBackend] = FlashInferBackend(device)
-            return backend
+            caps = probe_kernel_capabilities(device)
+            return FlashInferBackend(device, capabilities=caps)
         except ImportError:
             pass
-    return KernelBackend()
+    return KernelBackend(capabilities=probe_kernel_capabilities("cpu"))

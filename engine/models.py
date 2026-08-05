@@ -50,7 +50,18 @@ DEEPSEEK_MOE = MoEFamily(
     ),
 )
 
-FAMILIES: List[MoEFamily] = [MIXTRAL, QWEN_MOE, DEEPSEEK_MOE]
+DEEPSEEK_V4 = MoEFamily(
+    name="deepseek_v4",
+    model_types=frozenset({"deepseek_v4"}),
+    example_ids=frozenset(
+        {
+            "deepseek-ai/DeepSeek-V4-Flash",
+            "local:ds-v4-flash",
+        }
+    ),
+)
+
+FAMILIES: List[MoEFamily] = [MIXTRAL, QWEN_MOE, DEEPSEEK_MOE, DEEPSEEK_V4]
 
 # Only ids that successfully loaded (or were explicitly registered) this process.
 _VERIFIED: Set[str] = set()
@@ -101,12 +112,16 @@ def assert_moe_supported(model_id: str, model_type: Optional[str] = None) -> MoE
         return MIXTRAL
     if "qwen" in lower and "moe" in lower:
         return QWEN_MOE
+    if "deepseek" in lower and "v4" in lower:
+        return DEEPSEEK_V4
+    if "ds-v4" in lower or "deepseek-v4" in lower:
+        return DEEPSEEK_V4
     if "deepseek" in lower and ("moe" in lower or "v2" in lower or "v3" in lower):
         return DEEPSEEK_MOE
 
     raise ValueError(
         f"model '{model_id}' is not a supported MoE family "
-        f"(mixtral / qwen-moe / deepseek-moe). Dense models are out of scope."
+        f"(mixtral / qwen-moe / deepseek-moe / deepseek_v4). Dense models are out of scope."
     )
 
 
