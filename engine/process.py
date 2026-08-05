@@ -2,6 +2,11 @@
 
 Not an OpenAI surface — that lives in Rust control/serving.
 Run: python -m sglang_lite.process --model <moe> --port 9001
+
+TP / DeepSeek-V4 (torchrun)::
+
+  torchrun --nproc-per-node=8 -m sglang_lite.process \\
+    --model ~/models/ds-v4-flash --device cuda --port 9001
 """
 
 from __future__ import annotations
@@ -10,8 +15,16 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import queue
+import threading
 import uuid
 from typing import Any, Dict, List, Optional
+
+# Must run before torch import (TileLang device_id==0).
+from .tp_sync import broadcast_obj, is_tp, rank, remap_visible_device_for_tilelang, world_size
+
+remap_visible_device_for_tilelang()
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -28,6 +41,13 @@ app = FastAPI(title="sglang-lite engine process")
 LOOP: Optional[EngineLoop] = None
 READY = False
 MODEL_NAME = "stub"
+# Serialize TP generate so all ranks stay on one shared schedule.
+_TP_LOCK = threading.Lock()
+_TP_MODE = False
+# Rank-0: one CUDA-owning thread runs broadcast+submit+pump (TileLang is
+# thread-affine; asyncio default executors break device binding).
+_TP_CUDA_Q: "queue.Queue" = None  # type: ignore[assignment]
+_TP_CUDA_THREAD: Optional[threading.Thread] = None
 
 
 class ChatMessage(BaseModel):
@@ -83,6 +103,47 @@ def _input_ids_from_req(req: GenerationRequest) -> List[int]:
     return LOOP.runner.apply_chat_template(messages)
 
 
+def _params_from_req(req: GenerationRequest) -> GenParams:
+    return GenParams(
+        max_tokens=req.max_tokens,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        top_k=req.top_k,
+        seed=req.seed,
+        stop=req.stop,
+        timeout_s=req.timeout_s,
+    )
+
+
+def _msg_generate(req: GenerationRequest, input_ids: List[int]) -> Dict[str, Any]:
+    return {
+        "op": "generate",
+        "request_id": req.request_id,
+        "input_ids": list(input_ids),
+        "max_tokens": req.max_tokens,
+        "temperature": req.temperature,
+        "top_p": req.top_p,
+        "top_k": req.top_k,
+        "seed": req.seed,
+        "stop": req.stop,
+        "timeout_s": req.timeout_s,
+    }
+
+
+def _apply_generate_msg(msg: Dict[str, Any]):
+    assert LOOP is not None
+    params = GenParams(
+        max_tokens=int(msg["max_tokens"]),
+        temperature=float(msg["temperature"]),
+        top_p=float(msg["top_p"]),
+        top_k=msg.get("top_k"),
+        seed=msg.get("seed"),
+        stop=msg.get("stop"),
+        timeout_s=float(msg.get("timeout_s", 300.0)),
+    )
+    return LOOP.submit(str(msg["request_id"]), list(msg["input_ids"]), params)
+
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "service": "sglang-lite-engine"}
@@ -92,7 +153,12 @@ async def healthz():
 async def readyz():
     if not READY or LOOP is None or not LOOP.ready:
         return JSONResponse({"status": "not_ready"}, status_code=503)
-    return {"status": "ready", "model": MODEL_NAME}
+    return {
+        "status": "ready",
+        "model": MODEL_NAME,
+        "tp_world_size": world_size(),
+        "rank": rank(),
+    }
 
 
 @app.get("/metrics")
@@ -114,6 +180,7 @@ async def metrics():
             f"sglang_lite_cache_miss_count {stats['cache'].get('miss_count', 0)}",
             f"sglang_lite_kv_blocks_used {stats['cache'].get('blocks_used', 0)}",
             f"sglang_lite_oom_reject_count {stats['cache'].get('oom_reject_count', 0)}",
+            f"sglang_lite_tp_world_size {world_size()}",
         ]
         body = "\n".join(lines) + "\n"
     return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
@@ -135,8 +202,10 @@ async def stats():
 async def cancel(req: CancelRequest):
     if LOOP is None:
         return JSONResponse({"ok": False}, status_code=503)
+    # Local cancel only — TP workers may finish the current pump step; do not
+    # take _TP_LOCK (would deadlock with an in-flight generate).
     ok = LOOP.cancel(req.request_id)
-    return {"ok": ok, "request_id": req.request_id}
+    return {"ok": ok, "request_id": req.request_id, "tp": _TP_MODE}
 
 
 @app.post("/v1/generate")
@@ -172,15 +241,14 @@ async def generate(req: GenerationRequest, request: Request):
             status_code=400,
         )
 
-    params = GenParams(
-        max_tokens=req.max_tokens,
-        temperature=req.temperature,
-        top_p=req.top_p,
-        top_k=req.top_k,
-        seed=req.seed,
-        stop=req.stop,
-        timeout_s=req.timeout_s,
-    )
+    if _TP_MODE:
+        return await _generate_tp(req, request, input_ids)
+    return await _generate_local(req, request, input_ids)
+
+
+async def _generate_local(req: GenerationRequest, request: Request, input_ids: List[int]):
+    assert LOOP is not None
+    params = _params_from_req(req)
     try:
         submitted = LOOP.submit(req.request_id, input_ids, params)
     except Exception as e:
@@ -196,23 +264,115 @@ async def generate(req: GenerationRequest, request: Request):
                 item = await asyncio.get_event_loop().run_in_executor(None, dq.get, True, 0.5)
             except Exception:
                 continue
-            line = json.dumps(item, ensure_ascii=False) + "\n"
-            yield line
+            yield json.dumps(item, ensure_ascii=True) + "\n"
             if item.get("finish_reason") is not None or item.get("error"):
                 break
 
-        if not req.stream:
-            return
+    if req.stream:
+        return StreamingResponse(ndjson_stream(), media_type="application/x-ndjson")
+    return await _aggregate_ndjson(ndjson_stream(), input_ids)
+
+
+def _tp_cuda_bind() -> None:
+    """Bind the remapped single visible GPU (cuda:0)."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
+            torch.set_default_device("cuda")
+    except Exception:
+        pass
+
+
+def _start_tp_cuda_thread() -> None:
+    """Start the rank-0 CUDA worker that owns all Hybrid forwards."""
+    global _TP_CUDA_Q, _TP_CUDA_THREAD
+    if _TP_CUDA_THREAD is not None:
+        return
+    q: queue.Queue = queue.Queue()
+    _TP_CUDA_Q = q
+
+    def _loop() -> None:
+        _tp_cuda_bind()
+        logger.info("tp cuda worker thread bound device=0")
+        while True:
+            job = q.get()
+            if job is None:
+                break
+            msg, holder = job
+            try:
+                with _TP_LOCK:
+                    broadcast_obj(msg, src=0)
+                    submitted = _apply_generate_msg(msg)
+                    holder["submitted"] = submitted
+                    holder["event"].set()  # allow HTTP side to start reading deltas
+                    LOOP.pump_until_idle(timeout_s=float(msg.get("timeout_s", 300.0)))
+                holder["done"].set()
+            except Exception as e:
+                holder["error"] = e
+                holder["event"].set()
+                holder["done"].set()
+
+    _TP_CUDA_THREAD = threading.Thread(
+        target=_loop, name="sglang-lite-tp-cuda", daemon=True
+    )
+    _TP_CUDA_THREAD.start()
+
+
+async def _generate_tp(req: GenerationRequest, request: Request, input_ids: List[int]):
+    """Rank-0 only: enqueue CUDA work, stream NDJSON deltas."""
+    assert LOOP is not None
+    if _TP_CUDA_Q is None:
+        _start_tp_cuda_thread()
+    msg = _msg_generate(req, input_ids)
+    holder: Dict[str, Any] = {
+        "event": threading.Event(),
+        "done": threading.Event(),
+        "submitted": None,
+        "error": None,
+    }
+    _TP_CUDA_Q.put((msg, holder))
+
+    # Wait until submit finished (or error) without blocking the event loop hard.
+    loop = asyncio.get_event_loop()
+    while not holder["event"].is_set():
+        await asyncio.sleep(0.005)
+    if holder["error"] is not None:
+        return JSONResponse({"error": str(holder["error"])}, status_code=500)
+    submitted = holder["submitted"]
+
+    async def ndjson_stream():
+        dq = submitted.delta_queue
+        try:
+            while True:
+                if await request.is_disconnected():
+                    LOOP.cancel(req.request_id)
+                    break
+                try:
+                    item = await loop.run_in_executor(None, dq.get, True, 0.5)
+                except Exception:
+                    if holder["done"].is_set() and dq.empty():
+                        break
+                    continue
+                yield json.dumps(item, ensure_ascii=True) + "\n"
+                if item.get("finish_reason") is not None or item.get("error"):
+                    break
+        finally:
+            while not holder["done"].is_set():
+                await asyncio.sleep(0.01)
 
     if req.stream:
         return StreamingResponse(ndjson_stream(), media_type="application/x-ndjson")
+    return await _aggregate_ndjson(ndjson_stream(), input_ids)
 
-    # Non-stream: aggregate
+
+async def _aggregate_ndjson(ndjson_stream, input_ids: List[int]):
     text_parts: List[str] = []
     finish = "stop"
     usage = None
     error = None
-    async for chunk in ndjson_stream():
+    async for chunk in ndjson_stream:
         data = json.loads(chunk)
         if data.get("text"):
             text_parts.append(data["text"])
@@ -237,30 +397,97 @@ async def generate(req: GenerationRequest, request: Request):
     }
 
 
-def build_loop(model: str, device: str, allow_stub: bool, max_batch_size: int) -> EngineLoop:
+def _tp_worker_loop() -> None:
+    """Non-zero ranks: wait for broadcast ops and pump in lockstep with rank 0."""
+    assert LOOP is not None
+    logger.info("tp worker rank=%s waiting for broadcast", rank())
+    while True:
+        msg = broadcast_obj(None, src=0)
+        if msg is None:
+            logger.info("tp worker rank=%s shutdown", rank())
+            break
+        op = msg.get("op")
+        if op == "generate":
+            _apply_generate_msg(msg)
+            LOOP.pump_until_idle(timeout_s=float(msg.get("timeout_s", 300.0)))
+        elif op == "cancel":
+            LOOP.cancel(str(msg["request_id"]))
+        elif op == "warmup":
+            _apply_generate_msg(msg)
+            LOOP.pump_until_idle(timeout_s=float(msg.get("timeout_s", 60.0)))
+        else:
+            logger.warning("tp worker unknown op=%s", op)
+
+
+def build_loop(
+    model: str,
+    device: str,
+    allow_stub: bool,
+    max_batch_size: int,
+    *,
+    background: bool,
+) -> EngineLoop:
     runner = ModelRunner(model, device=device, max_batch=max_batch_size, allow_stub=allow_stub)
     loop = EngineLoop(runner, max_batch_size=max_batch_size)
-    loop.start()
-    # Warmup required for readiness when a real model is loaded
-    if runner._is_real:
-        ids = runner.tokenize("hi")[:4] or [1, 2]
-        sub = loop.submit(
-            "warmup",
-            ids,
-            GenParams(max_tokens=1, temperature=0.0, timeout_s=60.0),
-        )
-        while True:
-            item = sub.delta_queue.get(timeout=60.0)
-            if item.get("error"):
-                raise RuntimeError(f"warmup failed: {item['error']}")
-            if item.get("finish_reason") is not None:
-                break
-    register_verified(model)
+    if background:
+        loop.start()
+    else:
+        loop.mark_ready()
     return loop
 
 
+def _warmup(loop: EngineLoop, *, tp: bool) -> None:
+    runner = loop.runner
+    if not runner._is_real:
+        return
+    ids = runner.tokenize("hi")[:4] or [1, 2]
+    msg = {
+        "op": "warmup",
+        "request_id": "warmup",
+        "input_ids": list(ids),
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": None,
+        "seed": None,
+        "stop": None,
+        "timeout_s": 60.0,
+    }
+    if tp:
+        if rank() == 0:
+            broadcast_obj(msg, src=0)
+            sub = _apply_generate_msg(msg)
+            loop.pump_until_idle(timeout_s=60.0)
+            while True:
+                item = sub.delta_queue.get(timeout=60.0)
+                if item.get("error"):
+                    raise RuntimeError(f"warmup failed: {item['error']}")
+                if item.get("finish_reason") is not None:
+                    break
+        else:
+            # Worker path handles warmup via _tp_worker_loop — but warmup runs
+            # before the worker loop starts, so workers must participate here.
+            got = broadcast_obj(None, src=0)
+            assert got is not None and got.get("op") == "warmup"
+            _apply_generate_msg(got)
+            loop.pump_until_idle(timeout_s=60.0)
+        return
+
+    sub = loop.submit(
+        "warmup",
+        ids,
+        GenParams(max_tokens=1, temperature=0.0, timeout_s=60.0),
+    )
+    while True:
+        item = sub.delta_queue.get(timeout=60.0)
+        if item.get("error"):
+            raise RuntimeError(f"warmup failed: {item['error']}")
+        if item.get("finish_reason") is not None:
+            break
+
+
 def main(argv: Optional[List[str]] = None) -> None:
-    global LOOP, READY, MODEL_NAME
+    global LOOP, READY, MODEL_NAME, _TP_MODE
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     p = argparse.ArgumentParser(description="sglang-lite engine process")
     p.add_argument("--model", required=True, help="MoE model id or fixture:<path>")
@@ -273,15 +500,67 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     MODEL_NAME = args.model
     READY = False
+    tp = is_tp()
+    _TP_MODE = tp
+    background = not tp
+
     try:
-        LOOP = build_loop(args.model, args.device, args.allow_stub, args.max_batch_size)
+        LOOP = build_loop(
+            args.model,
+            args.device,
+            args.allow_stub,
+            args.max_batch_size,
+            background=background,
+        )
+        _warmup(LOOP, tp=tp)
+        register_verified(args.model)
         READY = True
     except Exception:
         READY = False
         logger.exception("engine failed to become ready")
         raise
-    logger.info("engine ready model=%s device=%s port=%s", args.model, args.device, args.port)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+    logger.info(
+        "engine ready model=%s device=%s port=%s tp=%s rank=%s/%s",
+        args.model,
+        args.device,
+        args.port,
+        tp,
+        rank(),
+        world_size(),
+    )
+
+    if tp and rank() == 0:
+        _start_tp_cuda_thread()
+
+    if tp and rank() != 0:
+        try:
+            _tp_worker_loop()
+        finally:
+            try:
+                import torch.distributed as dist
+
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+            except Exception:
+                pass
+        return
+
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    finally:
+        if tp and rank() == 0:
+            try:
+                broadcast_obj(None, src=0)
+            except Exception:
+                pass
+            try:
+                import torch.distributed as dist
+
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

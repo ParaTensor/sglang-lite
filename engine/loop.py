@@ -27,6 +27,7 @@ class GenParams:
     seed: Optional[int] = None
     stop: Optional[List[str]] = None
     timeout_s: float = 300.0
+    ignore_eos: bool = False
 
 
 @dataclass
@@ -107,6 +108,10 @@ class EngineLoop:
         self._thread.start()
         self._ready = True
 
+    def mark_ready(self) -> None:
+        """Mark ready without a background thread (TP sync / pump_until_idle)."""
+        self._ready = True
+
     def stop(self, drain: bool = True) -> None:
         self._stopping = True
         self._submit_q.put(None)
@@ -175,6 +180,12 @@ class EngineLoop:
         if final:
             with self._lock:
                 self._delta_qs.pop(request_id, None)
+            # V4: free official Attention batch slot (prefix snapshot already on CPU).
+            if getattr(self.runner, "_v4_hybrid", False):
+                for s in list(self.scheduler.running) + list(self.scheduler.waiting):
+                    if s.request_id == request_id:
+                        self.runner.v4_release_seq(s, batch_slot=0)
+                        break
                 self._prev_text.pop(request_id, None)
                 self._deadlines.pop(request_id, None)
 
@@ -202,8 +213,26 @@ class EngineLoop:
                     seed=item.params.seed,
                     stop_strings=item.params.stop,
                 )
+                # V4 Hybrid KV lives in official Attention buffers — ignore
+                # Radix hits and match against V4PrefixCache snapshots instead.
+                if getattr(self.runner, "_v4_hybrid", False):
+                    seq.block_table = []
+                    seq.kv_state = None
+                    match_len, entry = self.runner.v4_match_prefix(seq.input_ids)
+                    if match_len > 0 and entry is not None:
+                        seq.cached_len = match_len
+                        seq.cache_hit_tokens = match_len
+                        seq.last_logits = entry.last_logits
+                        seq._v4_prefix_entry = entry
+                        seq._v4_kv_pending_restore = True
+                    else:
+                        seq.cached_len = 0
+                        seq.cache_hit_tokens = 0
+                        seq.last_logits = None
+                        seq._v4_prefix_entry = None
+                        seq._v4_kv_pending_restore = False
                 eos = self.runner.eos_token_id
-                if eos is not None:
+                if eos is not None and not item.params.ignore_eos:
                     seq.stop_token_ids = [eos]
             except MemoryError as e:
                 self._emit(
@@ -299,7 +328,7 @@ class EngineLoop:
                     )
                     return True, delta, tok if delta else None
 
-        delta = full[len(prev_text) :] if full.startswith(prev_text) else full
+        delta = self.runner.detokenize_delta(seq.output_ids, prev_text)
         return False, delta, tok
 
     def _run(self) -> None:
@@ -352,7 +381,12 @@ class EngineLoop:
                         )
                         continue
                 if pre:
-                    self.scheduler.update_after_prefill(seq, [], seq.kv_state)
+                    if getattr(self.runner, "_v4_hybrid", False):
+                        # Bypass radix insert; official model owns KV.
+                        seq.cached_len = len(seq.input_ids)
+                        seq.kv_state = None
+                    else:
+                        self.scheduler.update_after_prefill(seq, [], seq.kv_state)
                 self.scheduler.update_after_decode(seq, tok, seq.kv_state)
 
                 prev = self._prev_text.get(seq.request_id, "")
@@ -369,6 +403,87 @@ class EngineLoop:
                 self._emit(seq.request_id, payload, final=finished)
 
             self.scheduler.running = [s for s in self.scheduler.running if not s.finished]
+
+    def pump_once(self) -> bool:
+        """Run one scheduler step synchronously. Returns True if work was done."""
+        self._admit_pending()
+        self._check_timeouts()
+        batch, is_prefill = self.scheduler.step()
+        if not batch:
+            return False
+        self.steps += 1
+        if len(batch) > 1:
+            self.multi_request_batches += 1
+        try:
+            next_tokens = self.runner.run_batch(batch, self.radix, is_prefill)
+        except Exception as e:
+            for seq in batch:
+                self.scheduler.mark_finished(seq, "error")
+                self._emit(
+                    seq.request_id,
+                    {
+                        "text": "",
+                        "finish_reason": "error",
+                        "usage": self._usage(seq),
+                        "error": str(e),
+                    },
+                    final=True,
+                )
+            return True
+
+        for seq, tok, pre in zip(batch, next_tokens, is_prefill):
+            if seq.finished or tok is None:
+                continue
+            with self._lock:
+                if seq.request_id in self._cancelled:
+                    self.scheduler.mark_finished(seq, "cancelled")
+                    self._emit(
+                        seq.request_id,
+                        {
+                            "text": "",
+                            "finish_reason": "cancelled",
+                            "usage": self._usage(seq),
+                            "error": None,
+                        },
+                        final=True,
+                    )
+                    continue
+            if pre:
+                if getattr(self.runner, "_v4_hybrid", False):
+                    seq.cached_len = len(seq.input_ids)
+                    seq.kv_state = None
+                else:
+                    self.scheduler.update_after_prefill(seq, [], seq.kv_state)
+            self.scheduler.update_after_decode(seq, tok, seq.kv_state)
+
+            prev = self._prev_text.get(seq.request_id, "")
+            finished, delta_text, emit_tok = self._apply_stop_and_limits(seq, tok, prev)
+            self._prev_text[seq.request_id] = self.runner.detokenize(seq.output_ids)
+
+            payload = {
+                "text": delta_text,
+                "token": emit_tok,
+                "finish_reason": seq.finish_reason if finished else None,
+                "usage": self._usage(seq) if finished else None,
+                "error": None,
+            }
+            self._emit(seq.request_id, payload, final=finished)
+
+        self.scheduler.running = [s for s in self.scheduler.running if not s.finished]
+        return True
+
+    def pump_until_idle(self, timeout_s: float = 600.0) -> None:
+        """Synchronously drain pending/running work (TP-safe; no background thread)."""
+        deadline = time.time() + timeout_s
+        while True:
+            self._admit_pending()
+            busy = bool(self.scheduler.waiting or self.scheduler.running or not self._submit_q.empty())
+            if not busy:
+                return
+            if time.time() > deadline:
+                raise TimeoutError("pump_until_idle exceeded timeout")
+            if not self.pump_once():
+                time.sleep(self.idle_sleep_s)
 
     def get_stats(self) -> Dict[str, Any]:
         return {

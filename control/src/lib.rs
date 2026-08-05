@@ -283,6 +283,7 @@ pub fn stream_chat(
                     },
                     finish_reason: None,
                 }],
+                usage: None,
             })
             .unwrap_or_else(|_| Event::default().data("data: [ERROR]"));
         yield Ok(first);
@@ -296,6 +297,12 @@ pub fn stream_chat(
                 break;
             }
             let finish = delta.finish_reason.clone();
+            let usage = delta.usage.as_ref().map(|u| openai::Usage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+                cache_hit_tokens: u.cache_hit_tokens,
+            });
             let chunk = openai::ChatCompletionChunk {
                 id: request_id.clone(),
                 object: "chat.completion.chunk".to_string(),
@@ -309,6 +316,7 @@ pub fn stream_chat(
                     },
                     finish_reason: finish.clone(),
                 }],
+                usage,
             };
 
             match Event::default().json_data(chunk) {
