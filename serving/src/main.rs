@@ -49,6 +49,11 @@ enum Commands {
         /// Do not spawn Python; connect to an already-running engine at this URL
         #[arg(long)]
         engine_url: Option<String>,
+
+        /// Spawn engine via ``torchrun --nproc-per-node=<tp>`` (DeepSeek-V4 Hybrid).
+        /// When set, ``python -m sglang_lite.process`` is not used directly.
+        #[arg(long)]
+        tp: Option<u16>,
     },
 }
 
@@ -76,11 +81,28 @@ impl Drop for EngineChild {
     }
 }
 
-fn spawn_python_engine(model: &str, device: &str, engine_port: u16) -> Result<EngineChild> {
-    let mut cmd = Command::new("python");
-    cmd.arg("-m")
-        .arg("sglang_lite.process")
-        .arg("--model")
+fn spawn_python_engine(
+    model: &str,
+    device: &str,
+    engine_port: u16,
+    tp: Option<u16>,
+) -> Result<EngineChild> {
+    let mut cmd = if let Some(n) = tp {
+        if n < 2 {
+            return Err(anyhow!("--tp must be >= 2 (got {})", n));
+        }
+        let mut c = Command::new("torchrun");
+        c.arg(format!("--nproc-per-node={}", n))
+            .arg("-m")
+            .arg("sglang_lite.process");
+        c
+    } else {
+        let mut c = Command::new("python");
+        c.arg("-m").arg("sglang_lite.process");
+        c
+    };
+
+    cmd.arg("--model")
         .arg(model)
         .arg("--device")
         .arg(device)
@@ -95,9 +117,13 @@ fn spawn_python_engine(model: &str, device: &str, engine_port: u16) -> Result<En
         cmd.arg("--allow-stub");
     }
 
-    let child = cmd
-        .spawn()
-        .context("failed to spawn python -m sglang_lite.process (is sglang-lite installed?)")?;
+    let child = cmd.spawn().with_context(|| {
+        if tp.is_some() {
+            "failed to spawn torchrun -m sglang_lite.process"
+        } else {
+            "failed to spawn python -m sglang_lite.process (is sglang-lite installed?)"
+        }
+    })?;
     Ok(EngineChild { child })
 }
 
@@ -140,7 +166,8 @@ async fn main() -> Result<()> {
             engine_port,
             stub,
             engine_url,
-        } => run_serve(model, device, port, engine_port, stub, engine_url).await,
+            tp,
+        } => run_serve(model, device, port, engine_port, stub, engine_url, tp).await,
     }
 }
 
@@ -151,6 +178,7 @@ async fn run_serve(
     engine_port: u16,
     stub: bool,
     engine_url: Option<String>,
+    tp: Option<u16>,
 ) -> Result<()> {
     let ready = Arc::new(AtomicBool::new(false));
     let draining = Arc::new(AtomicBool::new(false));
@@ -177,11 +205,16 @@ async fn run_serve(
         let model_id = model.ok_or_else(|| anyhow!("--model is required (or pass --stub)"))?;
         let url = format!("http://127.0.0.1:{}", engine_port);
         info!(
-            "spawning Python engine model={} device={} port={}",
-            model_id, device, engine_port
+            "spawning Python engine model={} device={} port={} tp={:?}",
+            model_id, device, engine_port, tp
         );
-        let child = spawn_python_engine(&model_id, &device, engine_port)?;
-        wait_engine_ready(&url, Duration::from_secs(600)).await?;
+        let child = spawn_python_engine(&model_id, &device, engine_port, tp)?;
+        let ready_timeout = if tp.is_some() {
+            Duration::from_secs(1800)
+        } else {
+            Duration::from_secs(600)
+        };
+        wait_engine_ready(&url, ready_timeout).await?;
         (
             EngineClient::http(url.clone()),
             Some(url),

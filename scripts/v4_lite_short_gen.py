@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """P4 short-gen entry for DeepSeek-V4-Flash.
 
-Full continuous-batching decode through LiteEngine for V4 still needs Hybrid
-forward wiring; this script:
+Official gold baseline via ``generate.py``. For LiteEngine Hybrid CB + timing,
+use ``scripts/v4_lite_engine_gen.py`` (torchrun TP=8).
+
+This script:
 
 1. Prints KernelBackend arch_family / sparse_mla / moe_gemm routing.
 2. Runs official ``generate.py`` via torchrun against converted MP shards

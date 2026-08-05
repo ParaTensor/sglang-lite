@@ -217,25 +217,84 @@ def find_rank_shard(converted_ckpt: Path, rank: int, world_size: int) -> Path:
     )
 
 
+def ensure_tp_process_group() -> Tuple[int, int, str]:
+    """Init NCCL (if needed) before constructing official Transformer.
+
+    Official ``model.py`` reads ``dist.get_world_size()`` during ``Transformer.__init__``.
+    Must run before model construction. Returns ``(rank, world_size, local_device)``.
+
+    When the entrypoint remaps ``CUDA_VISIBLE_DEVICES`` to a single GPU (required by
+    TileLang sparse_attn ABI expecting device_id 0), this uses ``cuda:0``.
+    """
+    import torch
+    import torch.distributed as dist
+
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    remapped = bool(visible) and "," not in visible
+    # After single-GPU remap, the only visible device is always cuda:0.
+    device_index = 0 if remapped else local_rank
+    local_device = f"cuda:{device_index}"
+
+    if world_size > 1:
+        if not dist.is_initialized():
+            if not torch.cuda.is_available():
+                raise RuntimeError("deepseek_v4 TP requires CUDA + NCCL")
+            torch.cuda.set_device(device_index)
+            dist.init_process_group("nccl")
+        else:
+            torch.cuda.set_device(device_index)
+    elif torch.cuda.is_available():
+        torch.cuda.set_device(device_index)
+
+    if torch.cuda.is_available():
+        torch.set_default_device("cuda")
+
+    return rank, world_size, local_device
+
+
 def load_v4_hybrid_model(
     paths: Optional[DeepseekV4Paths] = None,
-    rank: int = 0,
-    world_size: int = 8,
+    rank: Optional[int] = None,
+    world_size: Optional[int] = None,
     device: Optional[str] = None,
+    max_batch_size: Optional[int] = None,
 ) -> Tuple[Any, Dict[str, Any], TpShardPlan]:
     """Load official Transformer for the given TP rank (Hybrid entry).
 
     Requires converted checkpoint at ``paths.converted_ckpt`` (from convert.py).
+    Initializes the process group before ``Transformer(...)``.
     Returns (model, config_dict, shard_plan).
     """
     import torch
     from safetensors.torch import load_model
 
+    env_rank, env_world, local_device = ensure_tp_process_group()
+    rank = env_rank if rank is None else int(rank)
+    world_size = env_world if world_size is None else int(world_size)
+    if rank != env_rank or world_size != env_world:
+        raise ValueError(
+            f"rank/world_size mismatch: args=({rank},{world_size}) "
+            f"env=({env_rank},{env_world})"
+        )
+
     paths = paths or resolve_v4_paths()
     cfg = paths.load_config()
     n_experts = int(cfg.get("n_routed_experts", 256))
     plan = build_tp_shard_plan(world_size, rank, n_experts=n_experts)
-    dev = device or plan.local_device
+    # Single-node torchrun: device follows LOCAL_RANK, not necessarily RANK.
+    dev = device or local_device
+    plan = TpShardPlan(
+        world_size=plan.world_size,
+        rank=plan.rank,
+        local_device=dev,
+        n_experts=plan.n_experts,
+        n_local_experts=plan.n_local_experts,
+        expert_start=plan.expert_start,
+        expert_end=plan.expert_end,
+    )
 
     model_mod = import_official_inference(paths.inference_dir)
     args = model_args_from_config(model_mod.ModelArgs, cfg)
@@ -244,7 +303,27 @@ def load_v4_hybrid_model(
         hf_cfg = paths.load_hf_config()
         n_experts = int(hf_cfg.get("n_routed_experts", n_experts))
         plan = build_tp_shard_plan(world_size, rank, n_experts=n_experts)
-    model = model_mod.Transformer(args)
+        plan = TpShardPlan(
+            world_size=plan.world_size,
+            rank=plan.rank,
+            local_device=dev,
+            n_experts=plan.n_experts,
+            n_local_experts=plan.n_local_experts,
+            expert_start=plan.expert_start,
+            expert_end=plan.expert_end,
+        )
+    if max_batch_size is not None and hasattr(args, "max_batch_size"):
+        args.max_batch_size = int(max_batch_size)
+
+    # Match official generate.py dtype defaults before allocating module buffers.
+    if torch.cuda.is_available():
+        torch.set_default_dtype(torch.bfloat16)
+        # Prefer current CUDA device ("cuda") so TileLang sees device_id 0 after remap.
+        torch_dev = torch.device("cuda")
+    else:
+        torch_dev = torch.device(dev)
+    with torch_dev:
+        model = model_mod.Transformer(args)
 
     ckpt = paths.converted_ckpt
     if ckpt is None:
@@ -253,7 +332,6 @@ def load_v4_hybrid_model(
             "Set SGLANG_LITE_DSV4_CONVERTED=/path/to/mp-shards"
         )
     shard = find_rank_shard(Path(ckpt), rank, world_size)
-    load_model(model, str(shard))
-    model.to(device=dev)
+    load_model(model, str(shard), strict=False)
     model.eval()
     return model, cfg, plan

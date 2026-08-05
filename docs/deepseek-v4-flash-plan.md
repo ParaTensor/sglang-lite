@@ -365,6 +365,73 @@ S5  注册 deepseek_v4 家族：tokenizer 直接引用；模型图 Hybrid
   `ModelLoader` TP=8 / Hybrid 入口（需 `WORLD_SIZE` +
   `SGLANG_LITE_DSV4_CONVERTED`）。
 
+### 6.2 LiteEngine CB MVP（官方 forward 包装，2026-08-05）
+
+- **范围**：`ModelRunner` 对 `_v4_hybrid` 调用官方
+  `Transformer.forward(input_ids, start_pos)`；Scheduler continuous batching
+  可出 token；KV 仍在官方 `Attention` 缓冲内；Radix prefix hit **禁用**。
+- **加载顺序**：`ensure_tp_process_group()`（NCCL）必须在 `Transformer(...)`
+  之前；入口脚本 `scripts/v4_lite_engine_gen.py`（`torchrun`，`start_loop=False`
+  + `pump_until_idle`，全 rank 同步 forward）。
+- **计时用例**（8×5090，`scripts/v4_lite_engine_gen.py`，prompt `Hello`，
+  ignore_eos，warm tok/s）：
+
+  | Case | LiteEngine warm | 官方基线 warm |
+  | --- | --- | --- |
+  | 1×128 | ~4.8–5.1 | ~5.0 |
+  | 4×96 | ~18.3 | ~13.3 |
+  | 1×256 | ~4.8 | ~4.9 |
+
+  （仍走官方 `sparse_attn`；入口需在 import torch 前 remap
+  `CUDA_VISIBLE_DEVICES=$LOCAL_RANK`，供 TileLang device_id=0。）
+- **Prefix 复用（2026-08-05）**：`engine/v4_prefix_cache.py` 对官方
+  `kv_cache` / `kv_state` / `score_state` 做 CPU 快照；admit 用最长精确前缀
+  命中设 `cache_hit_tokens`/`cached_len`；exact hit 跳过 prefill forward，
+  partial hit 只跑 suffix（`start_pos>0` 时按官方约束逐 token）。单测：
+  `tests/test_v4_prefix_cache.py`。仍非 Radix 双池 COW。
+- **Standalone SSE（2026-08-05）**：`python -m sglang_lite.process` 支持
+  `torchrun` TP（rank0 HTTP NDJSON，其余 rank `broadcast_object_list` +
+  `pump_until_idle`）；`sglang-lite-serving --tp 8` 或
+  `scripts/v4_serve_sse.sh`；Rust SSE 输出 `chat.completion.chunk` + 最终
+  `usage` + `data: [DONE]`。控制面单测：`control/tests/sse_stream_tests.rs`。
+- **真机验收（2026-08-05 / 8×5090）**：
+  - **Align**：`match_soft_top5=true`（`Hello`∈prefill top5；greedy 常翻成
+    `你好`，logit 差≈0.09）。摘要 `/tmp/v4_align_summary.json`。
+  - **SSE**：`torchrun -m sglang_lite.process` + `sglang-lite-serving
+    --engine-url` → OpenAI `chat.completion.chunk` + `[DONE]`（需
+    rustup stable≥1.85；系统 cargo 1.75 不够）。引擎侧需 **专用 CUDA
+    线程**（asyncio executor 会触发 TileLang device mismatch）。
+  - 脚本：`scripts/v4_remote_acceptance.sh`、`v4_align_tokens.py`、
+    `v4_debug_first_token.py`。
+- **KV 生命周期（Hybrid）**：`clear_v4_kv_slot` 在 cold prefill 前与请求
+  `final` 时清官方 Attention/Compressor 行；prefix 仍靠 CPU 快照，非 Radix
+  双池。
+- **内核现状**：生产 decode 维持官方 `sparse_attn`；FI SM120 sparse MLA
+  仍 blocked（§6.3），默认 `SGLANG_LITE_V4_DISABLE_FI_SPARSE=1`。
+- **下一阶段**：逐层 logits atol；增量 decode UTF-8 稳态；Radix 双池；FI 换核。
+
+### 6.3 SM120 sparse MLA decode 换核（2026-08-05）
+
+- **入口**：`scripts/v4_lite_engine_gen.py` 在 import 前插入
+  `SGLANG_LITE_FI_PREFIX`（默认 `/tmp/fi1616`）+
+  `FLASHINFER_DISABLE_VERSION_CHECK=1`；共享 venv 仍可保留 FI **0.6.12**。
+- **Pack**：`engine/dsv4_kv_pack.py` — bf16 KV → uint8 584
+  （448 FP8 NoPE + 128 RoPE bf16 + 7 ue8m0 + pad）；优先用官方
+  `kernel.act_quant`。
+- **Hook**：`engine/v4_sparse_mla.py` `attach_v4_sparse_mla` 在 Hybrid load
+  后替换 `model.sparse_attn` / `kernel.sparse_attn`；**仅 decode**
+  （`q_len==1`）走 `KernelBackend.sparse_mla_decode_dsv4`；失败或 prefill
+  回退官方 TileLang。
+- **验收**：capability 为 `flashinfer_sparse_sm120`；hook 已 armed；同用例
+  warm tok/s 对照 §6.2。
+- **本机实况（2026-08-05）**：已在隔离前缀 `/tmp/fi1616_full` 对齐安装
+  `flashinfer-python==0.6.16.post1` + `flashinfer-cubin==0.6.16.post1` +
+  `flashinfer-jit-cache==0.6.16.post1+cu130`（含 `sparse_mla_sm120.so`）。
+  probe（随机/真实 584 pack、H=8/64）仍 **absmean=0**（finite）。
+  非版本错配问题；更像 SM120 dsv4 在本机 5090（sm_120）上的上游内核/
+  调用约定未闭环。hook 零输出探测会回退官方 `sparse_attn`。
+  远端直连 GitHub 超时，wheel 需本机下载后 `scp`。
+
 ## 7. 风险与开放问题
 
 - V4-Flash 的 CSA/HCA、FP4 expert、mHC 细节以官方 `inference/` 参考实现为准，

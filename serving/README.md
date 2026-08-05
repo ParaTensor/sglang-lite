@@ -31,9 +31,18 @@ cargo run -p sglang-lite-serving -- serve \
 
 # 控制面 stub（无 GPU / 无模型）
 cargo run -p sglang-lite-serving -- serve --stub --port 8000
+
+# DeepSeek-V4-Flash（TP=8 Hybrid，spawn torchrun engine）
+export SGLANG_LITE_DSV4_HF=~/models/ds-v4-flash
+export SGLANG_LITE_DSV4_CONVERTED=/tmp/ds-v4-mp8
+cargo run -p sglang-lite-serving --release -- serve \
+  --model "$SGLANG_LITE_DSV4_HF" \
+  --device cuda --port 8000 --tp 8
+
+# 或分两步：scripts/v4_serve_sse.sh engine / control
 ```
 
-流式路径：Rust `HttpEngineClient` 消费 Python NDJSON `TokenDelta`，不再伪切分全文。
+流式路径：Rust `HttpEngineClient` 消费 Python NDJSON `TokenDelta`，再打成 OpenAI SSE（含最终 `usage` 与 `data: [DONE]`）。
 
 ## 开发规则
 

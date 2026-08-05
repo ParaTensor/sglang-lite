@@ -47,6 +47,11 @@ class ModelRunner:
         self.model_forward_count = 0
         self.paged_rebuild_count = 0
         self.use_paged_as_source = True
+        self._v4_hybrid = False
+        self._v4_prefix_cache = None
+        self._tp_plan = None
+        self._kv_layout = None
+        self._swa_layout = None
         # Must match model compute dtype; fp16 pages + bf16 activations promote to fp32 in SDPA.
         self.torch_dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
         self.kernel_backend = create_kernel_backend(self.device)
@@ -143,7 +148,6 @@ class ModelRunner:
         from .kv_cache import KvLayout
         from .model_loader import load_v4_hybrid_model, resolve_v4_paths
 
-        rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         paths = resolve_v4_paths(hf_ckpt=load_id)
         if paths.converted_ckpt is None:
@@ -155,15 +159,21 @@ class ModelRunner:
         if world_size < 2:
             raise RuntimeError(
                 "deepseek_v4 requires tensor parallel (WORLD_SIZE>=2, typically 8). "
-                "Use: torchrun --nproc-per-node=8 -m sglang_lite.process ... "
+                "Use: torchrun --nproc-per-node=8 scripts/v4_lite_engine_gen.py "
                 "or scripts/v4_lite_short_gen.py"
             )
+        # load_v4_hybrid_model inits NCCL before Transformer; device from LOCAL_RANK.
         model, cfg, plan = load_v4_hybrid_model(
-            paths, rank=rank, world_size=world_size, device=self.device
+            paths, max_batch_size=self.max_batch
         )
         self.model = model
+        self.device = plan.local_device
+        self.torch_dtype = torch.bfloat16
         self._is_real = True
         self._v4_hybrid = True
+        from .v4_prefix_cache import V4PrefixCache
+
+        self._v4_prefix_cache = V4PrefixCache()
         self._tp_plan = plan
         self.vocab_size = int(cfg.get("vocab_size", 129280))
         self.num_layers = int(cfg.get("n_layers") or cfg.get("num_hidden_layers", 43))
@@ -180,6 +190,46 @@ class ModelRunner:
         )
         self._swa_layout = KvLayout.dsv4_packed(584)
         kb = self.kernel_backend
+        # Match official generate.py determinism for greedy numerical checks.
+        torch.manual_seed(33377335)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(33377335)
+        # Refresh capabilities after Hybrid import path may have put FI≥0.6.16
+        # on sys.path (SGLANG_LITE_FI_PREFIX). Then arm sparse MLA hook.
+        disable_fi = os.environ.get("SGLANG_LITE_V4_DISABLE_FI_SPARSE", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        try:
+            from .capability import probe_kernel_capabilities
+            from .kernel_backend import FlashInferBackend
+            from .v4_sparse_mla import attach_v4_sparse_mla
+
+            from .capability import SparseMlaBackend
+
+            caps = probe_kernel_capabilities(self.device)
+            if isinstance(kb, FlashInferBackend):
+                kb.capabilities = caps
+                kb.supports_sparse_mla = caps.sparse_mla_backend in (
+                    SparseMlaBackend.FLASHINFER_SPARSE_SM120,
+                    SparseMlaBackend.FLASHINFER_SPARSE_SM100,
+                )
+            win = int(cfg.get("window_size", 128))
+            if disable_fi:
+                print(
+                    "[sglang-lite] v4 sparse MLA hook disabled "
+                    "(SGLANG_LITE_V4_DISABLE_FI_SPARSE); official sparse_attn only"
+                )
+                armed = False
+            else:
+                armed = attach_v4_sparse_mla(kb, window_size=win)
+            print(
+                f"[sglang-lite] v4 sparse MLA hook armed={armed} "
+                f"backend={kb.sparse_mla_backend.value}"
+            )
+        except Exception as e:
+            print(f"[sglang-lite] v4 sparse MLA hook skipped: {e}")
         print(
             f"[sglang-lite] deepseek_v4 Hybrid rank={plan.rank}/{plan.world_size} "
             f"arch={kb.arch_family.value} sparse_mla={kb.sparse_mla_backend.value} "
@@ -253,6 +303,10 @@ class ModelRunner:
         return [hash(c) % self.vocab_size for c in text[:128]]
 
     def apply_chat_template(self, messages: list) -> List[int]:
+        if self._v4_hybrid:
+            ids = self._v4_encode_messages(messages)
+            if ids is not None:
+                return ids
         if self.tokenizer is not None and hasattr(self.tokenizer, "apply_chat_template"):
             try:
                 ids = self.tokenizer.apply_chat_template(
@@ -273,18 +327,70 @@ class ModelRunner:
         parts.append("assistant:")
         return self.tokenize("\n".join(parts))
 
+    def _v4_encode_messages(self, messages: list) -> Optional[List[int]]:
+        """Prefer official encoding_dsv4 when HF tree is available."""
+        import sys
+
+        try:
+            from .model_loader import resolve_v4_paths
+
+            paths = resolve_v4_paths()
+        except Exception:
+            return None
+        encoding_dir = paths.hf_ckpt / "encoding"
+        infer_dir = paths.hf_ckpt / "inference"
+        if not encoding_dir.is_dir():
+            return None
+        for p in (str(encoding_dir), str(infer_dir)):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        try:
+            from encoding_dsv4 import encode_messages
+
+            norm = []
+            for m in messages:
+                if isinstance(m, dict):
+                    norm.append(
+                        {
+                            "role": m.get("role", "user"),
+                            "content": m.get("content") or "",
+                        }
+                    )
+                else:
+                    norm.append(
+                        {
+                            "role": getattr(m, "role", "user"),
+                            "content": getattr(m, "content", "") or "",
+                        }
+                    )
+            rendered = encode_messages(norm, thinking_mode="chat")
+            if self.tokenizer is None:
+                return None
+            return list(self.tokenizer.encode(rendered))
+        except Exception:
+            return None
+
     def detokenize(self, token_ids: List[int]) -> str:
         if self.tokenizer is not None:
             return self.tokenizer.decode(token_ids, skip_special_tokens=True)
         return "".join([chr(97 + (t % 26)) for t in token_ids[:20]])
 
     def detokenize_delta(self, token_ids: List[int], prev_text: str = "") -> str:
+        """Incremental decode; tolerate tokenizer rewriting incomplete UTF-8 tails."""
         if not token_ids:
             return ""
         full = self.detokenize(token_ids)
         if full.startswith(prev_text):
             return full[len(prev_text) :]
-        return full
+        # Incomplete multi-byte piece: full shrank vs prev — wait for more tokens.
+        if prev_text.startswith(full):
+            return ""
+        # Longest common prefix; emit only the stable new suffix.
+        n = 0
+        limit = min(len(prev_text), len(full))
+        while n < limit and prev_text[n] == full[n]:
+            n += 1
+        return full[n:]
 
     @torch.no_grad()
     def run_batch(
@@ -315,6 +421,8 @@ class ModelRunner:
                 if seq.cached_len >= len(seq.input_ids) or (
                     not is_prefill[i] and seq.cached_len == len(seq.input_ids)
                 ):
+                    if self._v4_hybrid:
+                        self._v4_ensure_restored(seq, batch_slot=0)
                     results[i] = self._sample(seq.last_logits.to(device=self.device), seq)
                     seq.cached_len = len(seq.input_ids)
                     continue
@@ -376,15 +484,38 @@ class ModelRunner:
         B = len(seqs)
         max_new = new_lens[0]
         if max_new == 0:
-            for s, i in zip(seqs, idxs):
+            for b, (s, i) in enumerate(zip(seqs, idxs)):
                 if s.last_logits is None:
                     raise RuntimeError("exact hit without last_logits")
+                if self._v4_hybrid:
+                    self._v4_ensure_restored(s, batch_slot=b)
                 results[i] = self._sample(s.last_logits.to(self.device), s)
                 s.cached_len = len(s.input_ids)
             return
 
         input_ids = torch.tensor(news, dtype=torch.long, device=self.device)
         max_past = past_lens[0]
+
+        if self._v4_hybrid:
+            # Official decode path assumes seqlen==1 when start_pos>0.
+            if max_past > 0 and max_new > 1:
+                for s, i in zip(seqs, idxs):
+                    results[i] = self._prefill_one(s, radix)
+                return
+            for b, seq in enumerate(seqs):
+                self._v4_ensure_restored(seq, batch_slot=b)
+            logits = self._model_forward_v4(input_ids, start_pos=max_past)
+            for b, (seq, i) in enumerate(zip(seqs, idxs)):
+                nlen = new_lens[b]
+                row = logits[b]
+                seq.last_logits = row.detach().float().cpu().clone()
+                seq.kv_state = None
+                seq.cached_len = seq.cached_len + nlen
+                seq.prefill_tokens = getattr(seq, "prefill_tokens", 0) + nlen
+                results[i] = self._sample(row, seq)
+                self._v4_maybe_save_prefix(seq, batch_slot=b)
+            return
+
         for s in seqs:
             self._ensure_blocks(s, radix, s.cached_len + max_new)
 
@@ -430,8 +561,10 @@ class ModelRunner:
         # All seqs in this group share cached_len
         pending_seqs: List[Sequence] = []
         pending_idxs: List[int] = []
-        for s, i in zip(seqs, idxs):
+        for b, (s, i) in enumerate(zip(seqs, idxs)):
             if not s.output_ids and getattr(s, "last_logits", None) is not None:
+                if self._v4_hybrid:
+                    self._v4_ensure_restored(s, batch_slot=b)
                 results[i] = self._sample(s.last_logits.to(self.device), s)
                 s.cached_len = len(s.input_ids)
                 continue
@@ -443,6 +576,19 @@ class ModelRunner:
         B = len(seqs)
         lasts = [s.output_ids[-1] if s.output_ids else s.input_ids[-1] for s in seqs]
         input_ids = torch.tensor([[t] for t in lasts], dtype=torch.long, device=self.device)
+
+        if self._v4_hybrid:
+            for b, seq in enumerate(seqs):
+                self._v4_ensure_restored(seq, batch_slot=b)
+            start_pos = seqs[0].cached_len
+            logits = self._model_forward_v4(input_ids, start_pos=start_pos)
+            for b, (seq, i) in enumerate(zip(seqs, idxs)):
+                row = logits[b]
+                seq.kv_state = None
+                seq.cached_len = seq.cached_len + 1
+                results[i] = self._sample(row, seq)
+            return
+
         # COW last page before append
         for s in seqs:
             pos = s.cached_len
@@ -484,9 +630,32 @@ class ModelRunner:
         if not new_tokens:
             if seq.last_logits is None:
                 raise RuntimeError("exact hit without last_logits")
+            if self._v4_hybrid:
+                self._v4_ensure_restored(seq, batch_slot=0)
             return self._sample(seq.last_logits.to(self.device), seq)
-        self._ensure_blocks(seq, radix, len(prompt))
         input_ids = torch.tensor([new_tokens], dtype=torch.long, device=self.device)
+        if self._v4_hybrid:
+            self._v4_ensure_restored(seq, batch_slot=0)
+            if start > 0 and len(new_tokens) > 1:
+                row = None
+                for t_i, tok in enumerate(new_tokens):
+                    step_ids = torch.tensor(
+                        [[tok]], dtype=torch.long, device=self.device
+                    )
+                    logits = self._model_forward_v4(step_ids, start_pos=start + t_i)
+                    row = logits[0]
+                assert row is not None
+            else:
+                logits = self._model_forward_v4(input_ids, start_pos=start)
+                row = logits[0]
+            seq.last_logits = row.detach().float().cpu().clone()
+            seq.kv_state = None
+            seq.cached_len = len(prompt)
+            seq.prefill_tokens = getattr(seq, "prefill_tokens", 0) + len(new_tokens)
+            tok = self._sample(row, seq)
+            self._v4_maybe_save_prefix(seq, batch_slot=0)
+            return tok
+        self._ensure_blocks(seq, radix, len(prompt))
         if self._use_paged_attention():
             outputs = self._model_forward_paged(input_ids, [seq], radix, is_decode=False)
             logits = outputs.logits[0, -1, :]
@@ -510,11 +679,20 @@ class ModelRunner:
 
     def _decode_one(self, seq: Sequence, radix: RadixCache) -> int:
         if not seq.output_ids and getattr(seq, "last_logits", None) is not None:
+            if self._v4_hybrid:
+                self._v4_ensure_restored(seq, batch_slot=0)
             seq.cached_len = len(seq.input_ids)
             return self._sample(seq.last_logits.to(device=self.device), seq)
         last_token = seq.output_ids[-1] if seq.output_ids else seq.input_ids[-1]
         input_ids = torch.tensor([[last_token]], dtype=torch.long, device=self.device)
         pos = seq.cached_len
+        if self._v4_hybrid:
+            self._v4_ensure_restored(seq, batch_slot=0)
+            logits = self._model_forward_v4(input_ids, start_pos=pos)
+            row = logits[0]
+            seq.kv_state = None
+            seq.cached_len = pos + 1
+            return self._sample(row, seq)
         self._ensure_blocks(seq, radix, pos + 1)
         if seq.block_table:
             page_i = pos // radix.block_size
@@ -538,9 +716,84 @@ class ModelRunner:
         return self._sample(logits, seq)
 
     def _use_paged_attention(self) -> bool:
+        if self._v4_hybrid:
+            return False
         return bool(
             self._is_real
             and getattr(self.kernel_backend, "supports_paged_attention", False)
+        )
+
+    def _model_forward_v4(self, input_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
+        """Official Transformer.forward(input_ids, start_pos) → logits [B, vocab]."""
+        self.model_forward_count += 1
+        self.last_model_forward_size = int(input_ids.shape[0])
+        out = self.model(input_ids, start_pos=int(start_pos))
+        if isinstance(out, torch.Tensor):
+            logits = out
+        else:
+            logits = out.logits
+        # Official returns last-position logits [B, vocab]; accept [B, T, vocab] too.
+        if logits.dim() == 3:
+            logits = logits[:, -1, :]
+        return logits
+
+    def v4_match_prefix(self, token_ids: List[int]):
+        """Match ``token_ids`` against the Hybrid V4 prefix snapshot store."""
+        cache = self._v4_prefix_cache
+        if cache is None:
+            return 0, None
+        return cache.match(token_ids)
+
+    def _v4_ensure_restored(self, seq: Sequence, *, batch_slot: int = 0) -> None:
+        """Restore prefix snapshot, or clear the slot on a cold prefill."""
+        if getattr(seq, "_v4_kv_pending_restore", False):
+            entry = getattr(seq, "_v4_prefix_entry", None)
+            seq._v4_kv_pending_restore = False
+            if entry is None or self.model is None:
+                return
+            from .v4_prefix_cache import restore_v4_kv
+
+            restore_v4_kv(self.model, entry.buffers, batch_slot=batch_slot)
+            seq._v4_slot_prepared = True
+            return
+        # Cold path: wipe stale compressor / indexer state before start_pos=0.
+        if (
+            seq.cached_len == 0
+            and not getattr(seq, "_v4_slot_prepared", False)
+            and self.model is not None
+        ):
+            from .v4_prefix_cache import clear_v4_kv_slot
+
+            clear_v4_kv_slot(self.model, batch_slot=batch_slot)
+            seq._v4_slot_prepared = True
+
+    def v4_release_seq(self, seq: Sequence, *, batch_slot: int = 0) -> None:
+        """Drop in-GPU slot ownership after a sequence finishes or cancels."""
+        if not self._v4_hybrid or self.model is None:
+            return
+        from .v4_prefix_cache import clear_v4_kv_slot
+
+        clear_v4_kv_slot(self.model, batch_slot=batch_slot)
+        seq._v4_prefix_entry = None
+        seq._v4_kv_pending_restore = False
+        seq._v4_slot_prepared = False
+
+    def _v4_maybe_save_prefix(self, seq: Sequence, *, batch_slot: int = 0) -> None:
+        """Snapshot official KV after a completed prompt prefill."""
+        cache = self._v4_prefix_cache
+        if cache is None or self.model is None:
+            return
+        if seq.cached_len != len(seq.input_ids):
+            return
+        from .v4_prefix_cache import snapshot_v4_kv
+
+        buffers = snapshot_v4_kv(self.model, batch_slot=batch_slot)
+        if not buffers:
+            return
+        cache.insert(
+            seq.input_ids[: seq.cached_len],
+            last_logits=seq.last_logits,
+            buffers=buffers,
         )
 
     def _model_forward_paged(

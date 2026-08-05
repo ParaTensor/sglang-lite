@@ -111,7 +111,15 @@ class LiteEngine:
             seed=seed,
             stop=stop,
         )
+        return self._collect_generate(request_id, input_ids, params)
+
+    def _collect_generate(
+        self, request_id: str, input_ids: List[int], params: GenParams
+    ) -> Dict:
         sub = self.loop.submit(request_id, input_ids, params)
+        # TP / Hybrid: background loop is unsafe across ranks; pump synchronously.
+        if not self.loop.ready:
+            self.loop.pump_until_idle(timeout_s=params.timeout_s)
         text_parts: List[str] = []
         finish = "stop"
         usage = None
@@ -138,6 +146,67 @@ class LiteEngine:
                 "cache_hit_tokens": 0,
             },
         }
+
+    def generate_batch(
+        self,
+        requests: List[Dict],
+        *,
+        timeout_s: float = 600.0,
+    ) -> List[Dict]:
+        """Submit many requests and drain synchronously (TP-safe when start_loop=False).
+
+        Each item: ``{request_id, input_ids, max_tokens, temperature, ...}``.
+        All ranks must call with identical requests when using V4 Hybrid TP.
+        """
+        subs = []
+        for req in requests:
+            params = GenParams(
+                max_tokens=int(req.get("max_tokens", 128)),
+                temperature=float(req.get("temperature", 0.0)),
+                top_p=float(req.get("top_p", 1.0)),
+                top_k=req.get("top_k"),
+                seed=req.get("seed"),
+                stop=req.get("stop"),
+                timeout_s=timeout_s,
+                ignore_eos=bool(req.get("ignore_eos", False)),
+            )
+            subs.append(
+                self.loop.submit(str(req["request_id"]), list(req["input_ids"]), params)
+            )
+        if not self.loop.ready:
+            self.loop.pump_until_idle(timeout_s=timeout_s)
+        out: List[Dict] = []
+        for req, sub in zip(requests, subs):
+            text_parts: List[str] = []
+            finish = "stop"
+            usage = None
+            while True:
+                item = sub.delta_queue.get(timeout=timeout_s)
+                if item.get("error"):
+                    raise RuntimeError(item["error"])
+                if item.get("text"):
+                    text_parts.append(item["text"])
+                if item.get("finish_reason") is not None:
+                    finish = item["finish_reason"]
+                    usage = item.get("usage")
+                    break
+            ids = list(req["input_ids"])
+            out.append(
+                {
+                    "request_id": str(req["request_id"]),
+                    "text": "".join(text_parts),
+                    "finish_reason": finish,
+                    "finished": True,
+                    "usage": usage
+                    or {
+                        "prompt_tokens": len(ids),
+                        "completion_tokens": 0,
+                        "total_tokens": len(ids),
+                        "cache_hit_tokens": 0,
+                    },
+                }
+            )
+        return out
 
     def generate_stream(
         self,

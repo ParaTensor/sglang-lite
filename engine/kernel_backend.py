@@ -538,7 +538,15 @@ class FlashInferBackend(KernelBackend):
         return self._mla_wrapper.run(q_nope, q_pe, ckv, kpe)
 
     def sparse_mla_decode_dsv4(self, *args: Any, **kwargs: Any) -> torch.Tensor:
-        """Route V4 sparse MLA by arch_family — never SM100 TRTLLM on SM120."""
+        """Route V4 sparse MLA by arch_family — never SM100 TRTLLM on SM120.
+
+        FlashInfer path: keyword args match
+        ``flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4``.
+
+        Official fallback: pass ``q, kv, attn_sink, topk_idxs, softmax_scale``
+        (same as TileLang ``sparse_attn``) when backend is
+        ``OFFICIAL_SPARSE_ATTN`` and ``_official_sparse_attn`` was attached.
+        """
         backend = self.sparse_mla_backend
         if backend == SparseMlaBackend.FLASHINFER_SPARSE_SM100 and self.arch_family == ArchFamily.SM120:
             raise RuntimeError(
@@ -551,11 +559,25 @@ class FlashInferBackend(KernelBackend):
         ):
             import flashinfer.mla as mla
 
-            return mla.trtllm_batch_decode_sparse_mla_dsv4(*args, **kwargs)
+            # Prefer kwargs API used by our Hybrid hook.
+            if kwargs:
+                return mla.trtllm_batch_decode_sparse_mla_dsv4(*args, **kwargs)
+            return mla.trtllm_batch_decode_sparse_mla_dsv4(*args)
         if backend == SparseMlaBackend.OFFICIAL_SPARSE_ATTN:
-            raise NotImplementedError(
-                "official sparse_attn fallback not wired; set FI≥0.6.16 with "
-                "SM120 sparse module or pass SGLANG_LITE_DSV4_INFER"
+            fn = getattr(self, "_official_sparse_attn", None)
+            if fn is None:
+                raise NotImplementedError(
+                    "official sparse_attn not attached; load Hybrid model first "
+                    "or set FI≥0.6.16 with SM120 sparse module"
+                )
+            if args and len(args) >= 5:
+                return fn(*args[:5])
+            return fn(
+                kwargs["q"],
+                kwargs["kv"],
+                kwargs["attn_sink"],
+                kwargs["topk_idxs"],
+                kwargs["softmax_scale"],
             )
         raise NotImplementedError(f"sparse MLA backend unavailable: {backend}")
 
