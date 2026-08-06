@@ -492,8 +492,24 @@ torchrun --nproc-per-node=8 scripts/v4_logits_compare.py --prompt Hello --out ~/
 | 1×256 | 7.12 | **7.51** | ~7.6 | 同上 + capital of France |
 
 相对 8×5090 Hybrid 基线（§6.2：1×128 ~4.8–5.1 / 4×96 ~18.3 / 1×256 ~4.8）：
-PRO6000 单请求 decode 更高，batch=4 接近同量级。本表为 **Phase 1 换核对照
-基线**——FI SM120 默认未开；换核后必须 ≥ 此表 warm（允许小幅方差）。
+PRO6000 单请求 decode 更高，batch=4 接近同量级。本表为 **吞吐对照基线**——
+FI SM120 默认未开；任何路径变更后 warm 应 ≥ 此表（允许小幅方差）。
+
+#### 6.4.2 0c-4 page-stage 吞吐回归（2026-08-06，同宿主）
+
+官方 `sparse_attn` + **page-primary stage**（`DISABLE_FI=1`）。日志：
+`~/bench/v4_thru_0c4_{1x128,4x96,1x256}.log`；对照 JSON：
+`~/bench/v4_thru_0c4_vs_baseline.json`。
+
+| Case | 基线 warm | 0c-4 warm | Δ warm | 0c-4 cold | load_s |
+| --- | --- | --- | --- | --- | --- |
+| 1×128 | 7.59 | **7.43** | **−2.1%** | 6.74 | 7.35 |
+| 4×96 | 16.74 | **16.59** | **−0.9%** | 14.67 | 8.28 |
+| 1×256 | 7.51 | **7.33** | **−2.4%** | 6.95 | 7.61 |
+
+样本前缀均 `Hello! How can I help you today`。门禁：**PASS**（|Δ warm| < 10%，
+落在「小幅方差」内）。结论：0c-4 每步 stage 的 e2e 开销约 **1–2.5%**，可接受；
+**不**据此关掉 page-primary。
 
 ## 7. 风险与开放问题
 
@@ -628,6 +644,8 @@ Phase0 HybridMVP → Phase0b Stabilize → Phase0c OwnKV → Phase1 OwnKernels �
 摘要：`~/bench/v4_dual_stats_0c4.json`。退出时 NCCL destroy 仍可能挂
 （与历史 dual probe 相同，**不影响门禁 JSON**）；探针已改为各 rank 对称
 `shutdown`、无结果后 barrier。
+
+吞吐回归见 **§6.4.2**（0c-4 vs §6.4.1：warm Δ ≈ −1%～−2.5%，**PASS**）。
 
 **仍后置**：decode 直接读 packed 页做 FI leaf（不默认）；更细的 SWA/comp
 分池语义与官方 ring 对齐。
