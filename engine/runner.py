@@ -798,7 +798,12 @@ class ModelRunner:
         return cache.match(token_ids)
 
     def _v4_ensure_restored(self, seq: Sequence, *, batch_slot: int = 0) -> None:
-        """Restore prefix snapshot, or clear the slot on a cold prefill."""
+        """Restore prefix state, or clear the slot on a cold prefill.
+
+        Phase 0c-3: prefer dual-pool bf16 page restore for ``kv_cache`` rows,
+        then apply CPU snapshot for remaining buffers (``kv_state`` /
+        ``score_state`` / fallback).
+        """
         if getattr(seq, "_v4_kv_pending_restore", False):
             entry = getattr(seq, "_v4_prefix_entry", None)
             seq._v4_kv_pending_restore = False
@@ -806,7 +811,40 @@ class ModelRunner:
                 return
             from .v4_prefix_cache import restore_v4_kv
 
-            restore_v4_kv(self.model, entry.buffers, batch_slot=batch_slot)
+            skip_keys = set()
+            handle = getattr(seq, "_v4_dual_handle", None)
+            radix = getattr(seq, "_v4_dual_radix", None)
+            if (
+                handle is not None
+                and radix is not None
+                and getattr(radix, "restore_bf16_cache", None) is not None
+                and handle.swa_blocks
+            ):
+                try:
+                    from .v4_dual_pool import restore_dual_pool_to_model
+
+                    n_dual, skip_keys = restore_dual_pool_to_model(
+                        self.model,
+                        radix,
+                        handle,
+                        batch_slot=batch_slot,
+                        n_tokens=int(
+                            getattr(entry, "dual_pool_tokens", 0)
+                            or handle.n_tokens
+                            or seq.cached_len
+                        ),
+                    )
+                    if n_dual > 0:
+                        seq._v4_dual_restored = True
+                except Exception as e:
+                    print(f"[sglang-lite] v4 dual-pool restore skipped: {e}")
+                    skip_keys = set()
+            restore_v4_kv(
+                self.model,
+                entry.buffers,
+                batch_slot=batch_slot,
+                skip_keys=skip_keys,
+            )
             seq._v4_slot_prepared = True
             return
         # Cold path: wipe stale compressor / indexer state before start_pos=0.
@@ -876,9 +914,10 @@ class ModelRunner:
     ) -> None:
         """Snapshot official KV after a completed prompt prefill.
 
-        Phase 0c: dual-write packed SWA+compressed pages into ``radix``. The
-        prefix cache takes an extra refcount; the sequence keeps the original
-        allocate-ref and releases it on finish. Restore still uses CPU snapshots.
+        Phase 0c: dual-write packed + bf16 restore pages into ``radix``. When
+        dual-write covers ``kv_cache`` modules, those tensors are **slimed out**
+        of the CPU snapshot (``dual_primary``) so pages become the primary
+        restore path for KV; ``kv_state`` / ``score_state`` stay in the snapshot.
         """
         cache = self._v4_prefix_cache
         if cache is None or self.model is None:
@@ -898,11 +937,13 @@ class ModelRunner:
         comp_ids: List[int] = []
         dual_tokens = 0
         dual_layers = 0
+        dual_keys: List[str] = []
+        dual_primary = False
         if radix is not None and (
             radix.packed_swa_cache is not None or radix.packed_kv_cache is not None
         ):
             try:
-                from .v4_dual_pool import dual_write_from_model
+                from .v4_dual_pool import dual_write_from_model, slim_snapshot_buffers
 
                 handle = dual_write_from_model(
                     self.model,
@@ -915,13 +956,19 @@ class ModelRunner:
                     comp_ids = list(handle.comp_blocks)
                     dual_tokens = int(handle.n_tokens)
                     dual_layers = int(handle.n_layers_written)
+                    dual_keys = list(handle.layer_keys or [])
                     # Sequence keeps the allocate-ref; cache.insert will fork.
                     seq.swa_block_table = list(swa_ids)
                     seq.comp_block_table = list(comp_ids)
                     seq._v4_dual_handle = handle
                     seq._v4_dual_radix = radix
+                    # Slim CPU snapshot when we have page-backed kv rows.
+                    paged_keys = {k for k in dual_keys if k}
+                    if paged_keys and radix.restore_bf16_cache is not None:
+                        buffers = slim_snapshot_buffers(buffers, paged_keys)
+                        dual_primary = True
             except Exception as e:
-                # Dual-write is best-effort; CPU snapshot remains the restore path.
+                # Dual-write is best-effort; full CPU snapshot remains restore path.
                 print(f"[sglang-lite] v4 dual-write skipped: {e}")
 
         cache.insert(
@@ -932,6 +979,8 @@ class ModelRunner:
             comp_block_ids=comp_ids,
             dual_pool_tokens=dual_tokens,
             dual_pool_layers=dual_layers,
+            dual_layer_keys=dual_keys,
+            dual_primary=dual_primary,
         )
 
     def _v4_dual_append_decode(

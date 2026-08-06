@@ -150,19 +150,19 @@ clear_v4_kv_slot on final   →     release pages on finish      optional CUDA g
 LiteEngine CB + TP SSE      →     same scheduler contract      throughput ≥ official warm
 ```
 
-**Phase 0c slices 1–2 (landed):**
+**Phase 0c slices 1–3 (landed):**
 
-1. Dual-write packed SWA+compressed pages after Hybrid prefill
-   (`v4_dual_pool.dual_write_from_model`, `RadixCache.write_packed_kv`).
-2. **Page ownership**: `V4PrefixCache` holds a forked ref on dual pages;
-   sequences hold the allocate-ref (or a hit fork). Finish only drops the
-   sequence fork — prefix entries survive for reuse (`dual_hit_count`).
-3. Decode best-effort **dual-append** keeps pages length-aligned.
-4. Official **restore still uses CPU snapshots**; dual pages are lifecycle +
-   future source-of-truth, not yet attention inputs.
+1. Dual-write packed SWA+compressed pages after Hybrid prefill.
+2. **Page ownership**: cache holds forked refs; seq holds allocate/hit forks.
+3. Decode best-effort dual-append.
+4. **0c-3 page restore**: bf16 restore pool writes back into official
+   `kv_cache` rows on hit (`restore_dual_pool_to_model`); CPU snapshot is
+   **slimmed** (`dual_primary`) to state tensors only when page-backed.
+   Decode still runs official `sparse_attn` (pages are not yet the attention
+   source).
 
-Metrics: `get_stats()["dual_pool"]` and `["v4_prefix"]`. Next (0c-3): restore
-from pages / drop whole-buffer snapshot as sole path.
+Metrics: `dual_restore_count`, `prefix_dual_primary`. Next: attention reads
+pages / FI SM120.
 
 Do not treat “FI attached” as Owned KV: FlashInfer is a leaf; Radix page
 lifecycle and scheduler grouping remain the engine’s job.

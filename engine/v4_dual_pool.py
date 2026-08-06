@@ -1,17 +1,18 @@
-"""Phase 0c: dual-pool (SWA + compressed) page export for DeepSeek-V4 Hybrid.
+"""Phase 0c: dual-pool (SWA + compressed) pages for DeepSeek-V4 Hybrid.
 
-Hybrid still runs official ``sparse_attn`` with in-module buffers. This module
-**dual-writes** packed pages into :class:`RadixCache` so prefix lifecycle can
-migrate off whole-buffer CPU snapshots.
+Hybrid still runs official ``sparse_attn`` with in-module buffers. This module:
 
-Restore path remains official-buffer snapshots until a later slice makes
-Radix the source of truth.
+1. **Dual-writes** packed uint8 pages (future FI path) + bf16 restore pages.
+2. **Restores** official ``kv_cache`` rows from bf16 pages on prefix hit (0c-3).
+3. Keeps CPU snapshots for ``kv_state`` / ``score_state`` and as fallback.
+
+Ownership: see :class:`~sglang_lite.v4_prefix_cache.V4PrefixCache`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -27,6 +28,9 @@ class DualPoolHandle:
     comp_blocks: List[int] = field(default_factory=list)
     n_tokens: int = 0
     n_layers_written: int = 0
+    # module path keys aligned with layer indices written to restore_bf16_cache
+    # e.g. ["layers.0.attn.kv_cache", ...]
+    layer_keys: List[str] = field(default_factory=list)
 
 
 def pages_for_tokens(n_tokens: int, block_size: int) -> int:
@@ -41,7 +45,7 @@ def allocate_dual_pool_pages(radix: RadixCache, n_tokens: int) -> DualPoolHandle
     if n_pages <= 0:
         return DualPoolHandle(n_tokens=0)
     blocks = radix.allocate_blocks(n_pages)
-    # Same physical page ids index both packed pools.
+    # Same physical page ids index both packed pools + restore bf16 pool.
     return DualPoolHandle(
         swa_blocks=list(blocks),
         comp_blocks=list(blocks),
@@ -60,6 +64,7 @@ def release_dual_pool_pages(radix: RadixCache, handle: Optional[DualPoolHandle])
     handle.comp_blocks = []
     handle.n_tokens = 0
     handle.n_layers_written = 0
+    handle.layer_keys = []
 
 
 def write_dual_pool_layer(
@@ -73,18 +78,21 @@ def write_dual_pool_layer(
     comp_packed: Optional[torch.Tensor] = None,
     start_pos: int = 0,
     act_quant_fn=None,
+    write_restore_bf16: bool = True,
 ) -> int:
-    """Write one layer into SWA and/or compressed packed pools.
+    """Write one layer into SWA/comp packed pools (+ optional bf16 restore pool).
 
     Accepts either bf16 ``[..., 512]`` (packed here) or pre-packed uint8
     ``[T, 584]``. Returns number of tokens written (max of SWA/comp lengths).
     """
     written = 0
+    restore_src: Optional[torch.Tensor] = None
     if swa_bf16 is not None or swa_packed is not None:
         packed = swa_packed
         if packed is None:
             assert swa_bf16 is not None
             flat = _as_token_major_512(swa_bf16)
+            restore_src = flat
             packed = pack_dsv4_kv_bf16(flat, act_quant_fn=act_quant_fn)
         radix.write_packed_kv(
             handle.swa_blocks, start_pos, packed, pool="swa", layer_idx=layer_idx
@@ -95,11 +103,21 @@ def write_dual_pool_layer(
         if packed is None:
             assert comp_bf16 is not None
             flat = _as_token_major_512(comp_bf16)
+            if restore_src is None:
+                restore_src = flat
             packed = pack_dsv4_kv_bf16(flat, act_quant_fn=act_quant_fn)
         radix.write_packed_kv(
             handle.comp_blocks, start_pos, packed, pool="comp", layer_idx=layer_idx
         )
         written = max(written, int(packed.shape[0]))
+    if (
+        write_restore_bf16
+        and restore_src is not None
+        and radix.restore_bf16_cache is not None
+    ):
+        radix.write_restore_bf16(
+            handle.swa_blocks, start_pos, restore_src, layer_idx=layer_idx
+        )
     if written:
         handle.n_layers_written = max(handle.n_layers_written, layer_idx + 1)
         handle.n_tokens = max(handle.n_tokens, start_pos + written)
@@ -128,21 +146,20 @@ def extract_layer_kv_bf16(
     *,
     batch_slot: int = 0,
     max_tokens: Optional[int] = None,
-) -> List[Tuple[int, torch.Tensor]]:
-    """Best-effort extract per-layer bf16 KV rows shaped ``[T, 512]``.
+) -> List[Tuple[int, str, torch.Tensor]]:
+    """Extract per-layer bf16 KV rows shaped ``[T, 512]`` with module keys.
 
-    Official V4 buffers vary by module; we accept tensors whose last dim is
-    512 (or 512-contiguous) on the batch row. Returns ``(layer_idx, kv)`` pairs
-    in discovery order (layer_idx is a dense counter, not model layer id).
+    Returns ``(layer_idx, module_key, kv)`` where ``module_key`` is like
+    ``layers.0.attn.kv_cache`` for later restore.
     """
-    out: List[Tuple[int, torch.Tensor]] = []
+    out: List[Tuple[int, str, torch.Tensor]] = []
     seen = set()
     layer_i = 0
     for name, mod in model.named_modules():
         for attr in ("kv_cache",):
             if not hasattr(mod, attr):
                 continue
-            key = f"{name}.{attr}"
+            key = f"{name}.{attr}" if name else attr
             if key in seen:
                 continue
             buf = getattr(mod, attr)
@@ -155,7 +172,7 @@ def extract_layer_kv_bf16(
             flat = _try_as_t512(row, max_tokens=max_tokens)
             if flat is None:
                 continue
-            out.append((layer_i, flat))
+            out.append((layer_i, key, flat))
             layer_i += 1
     return out
 
@@ -203,6 +220,7 @@ def dual_write_from_model(
 ) -> Optional[DualPoolHandle]:
     """Allocate dual-pool pages and dual-write extractable layer KVs.
 
+    Also writes bf16 restore pages when ``restore_bf16_cache`` is allocated.
     Returns a handle when at least one layer was written; otherwise releases
     pages and returns ``None``.
     """
@@ -221,12 +239,11 @@ def dual_write_from_model(
     wrote_any = False
     try:
         if layers:
-            for layer_idx, kv in layers:
+            for layer_idx, key, kv in layers:
                 if layer_idx >= radix.num_layers:
                     break
-                # Official hybrid often keeps a single fused SWA||compressed stream
-                # in one buffer; dual-write the same stream into both pools so
-                # page lifecycle is exercised. Later slices split SWA vs compress.
+                # Official hybrid often keeps a single fused stream; dual-write
+                # the same stream into both packed pools + bf16 restore.
                 write_dual_pool_layer(
                     radix,
                     handle,
@@ -235,11 +252,18 @@ def dual_write_from_model(
                     comp_bf16=kv,
                     start_pos=0,
                     act_quant_fn=act_quant_fn,
+                    write_restore_bf16=True,
                 )
+                # Keep layer_keys aligned with dense layer indices 0..N-1
+                while len(handle.layer_keys) < layer_idx:
+                    handle.layer_keys.append("")
+                if len(handle.layer_keys) == layer_idx:
+                    handle.layer_keys.append(key)
+                else:
+                    handle.layer_keys[layer_idx] = key
                 wrote_any = True
         else:
-            # No extractable 512-d rows: still reserve pages (lifecycle bookkeeping)
-            # so finish/cancel can release dual-pool blocks. Filled with zeros.
+            # No extractable 512-d rows: reserve zero pages for lifecycle only.
             zeros = torch.zeros(
                 n_tokens, DSV4_PACKED_BYTES, dtype=torch.uint8, device=radix.device
             )
@@ -251,6 +275,7 @@ def dual_write_from_model(
                     swa_packed=zeros,
                     comp_packed=zeros,
                     start_pos=0,
+                    write_restore_bf16=False,
                 )
                 wrote_any = True
     except Exception:
@@ -271,6 +296,7 @@ def dual_write_from_bf16(
     *,
     swa_layers: List[torch.Tensor],
     comp_layers: Optional[List[torch.Tensor]] = None,
+    layer_keys: Optional[List[str]] = None,
     act_quant_fn=None,
 ) -> DualPoolHandle:
     """Test/helper: dual-write lists of ``[T, 512]`` layers."""
@@ -289,7 +315,10 @@ def dual_write_from_bf16(
             comp_bf16=comp,
             start_pos=0,
             act_quant_fn=act_quant_fn,
+            write_restore_bf16=True,
         )
+        key = layer_keys[i] if layer_keys and i < len(layer_keys) else f"layer.{i}.kv_cache"
+        handle.layer_keys.append(key)
     radix.dual_write_count += 1
     radix.dual_write_tokens += n_tokens
     return handle
@@ -322,10 +351,7 @@ def dual_append_from_model(
     pos: int,
     act_quant_fn=None,
 ) -> bool:
-    """Append one token at ``pos`` into existing dual-pool pages (best-effort).
-
-    Returns True if at least one layer was written.
-    """
+    """Append one token at ``pos`` into existing dual-pool pages (best-effort)."""
     if pos < 0:
         return False
     if radix.packed_comp_cache is None:
@@ -333,18 +359,16 @@ def dual_append_from_model(
     if radix.packed_swa_cache is None and radix.packed_kv_cache is None:
         return False
 
-    # Extract up to pos+1 tokens; use only the last row.
     layers = extract_layer_kv_bf16(model, batch_slot=batch_slot, max_tokens=pos + 1)
     if not layers:
         return False
 
     ensure_dual_pool_capacity(radix, handle, pos + 1)
     wrote = False
-    for layer_idx, kv in layers:
+    for layer_idx, key, kv in layers:
         if layer_idx >= radix.num_layers:
             break
         if kv.shape[0] <= pos:
-            # Buffer shorter than expected — use last available token.
             row = kv[-1:]
         else:
             row = kv[pos : pos + 1]
@@ -356,12 +380,142 @@ def dual_append_from_model(
             comp_bf16=row,
             start_pos=pos,
             act_quant_fn=act_quant_fn,
+            write_restore_bf16=True,
         )
+        while len(handle.layer_keys) <= layer_idx:
+            handle.layer_keys.append("")
+        if not handle.layer_keys[layer_idx]:
+            handle.layer_keys[layer_idx] = key
         wrote = True
     if wrote:
         handle.n_tokens = max(handle.n_tokens, pos + 1)
         radix.dual_append_count += 1
     return wrote
+
+
+def restore_dual_pool_to_model(
+    model: torch.nn.Module,
+    radix: RadixCache,
+    handle: DualPoolHandle,
+    *,
+    batch_slot: int = 0,
+    n_tokens: Optional[int] = None,
+) -> Tuple[int, Set[str]]:
+    """Write bf16 restore pages back into model ``kv_cache`` modules.
+
+    Returns ``(n_modules_written, restored_keys)``.
+    """
+    if radix.restore_bf16_cache is None or not handle.swa_blocks:
+        return 0, set()
+    n = int(n_tokens if n_tokens is not None else handle.n_tokens)
+    if n <= 0:
+        return 0, set()
+    restored: Set[str] = set()
+    written = 0
+    n_layers = min(
+        handle.n_layers_written or len(handle.layer_keys) or radix.num_layers,
+        radix.num_layers,
+        max(len(handle.layer_keys), 1),
+    )
+    # Prefer explicit layer_keys length.
+    if handle.layer_keys:
+        n_layers = min(len(handle.layer_keys), radix.num_layers)
+    for layer_idx in range(n_layers):
+        key = (
+            handle.layer_keys[layer_idx]
+            if layer_idx < len(handle.layer_keys)
+            else ""
+        )
+        if not key:
+            continue
+        try:
+            data = radix.read_restore_bf16(
+                handle.swa_blocks, n, layer_idx=layer_idx
+            )
+        except Exception:
+            continue
+        if _write_module_kv_row(model, key, data, batch_slot=batch_slot):
+            restored.add(key)
+            written += 1
+    if written:
+        radix.dual_restore_count += 1
+    return written, restored
+
+
+def _write_module_kv_row(
+    model: torch.nn.Module,
+    key: str,
+    data: torch.Tensor,
+    *,
+    batch_slot: int,
+) -> bool:
+    """Copy ``[T, 512]`` into ``model`` buffer identified by ``key``."""
+    if "." not in key and key != "kv_cache":
+        return False
+    if key == "kv_cache":
+        mod, attr = model, "kv_cache"
+    else:
+        mod_path, attr = key.rsplit(".", 1)
+        mod = model
+        try:
+            for part in mod_path.split("."):
+                if not part:
+                    continue
+                mod = getattr(mod, part)
+        except AttributeError:
+            return False
+    if not hasattr(mod, attr):
+        return False
+    buf = getattr(mod, attr)
+    if not torch.is_tensor(buf):
+        return False
+    src = data.to(device=buf.device, dtype=buf.dtype)
+    # Common layouts: [B, T, 512], [B, T, H, 512], [B, H, T, 512]
+    try:
+        if buf.dim() >= 1 and buf.shape[0] > batch_slot:
+            row = buf[batch_slot]
+        elif batch_slot == 0:
+            row = buf
+        else:
+            return False
+        t = int(src.shape[0])
+        if row.dim() == 2 and row.shape[-1] == DSV4_HEAD_DIM:
+            n = min(t, row.shape[0])
+            row[:n].copy_(src[:n])
+            return True
+        if row.dim() == 3 and row.shape[-1] == DSV4_HEAD_DIM:
+            if row.shape[1] == 1:
+                n = min(t, row.shape[0])
+                row[:n, 0, :].copy_(src[:n])
+                return True
+            if row.shape[0] == 1:
+                n = min(t, row.shape[1])
+                row[0, :n, :].copy_(src[:n])
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def slim_snapshot_buffers(
+    buffers: Dict[str, torch.Tensor],
+    restored_or_paged_keys: Set[str],
+) -> Dict[str, torch.Tensor]:
+    """Drop ``kv_cache`` tensors that are page-backed from a snapshot dict.
+
+    Keeps ``kv_state`` / ``score_state`` and any keys not covered by dual-pool.
+    """
+    if not restored_or_paged_keys:
+        return buffers
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in buffers.items():
+        if k in restored_or_paged_keys:
+            continue
+        # Also drop keys that end with .kv_cache when layer key matches
+        if k.endswith(".kv_cache") and k in restored_or_paged_keys:
+            continue
+        out[k] = v
+    return out
 
 
 def verify_dual_pool_roundtrip(
@@ -371,7 +525,7 @@ def verify_dual_pool_roundtrip(
     layer_idx: int = 0,
     n_tokens: Optional[int] = None,
 ) -> bool:
-    """Return True if SWA packed pages for ``layer_idx`` are readable and non-empty."""
+    """Return True if SWA packed pages for ``layer_idx`` are readable."""
     n = int(n_tokens if n_tokens is not None else handle.n_tokens)
     if n <= 0 or not handle.swa_blocks:
         return False

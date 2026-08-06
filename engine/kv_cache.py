@@ -226,6 +226,15 @@ class RadixCache:
                 dtype=torch.uint8,
                 device=device,
             )
+        # Phase 0c-3: bf16 restore pool [layers, blocks, page, 512] for Hybrid
+        # page→official buffer restore (packed 584 is lossy / FI-only).
+        self.restore_bf16_cache: Optional[torch.Tensor] = None
+        if need_swa_packed or need_comp_packed:
+            self.restore_bf16_cache = torch.zeros(
+                (num_layers, self.num_blocks, block_size, 512),
+                dtype=dtype if dtype != torch.uint8 else torch.bfloat16,
+                device=device,
+            )
         # Token occupancy per physical page (for append position)
         self._page_len: Dict[int, int] = {}
 
@@ -239,6 +248,7 @@ class RadixCache:
         self.dual_write_tokens = 0
         self.dual_hit_count = 0
         self.dual_append_count = 0
+        self.dual_restore_count = 0
 
     def match_prefix(
         self, token_ids: List[int]
@@ -419,6 +429,83 @@ class RadixCache:
             return self.packed_comp_cache
         raise ValueError(f"unknown packed pool {pool!r}; use 'swa' or 'comp'")
 
+    def write_restore_bf16(
+        self,
+        block_table: List[int],
+        start_pos: int,
+        tokens: torch.Tensor,
+        *,
+        layer_idx: int = 0,
+    ) -> None:
+        """Write bf16 ``[T, 512]`` into the Hybrid restore pool."""
+        if self.restore_bf16_cache is None:
+            raise RuntimeError("restore_bf16_cache is not allocated")
+        if not block_table:
+            raise ValueError("write_restore_bf16 requires block_table")
+        if tokens.dim() != 2 or tokens.shape[-1] != 512:
+            raise ValueError(f"expected [T, 512], got {tuple(tokens.shape)}")
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise ValueError(f"layer_idx {layer_idx} out of range")
+        n = int(tokens.shape[0])
+        if n == 0:
+            return
+        end_pos = start_pos + n
+        pages_needed = (end_pos + self.block_size - 1) // self.block_size
+        if pages_needed > len(block_table):
+            raise RuntimeError(
+                f"block_table too short for restore bf16 pos={end_pos - 1}"
+            )
+        src = tokens.to(device=self.device, dtype=self.restore_bf16_cache.dtype).contiguous()
+        t = 0
+        while t < n:
+            pos = start_pos + t
+            page_i = pos // self.block_size
+            slot = pos % self.block_size
+            span = min(self.block_size - slot, n - t)
+            bid = block_table[page_i]
+            self.restore_bf16_cache[layer_idx, bid, slot : slot + span].copy_(
+                src[t : t + span]
+            )
+            self._page_len[bid] = max(self._page_len.get(bid, 0), slot + span)
+            t += span
+
+    def read_restore_bf16(
+        self,
+        block_table: List[int],
+        length: int,
+        *,
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        """Read ``length`` tokens from the Hybrid restore pool as ``[T, 512]``."""
+        if self.restore_bf16_cache is None:
+            raise RuntimeError("restore_bf16_cache is not allocated")
+        if length <= 0:
+            return torch.zeros(
+                0, 512, dtype=self.restore_bf16_cache.dtype, device=self.device
+            )
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise ValueError(f"layer_idx {layer_idx} out of range")
+        pages_needed = (length + self.block_size - 1) // self.block_size
+        if len(block_table) < pages_needed:
+            raise RuntimeError(
+                f"read_restore_bf16: need {pages_needed} pages, have {len(block_table)}"
+            )
+        out = torch.empty(
+            length, 512, dtype=self.restore_bf16_cache.dtype, device=self.device
+        )
+        t = 0
+        while t < length:
+            pos = t
+            page_i = pos // self.block_size
+            slot = pos % self.block_size
+            span = min(self.block_size - slot, length - t)
+            bid = block_table[page_i]
+            out[t : t + span].copy_(
+                self.restore_bf16_cache[layer_idx, bid, slot : slot + span]
+            )
+            t += span
+        return out
+
     def write_kv(
         self,
         block_table: List[int],
@@ -596,6 +683,8 @@ class RadixCache:
             self.packed_swa_cache[:, new_id].copy_(self.packed_swa_cache[:, block_id])
         if self.packed_comp_cache is not None:
             self.packed_comp_cache[:, new_id].copy_(self.packed_comp_cache[:, block_id])
+        if self.restore_bf16_cache is not None:
+            self.restore_bf16_cache[:, new_id].copy_(self.restore_bf16_cache[:, block_id])
         self._page_len[new_id] = self._page_len.get(block_id, 0)
         blk.ref_count -= 1
         return new_id
@@ -617,9 +706,11 @@ class RadixCache:
             "dual_write_tokens": self.dual_write_tokens,
             "dual_hit_count": self.dual_hit_count,
             "dual_append_count": self.dual_append_count,
+            "dual_restore_count": self.dual_restore_count,
             "has_packed_swa": self.packed_swa_cache is not None
             or self.packed_kv_cache is not None,
             "has_packed_comp": self.packed_comp_cache is not None,
+            "has_restore_bf16": self.restore_bf16_cache is not None,
         }
 
     def allocate_blocks(self, count: int) -> List[int]:
@@ -669,6 +760,8 @@ class RadixCache:
                     self.packed_swa_cache[:, bid].zero_()
                 if self.packed_comp_cache is not None:
                     self.packed_comp_cache[:, bid].zero_()
+                if self.restore_bf16_cache is not None:
+                    self.restore_bf16_cache[:, bid].zero_()
                 self._free_blocks.append(bid)
 
     def evict(self, needed: int) -> int:

@@ -33,6 +33,10 @@ class V4PrefixEntry:
     comp_block_ids: List[int] = field(default_factory=list)
     dual_pool_tokens: int = 0
     dual_pool_layers: int = 0
+    # Module keys for bf16 page restore (Phase 0c-3), aligned with dual layers.
+    dual_layer_keys: List[str] = field(default_factory=list)
+    # True when insert stored slim buffers (kv_cache rows dropped, page-backed).
+    dual_primary: bool = False
 
 
 def snapshot_v4_kv(model: torch.nn.Module, *, batch_slot: int = 0) -> Dict[str, torch.Tensor]:
@@ -93,10 +97,18 @@ def restore_v4_kv(
     buffers: Dict[str, torch.Tensor],
     *,
     batch_slot: int = 0,
+    skip_keys: Optional[set] = None,
 ) -> int:
-    """Restore CPU snapshots into ``batch_slot``. Returns number of tensors written."""
+    """Restore CPU snapshots into ``batch_slot``. Returns number of tensors written.
+
+    ``skip_keys``: optional set of fully-qualified buffer names already restored
+    from dual-pool pages (Phase 0c-3).
+    """
+    skip = skip_keys or set()
     n = 0
     for key, cpu_t in buffers.items():
+        if key in skip:
+            continue
         # key = "layers.3.attn.kv_cache"
         if "." not in key:
             continue
@@ -163,8 +175,14 @@ class V4PrefixCache:
         comp_block_ids: Optional[List[int]] = None,
         dual_pool_tokens: int = 0,
         dual_pool_layers: int = 0,
+        dual_layer_keys: Optional[List[str]] = None,
+        dual_primary: bool = False,
     ) -> None:
-        if not token_ids or not buffers:
+        # dual_primary entries may slim out all kv_cache tensors; allow empty
+        # buffers when dual pages carry KV (state-only or fully page-backed).
+        if not token_ids:
+            return
+        if not buffers and not (dual_primary and (swa_block_ids or [])):
             return
 
         swa = list(swa_block_ids or [])
@@ -192,6 +210,8 @@ class V4PrefixCache:
             comp_block_ids=comp,
             dual_pool_tokens=int(dual_pool_tokens or 0),
             dual_pool_layers=int(dual_pool_layers or 0),
+            dual_layer_keys=list(dual_layer_keys or []),
+            dual_primary=bool(dual_primary),
         )
         # Replace equal-length exact key if present.
         for i, e in enumerate(self._entries):
@@ -241,6 +261,7 @@ class V4PrefixCache:
             comp_blocks=comp,
             n_tokens=int(entry.dual_pool_tokens or len(entry.token_ids)),
             n_layers_written=int(entry.dual_pool_layers or 0),
+            layer_keys=list(entry.dual_layer_keys or []),
         )
 
     def _release_entry_pages(self, entry: V4PrefixEntry) -> None:
@@ -265,9 +286,11 @@ class V4PrefixCache:
 
     def get_stats(self) -> Dict[str, int]:
         n_dual = sum(1 for e in self._entries if e.swa_block_ids)
+        n_primary = sum(1 for e in self._entries if e.dual_primary)
         return {
             "prefix_entries": len(self._entries),
             "prefix_dual_entries": n_dual,
+            "prefix_dual_primary": n_primary,
             "dual_store_count": self.dual_store_count,
             "dual_hit_count": self.dual_hit_count,
             "dual_release_count": self.dual_release_count,

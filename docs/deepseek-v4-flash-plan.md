@@ -552,7 +552,17 @@ Phase0 HybridMVP → Phase0b Stabilize → Phase0c OwnKV → Phase1 OwnKernels �
 | 可观测 | **done** | `get_stats()["dual_pool"]` + `v4_prefix` dual_* 计数 |
 | 单测 | **done** | `tests/test_v4_dual_pool_lifecycle.py` |
 
-**仍未做（0c-3）**：从 dual-pool **unpack/restore** 官方 buffer（去掉 CPU 快照为唯一源）；page 为 attention 源；PRO6000 真机 dual_write/hit 数字回填。
+#### 8.2.3 切片 3（已落地）— bf16 page restore（KV 以 page 为主源）
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| bf16 restore 池 | **done** | `RadixCache.restore_bf16_cache` `[L,B,P,512]`；与 dual-write 同页 id |
+| dual_write 写 restore 页 | **done** | `write_dual_pool_layer(..., write_restore_bf16=True)` + `layer_keys` |
+| hit 优先 page restore | **done** | `_v4_ensure_restored` → `restore_dual_pool_to_model` 再 snapshot 补 state |
+| slim snapshot | **done** | `dual_primary`：入库时丢掉已 page 化的 `*.kv_cache`，保留 state |
+| 单测 | **done** | `tests/test_v4_dual_pool_restore.py` |
+
+**仍未做（0c-4 / Phase 1）**：decode 直接读 page 做 attention；FI SM120 用 packed 池；PRO6000 真机 dual_restore 数字回填。
 
 ### 8.3 Phase 1 — 自持 decode 内核 + MoE
 

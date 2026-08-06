@@ -141,10 +141,9 @@ sglang-lite 强调高内聚与整洁，**根目录严禁堆放非核心内容**�
 
 ## 当前阶段
 
-当前处于 **Phase 0c**（自持 KV，切片 1–2 已落地：双池 packed 写入、Hybrid 双写、
-prefix cache 页所有权/hit fork、decode dual-append；**restore 仍走 CPU 快照**）。
-Phase 0b 稳态门禁保留。下一切片 0c-3：从 dual-pool page restore / 以 Radix 为源；
-再 Phase 1 换核 / Phase 2 生产硬化。
+当前处于 **Phase 0c**（自持 KV，切片 1–3：双池写入、生命周期、hit fork、
+decode append、**kv_cache page restore + slim snapshot**）。Decode 仍走官方
+`sparse_attn`。Phase 0b 门禁保留。下一：attention 读 page / Phase 1 换核。
 
 阶段定义与验收见 [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) **§8**。
 
