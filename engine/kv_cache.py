@@ -187,15 +187,42 @@ class RadixCache:
                 dtype=dtype,
                 device=device,
             )
-        # Optional packed SWA/compressed pool for SM120 DSV4 (uint8 last-dim 584)
+        # Dual packed pools for V4 Phase 0c (SWA + compressed), uint8 last-dim 584.
+        # ``packed_kv_cache`` remains an alias of the SWA pool for older callers.
+        self.packed_swa_cache: Optional[torch.Tensor] = None
+        self.packed_comp_cache: Optional[torch.Tensor] = None
         self.packed_kv_cache: Optional[torch.Tensor] = None
-        if self.layout.kind == KvLayoutKind.DSV4_PACKED or (
+        need_swa_packed = self.layout.kind == KvLayoutKind.DSV4_PACKED or (
             swa_layout is not None and swa_layout.kind == KvLayoutKind.DSV4_PACKED
-        ):
+        )
+        need_comp_packed = (
+            compressed_layout is not None
+            and compressed_layout.kind == KvLayoutKind.DSV4_PACKED
+        )
+        if need_swa_packed:
             pl = swa_layout if swa_layout and swa_layout.packed_last_dim else self.layout
             last = pl.packed_last_dim or 584
-            self.packed_kv_cache = torch.zeros(
+            self.packed_swa_cache = torch.zeros(
                 (num_layers, self.num_blocks, 1, block_size, last),
+                dtype=torch.uint8,
+                device=device,
+            )
+            self.packed_kv_cache = self.packed_swa_cache
+        # Phase 0c: pair a compressed packed pool whenever SWA packed exists
+        # (or when an explicit compressed DSV4 layout is requested).
+        if need_comp_packed or need_swa_packed:
+            cl = (
+                compressed_layout
+                if compressed_layout and compressed_layout.packed_last_dim
+                else (
+                    swa_layout
+                    if swa_layout and swa_layout.packed_last_dim
+                    else self.layout
+                )
+            )
+            last_c = cl.packed_last_dim or 584
+            self.packed_comp_cache = torch.zeros(
+                (num_layers, self.num_blocks, 1, block_size, last_c),
                 dtype=torch.uint8,
                 device=device,
             )
@@ -207,6 +234,11 @@ class RadixCache:
         self.miss_count = 0
         self.oom_reject_count = 0
         self.evict_count = 0
+        # Phase 0c dual-write / dual-hit observability
+        self.dual_write_count = 0
+        self.dual_write_tokens = 0
+        self.dual_hit_count = 0
+        self.dual_append_count = 0
 
     def match_prefix(
         self, token_ids: List[int]
@@ -292,6 +324,100 @@ class RadixCache:
         node.prefix_len = prefix_len or len(token_ids)
         self.total_tokens_stored = max(self.total_tokens_stored, node.prefix_len)
         return list(node.block_ids)
+
+    def write_packed_kv(
+        self,
+        block_table: List[int],
+        start_pos: int,
+        packed_tokens: torch.Tensor,
+        *,
+        pool: str = "swa",
+        layer_idx: int = 0,
+    ) -> None:
+        """Write packed uint8 tokens ``[T, packed_last_dim]`` into a dual pool.
+
+        ``pool`` is ``\"swa\"`` (default) or ``\"comp\"`` (compressed).
+        Page layout is ``[layers, blocks, 1, page, packed_dim]``.
+        """
+        cache = self._packed_pool(pool)
+        if cache is None:
+            raise RuntimeError(f"packed pool {pool!r} is not allocated on this RadixCache")
+        if not block_table:
+            raise ValueError("write_packed_kv requires block_table")
+        if packed_tokens.dim() != 2:
+            raise ValueError(f"expected [T, D] packed tokens, got {tuple(packed_tokens.shape)}")
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise ValueError(f"layer_idx {layer_idx} out of range ({self.num_layers})")
+        n = int(packed_tokens.shape[0])
+        if n == 0:
+            return
+        last = int(cache.shape[-1])
+        if int(packed_tokens.shape[-1]) != last:
+            raise ValueError(
+                f"packed last dim {packed_tokens.shape[-1]} != pool dim {last}"
+            )
+        end_pos = start_pos + n
+        pages_needed = (end_pos + self.block_size - 1) // self.block_size
+        if pages_needed > len(block_table):
+            raise RuntimeError(
+                f"block_table too short for packed pos={end_pos - 1}: pages={len(block_table)}"
+            )
+        src = packed_tokens.to(device=self.device, dtype=torch.uint8).contiguous()
+        t = 0
+        while t < n:
+            pos = start_pos + t
+            page_i = pos // self.block_size
+            slot = pos % self.block_size
+            span = min(self.block_size - slot, n - t)
+            bid = block_table[page_i]
+            if bid >= self.num_blocks:
+                raise RuntimeError(f"block id {bid} out of range ({self.num_blocks})")
+            # cache[layer, bid, 0, slot:slot+span, :]
+            cache[layer_idx, bid, 0, slot : slot + span].copy_(src[t : t + span])
+            self._page_len[bid] = max(self._page_len.get(bid, 0), slot + span)
+            t += span
+
+    def read_packed_kv(
+        self,
+        block_table: List[int],
+        length: int,
+        *,
+        pool: str = "swa",
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        """Read ``length`` packed tokens from a dual pool as ``[T, packed_dim]`` uint8."""
+        cache = self._packed_pool(pool)
+        if cache is None:
+            raise RuntimeError(f"packed pool {pool!r} is not allocated on this RadixCache")
+        if length <= 0:
+            return torch.zeros(0, cache.shape[-1], dtype=torch.uint8, device=self.device)
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise ValueError(f"layer_idx {layer_idx} out of range ({self.num_layers})")
+        pages_needed = (length + self.block_size - 1) // self.block_size
+        if len(block_table) < pages_needed:
+            raise RuntimeError(
+                f"read_packed_kv: need {pages_needed} pages, have {len(block_table)}"
+            )
+        last = int(cache.shape[-1])
+        out = torch.empty(length, last, dtype=torch.uint8, device=self.device)
+        t = 0
+        while t < length:
+            pos = t
+            page_i = pos // self.block_size
+            slot = pos % self.block_size
+            span = min(self.block_size - slot, length - t)
+            bid = block_table[page_i]
+            out[t : t + span].copy_(cache[layer_idx, bid, 0, slot : slot + span])
+            t += span
+        return out
+
+    def _packed_pool(self, pool: str) -> Optional[torch.Tensor]:
+        name = (pool or "swa").lower()
+        if name in ("swa", "window", "packed"):
+            return self.packed_swa_cache if self.packed_swa_cache is not None else self.packed_kv_cache
+        if name in ("comp", "compressed", "c"):
+            return self.packed_comp_cache
+        raise ValueError(f"unknown packed pool {pool!r}; use 'swa' or 'comp'")
 
     def write_kv(
         self,
@@ -462,6 +588,14 @@ class RadixCache:
         new_id = new_ids[0]
         self.k_cache[:, new_id].copy_(self.k_cache[:, block_id])
         self.v_cache[:, new_id].copy_(self.v_cache[:, block_id])
+        if self.ckv_cache is not None:
+            self.ckv_cache[:, new_id].copy_(self.ckv_cache[:, block_id])
+        if self.kpe_cache is not None:
+            self.kpe_cache[:, new_id].copy_(self.kpe_cache[:, block_id])
+        if self.packed_swa_cache is not None:
+            self.packed_swa_cache[:, new_id].copy_(self.packed_swa_cache[:, block_id])
+        if self.packed_comp_cache is not None:
+            self.packed_comp_cache[:, new_id].copy_(self.packed_comp_cache[:, block_id])
         self._page_len[new_id] = self._page_len.get(block_id, 0)
         blk.ref_count -= 1
         return new_id
@@ -479,6 +613,13 @@ class RadixCache:
             "blocks_free": len(self._free_blocks) + (self.num_blocks - self._next_block_id),
             "oom_reject_count": self.oom_reject_count,
             "evict_count": self.evict_count,
+            "dual_write_count": self.dual_write_count,
+            "dual_write_tokens": self.dual_write_tokens,
+            "dual_hit_count": self.dual_hit_count,
+            "dual_append_count": self.dual_append_count,
+            "has_packed_swa": self.packed_swa_cache is not None
+            or self.packed_kv_cache is not None,
+            "has_packed_comp": self.packed_comp_cache is not None,
         }
 
     def allocate_blocks(self, count: int) -> List[int]:
@@ -520,6 +661,14 @@ class RadixCache:
                 self._page_len.pop(bid, None)
                 self.k_cache[:, bid].zero_()
                 self.v_cache[:, bid].zero_()
+                if self.ckv_cache is not None:
+                    self.ckv_cache[:, bid].zero_()
+                if self.kpe_cache is not None:
+                    self.kpe_cache[:, bid].zero_()
+                if self.packed_swa_cache is not None:
+                    self.packed_swa_cache[:, bid].zero_()
+                if self.packed_comp_cache is not None:
+                    self.packed_comp_cache[:, bid].zero_()
                 self._free_blocks.append(bid)
 
     def evict(self, needed: int) -> int:

@@ -36,6 +36,9 @@ class Sequence:
     seed: Optional[int] = None
     stop_token_ids: List[int] = field(default_factory=list)
     stop_strings: List[str] = field(default_factory=list)
+    # Phase 0c dual-pool page handle (V4 Hybrid dual-write; optional)
+    swa_block_table: List[int] = field(default_factory=list)
+    comp_block_table: List[int] = field(default_factory=list)
 
 
 class SequenceTable:

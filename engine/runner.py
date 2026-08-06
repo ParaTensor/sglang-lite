@@ -555,7 +555,7 @@ class ModelRunner:
                 seq.cached_len = seq.cached_len + nlen
                 seq.prefill_tokens = getattr(seq, "prefill_tokens", 0) + nlen
                 results[i] = self._sample(row, seq)
-                self._v4_maybe_save_prefix(seq, batch_slot=b)
+                self._v4_maybe_save_prefix(seq, batch_slot=b, radix=radix)
             return
 
         for s in seqs:
@@ -629,6 +629,8 @@ class ModelRunner:
                 seq.kv_state = None
                 seq.cached_len = seq.cached_len + 1
                 results[i] = self._sample(row, seq)
+                # Phase 0c: keep dual-pool pages in sync on decode (best-effort).
+                self._v4_dual_append_decode(seq, batch_slot=b, radix=radix)
             return
 
         # COW last page before append
@@ -695,7 +697,7 @@ class ModelRunner:
             seq.cached_len = len(prompt)
             seq.prefill_tokens = getattr(seq, "prefill_tokens", 0) + len(new_tokens)
             tok = self._sample(row, seq)
-            self._v4_maybe_save_prefix(seq, batch_slot=0)
+            self._v4_maybe_save_prefix(seq, batch_slot=0, radix=radix)
             return tok
         self._ensure_blocks(seq, radix, len(prompt))
         if self._use_paged_attention():
@@ -825,12 +827,59 @@ class ModelRunner:
         from .v4_prefix_cache import clear_v4_kv_slot
 
         clear_v4_kv_slot(self.model, batch_slot=batch_slot)
+        # Phase 0c: release only this sequence's dual-pool fork (cache keeps its ref).
+        self._v4_release_dual_pool(seq)
         seq._v4_prefix_entry = None
         seq._v4_kv_pending_restore = False
         seq._v4_slot_prepared = False
 
-    def _v4_maybe_save_prefix(self, seq: Sequence, *, batch_slot: int = 0) -> None:
-        """Snapshot official KV after a completed prompt prefill."""
+    def _v4_release_dual_pool(self, seq: Sequence) -> None:
+        """Free dual-pool pages forked for this sequence (not the prefix-cache copy)."""
+        handle = getattr(seq, "_v4_dual_handle", None)
+        if handle is not None:
+            try:
+                from .v4_dual_pool import release_dual_pool_pages
+
+                radix = getattr(seq, "_v4_dual_radix", None)
+                if radix is not None:
+                    release_dual_pool_pages(radix, handle)
+            except Exception:
+                pass
+            seq._v4_dual_handle = None
+            seq._v4_dual_radix = None
+        seq.swa_block_table = []
+        seq.comp_block_table = []
+
+    def v4_attach_dual_pool_from_entry(
+        self, seq: Sequence, entry, radix: Optional[RadixCache]
+    ) -> bool:
+        """On prefix hit: fork dual-pool pages from the cache entry onto ``seq``."""
+        cache = self._v4_prefix_cache
+        if cache is None or radix is None or entry is None:
+            return False
+        if not getattr(entry, "swa_block_ids", None):
+            return False
+        # Prefer cache.fork so dual_hit_count is updated.
+        if cache.radix is None:
+            cache.bind_radix(radix)
+        handle = cache.fork_dual_pool_for_hit(entry)
+        if handle is None:
+            return False
+        seq._v4_dual_handle = handle
+        seq._v4_dual_radix = radix
+        seq.swa_block_table = list(handle.swa_blocks)
+        seq.comp_block_table = list(handle.comp_blocks)
+        return True
+
+    def _v4_maybe_save_prefix(
+        self, seq: Sequence, *, batch_slot: int = 0, radix: Optional[RadixCache] = None
+    ) -> None:
+        """Snapshot official KV after a completed prompt prefill.
+
+        Phase 0c: dual-write packed SWA+compressed pages into ``radix``. The
+        prefix cache takes an extra refcount; the sequence keeps the original
+        allocate-ref and releases it on finish. Restore still uses CPU snapshots.
+        """
         cache = self._v4_prefix_cache
         if cache is None or self.model is None:
             return
@@ -841,11 +890,75 @@ class ModelRunner:
         buffers = snapshot_v4_kv(self.model, batch_slot=batch_slot)
         if not buffers:
             return
+
+        if radix is not None and cache.radix is None:
+            cache.bind_radix(radix)
+
+        swa_ids: List[int] = []
+        comp_ids: List[int] = []
+        dual_tokens = 0
+        dual_layers = 0
+        if radix is not None and (
+            radix.packed_swa_cache is not None or radix.packed_kv_cache is not None
+        ):
+            try:
+                from .v4_dual_pool import dual_write_from_model
+
+                handle = dual_write_from_model(
+                    self.model,
+                    radix,
+                    batch_slot=batch_slot,
+                    n_tokens=int(seq.cached_len),
+                )
+                if handle is not None:
+                    swa_ids = list(handle.swa_blocks)
+                    comp_ids = list(handle.comp_blocks)
+                    dual_tokens = int(handle.n_tokens)
+                    dual_layers = int(handle.n_layers_written)
+                    # Sequence keeps the allocate-ref; cache.insert will fork.
+                    seq.swa_block_table = list(swa_ids)
+                    seq.comp_block_table = list(comp_ids)
+                    seq._v4_dual_handle = handle
+                    seq._v4_dual_radix = radix
+            except Exception as e:
+                # Dual-write is best-effort; CPU snapshot remains the restore path.
+                print(f"[sglang-lite] v4 dual-write skipped: {e}")
+
         cache.insert(
             seq.input_ids[: seq.cached_len],
             last_logits=seq.last_logits,
             buffers=buffers,
+            swa_block_ids=swa_ids,
+            comp_block_ids=comp_ids,
+            dual_pool_tokens=dual_tokens,
+            dual_pool_layers=dual_layers,
         )
+
+    def _v4_dual_append_decode(
+        self, seq: Sequence, *, batch_slot: int = 0, radix: Optional[RadixCache] = None
+    ) -> None:
+        """Best-effort append the latest decode token into dual-pool pages."""
+        handle = getattr(seq, "_v4_dual_handle", None)
+        radix = radix or getattr(seq, "_v4_dual_radix", None)
+        if handle is None or radix is None or self.model is None:
+            return
+        if seq.cached_len <= 0:
+            return
+        pos = int(seq.cached_len) - 1
+        try:
+            from .v4_dual_pool import dual_append_from_model
+
+            dual_append_from_model(
+                self.model,
+                radix,
+                handle,
+                batch_slot=batch_slot,
+                pos=pos,
+            )
+            seq.swa_block_table = list(handle.swa_blocks)
+            seq.comp_block_table = list(handle.comp_blocks)
+        except Exception:
+            pass
 
     def _model_forward_paged(
         self,

@@ -56,3 +56,7 @@ def test_dsv4_packed_allocates_uint8_pool():
     assert cache.packed_kv_cache is not None
     assert cache.packed_kv_cache.dtype == torch.uint8
     assert cache.packed_kv_cache.shape[-1] == 584
+    # Phase 0c: SWA packed implies paired compressed packed pool.
+    assert cache.packed_swa_cache is not None
+    assert cache.packed_comp_cache is not None
+    assert cache.packed_comp_cache.shape[-1] == 584

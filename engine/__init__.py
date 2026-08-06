@@ -1,4 +1,5 @@
 from .kv_cache import KVBlock, KvLayout, KvLayoutKind, RadixCache
+from .v4_dual_pool import DualPoolHandle, dual_write_from_bf16
 from .scheduler import Scheduler, Sequence
 from .runner import ModelRunner, MoEModelRunner
 from .core import LiteEngine
@@ -12,6 +13,8 @@ __all__ = [
     "KVBlock",
     "KvLayout",
     "KvLayoutKind",
+    "DualPoolHandle",
+    "dual_write_from_bf16",
     "Scheduler",
     "Sequence",
     "ModelRunner",

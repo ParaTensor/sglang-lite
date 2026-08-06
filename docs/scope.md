@@ -18,8 +18,8 @@ official `inference/` + leaf kernels (FlashInfer/sgl-kernel); see `docs/deepseek
 | 路径 | 当前阶段 | KV / prefix | Decode 内核 | 备注 |
 |------|----------|-------------|-------------|------|
 | Mixtral / Qwen-MoE 等 | Phase 0 已验 | Radix paged K/V + `last_logits`；CUDA 上 FlashInfer paged 为 sole attention 源 | HF / FlashInfer paged；MoE 叶子仍 P1 | CPU 仍可从 page 重建 HF attn |
-| DeepSeek-V4-Flash | **Phase 0b**（稳态） | Hybrid：官方 Attention 缓冲 + CPU 快照 prefix（非 Radix 双池真写） | 官方 `sparse_attn`；FI SM120 blocked | 见 `docs/deepseek-v4-flash-plan.md` §6.2 / §8 |
-| 目标态（健全引擎） | Phase 0c → 1 → 2 | Owned Radix 双池真写/COW；`cache_hit_tokens` = 真实跳过 prefill | KernelBackend capability 路由；官方核仅回退 | §8 验收表；不扩大 vLLM 功能面 |
+| DeepSeek-V4-Flash | **Phase 0c 切片1–2** | CPU 快照仍负责 restore；dual-pool **双写 + cache 持有 + hit fork + decode append** | 官方 `sparse_attn`；FI SM120 blocked | plan §8.2.1–8.2.2；下一刀 page restore |
+| 目标态（健全引擎） | Phase 0c 后续 → 1 → 2 | Owned Radix 双池 **为源** restore/COW；`cache_hit_tokens` = 真实跳过 prefill | KernelBackend capability 路由；官方核仅回退 | §8 验收表；不扩大 vLLM 功能面 |
 
 Scheduler groups requests; the runner issues **tensor-batched** forwards when sequences share
 the same `cached_len` (and prefill new-length). V4 下一实现重点是 Phase **0c**（自持 KV），

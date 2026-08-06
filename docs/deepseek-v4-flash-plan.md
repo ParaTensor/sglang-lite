@@ -519,7 +519,7 @@ Phase0 HybridMVP → Phase0b Stabilize → Phase0c OwnKV → Phase1 OwnKernels �
 | TP SSE 硬化 | **done** | 专用 CUDA 线程；`v4_remote_acceptance.sh` 手工闸门 |
 | Radix 双池 / FI 换核 | **不做**（本阶段） | 见 0c / 1 |
 
-### 8.2 Phase 0c — 自持 KV（下一实现大 PR）
+### 8.2 Phase 0c — 自持 KV（进行中）
 
 目标：去掉「官方 Attention 缓冲 + CPU 整包快照」作为唯一 prefix 路径。
 
@@ -529,6 +529,30 @@ Phase0 HybridMVP → Phase0b Stabilize → Phase0c OwnKV → Phase1 OwnKernels �
 - Scheduler：多 slot 与 `cached_len` 分组在 V4 上正确；结束必释放 page。
 
 验收：二次同前缀 `cache_hit_tokens > 0` 且 prefill forward tokens 下降；取消/结束无泄漏。
+
+#### 8.2.1 切片 1（已落地）— 双池 page API + Hybrid 双写
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| SWA + compressed packed 双池分配 | **done** | `RadixCache.packed_swa_cache` / `packed_comp_cache`；`write_packed_kv` / `read_packed_kv` |
+| COW / release 覆盖双池 | **done** | `cow_block_if_shared` / `release_blocks` 同步拷贝与清零 |
+| 导出 API | **done** | `engine/v4_dual_pool.py`：`dual_write_from_bf16` / `dual_write_from_model` |
+| Hybrid prefill 后双写 | **done** | `_v4_maybe_save_prefix(..., radix=)` best-effort 导出；**restore 仍走 CPU snapshot** |
+| 结束释放 dual pages | **done** | `v4_release_seq` → `release_dual_pool_pages` |
+| 单测 | **done** | `tests/test_v4_dual_pool.py`、`test_kv_layout` 扩展 |
+
+#### 8.2.2 切片 2（已落地）— 双池生命周期 + hit fork + decode append
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| Prefix cache 持有 dual page ref | **done** | `V4PrefixCache.bind_radix` + insert `fork_blocks`；evict/replace/clear 释放 |
+| Seq 与 cache 所有权分离 | **done** | 写入 seq 保留 allocate-ref；cache 额外 fork；finish 只放 seq fork |
+| Hit 路径 fork dual pages | **done** | admit → `v4_attach_dual_pool_from_entry` / `fork_dual_pool_for_hit`；`dual_hit_count` |
+| Decode dual-append | **done** | `_v4_dual_append_decode` → `dual_append_from_model`（best-effort 扩页） |
+| 可观测 | **done** | `get_stats()["dual_pool"]` + `v4_prefix` dual_* 计数 |
+| 单测 | **done** | `tests/test_v4_dual_pool_lifecycle.py` |
+
+**仍未做（0c-3）**：从 dual-pool **unpack/restore** 官方 buffer（去掉 CPU 快照为唯一源）；page 为 attention 源；PRO6000 真机 dual_write/hit 数字回填。
 
 ### 8.3 Phase 1 — 自持 decode 内核 + MoE
 

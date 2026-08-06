@@ -141,9 +141,10 @@ sglang-lite 强调高内聚与整洁，**根目录严禁堆放非核心内容**�
 
 ## 当前阶段
 
-当前处于 **Phase 0b**（稳态与门禁：UTF-8 增量 decode、logits 软门槛、TP SSE 可验收）。
-V4 Hybrid MVP（官方 forward + CPU 快照 prefix）已落地；下一实现大 PR 为
-**Phase 0c**（自持 Radix 双池 KV），再进入 Phase 1 换核 / Phase 2 生产硬化。
+当前处于 **Phase 0c**（自持 KV，切片 1–2 已落地：双池 packed 写入、Hybrid 双写、
+prefix cache 页所有权/hit fork、decode dual-append；**restore 仍走 CPU 快照**）。
+Phase 0b 稳态门禁保留。下一切片 0c-3：从 dual-pool page restore / 以 Radix 为源；
+再 Phase 1 换核 / Phase 2 生产硬化。
 
 阶段定义与验收见 [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) **§8**。
 

@@ -146,10 +146,11 @@ UniGateway owns cross-backend routing, auth, rate limits, global policy, and agg
 - Prefill-final logits gate (`scripts/v4_logits_compare.py`; soft top5 / CVD near-tie)
 - TP process + standalone SSE acceptance (dedicated CUDA thread)
 
-**Phase 0c (Own KV)** — next large PR
+**Phase 0c (Own KV)** — in progress (slices 1–2)
 
-- V4 Radix dual-pool (compressed + SWA / `dsv4_packed`) true write/read/COW
-- Drop CPU whole-buffer snapshot as the only prefix path
+- Dual-pool packed SWA+compressed page API + Hybrid dual-write
+- Prefix-cache page ownership, hit COW fork, decode dual-append
+- Restore still uses CPU snapshots; next (0c-3) makes pages source-of-truth
 - See [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) §8.2
 
 **Phase 1 (Own kernels + production hardening path)**

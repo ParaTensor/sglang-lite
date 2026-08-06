@@ -64,17 +64,38 @@ class EngineLoop:
             # Modest page pool for the HF-cache prototype (paged tensors are mirrors only).
             # Full 64k prealloc is too large for tiny CPU fixtures / single-GPU demos.
             max_tokens = 4096 if runner.device == "cpu" else 16384
+            layout = getattr(runner, "_kv_layout", None)
+            swa_layout = getattr(runner, "_swa_layout", None)
+            # Phase 0c: V4 Hybrid dual-write needs DSV4 packed SWA + compressed pools.
+            compressed_layout = None
+            if getattr(runner, "_v4_hybrid", False):
+                from .kv_cache import KvLayout
+
+                swa_layout = swa_layout or KvLayout.dsv4_packed(584)
+                compressed_layout = KvLayout.dsv4_packed(584)
+                # Prefer page_size 64 for DSV4 FI layout; keep 16 for standard MHA.
+                block_size = 64 if swa_layout is not None else 16
+            else:
+                block_size = 16
             radix = RadixCache(
                 max_tokens=max_tokens,
-                block_size=16,
+                block_size=block_size,
                 num_layers=runner.num_layers,
                 num_kv_heads=runner.num_kv_heads,
                 head_dim=runner.head_dim,
                 dtype=getattr(runner, "torch_dtype", None)
                 or (torch.float32 if runner.device == "cpu" else torch.bfloat16),
                 device=runner.device if runner.device != "cpu" else "cpu",
+                layout=layout,
+                swa_layout=swa_layout,
+                compressed_layout=compressed_layout,
             )
         self.radix = radix
+        # Phase 0c: bind dual-pool page refcounting into the Hybrid prefix store.
+        # Note: empty V4PrefixCache is falsy via __len__; always test ``is not None``.
+        _v4pc = getattr(runner, "_v4_prefix_cache", None)
+        if getattr(runner, "_v4_hybrid", False) and _v4pc is not None:
+            _v4pc.bind_radix(self.radix)
         self.scheduler = Scheduler(
             self.radix,
             max_batch_size=max_batch_size,
@@ -225,6 +246,10 @@ class EngineLoop:
                         seq.last_logits = entry.last_logits
                         seq._v4_prefix_entry = entry
                         seq._v4_kv_pending_restore = True
+                        # Phase 0c: fork dual-pool pages for this hit (COW refs).
+                        self.runner.v4_attach_dual_pool_from_entry(
+                            seq, entry, self.radix
+                        )
                     else:
                         seq.cached_len = 0
                         seq.cache_hit_tokens = 0
@@ -517,4 +542,20 @@ class EngineLoop:
                 "none",
             ),
             "v4_hybrid": bool(getattr(self.runner, "_v4_hybrid", False)),
+            "v4_prefix": (
+                self.runner._v4_prefix_cache.get_stats()
+                if getattr(self.runner, "_v4_prefix_cache", None) is not None
+                else {}
+            ),
+            "dual_pool": {
+                k: self.radix.get_cache_stats().get(k)
+                for k in (
+                    "dual_write_count",
+                    "dual_write_tokens",
+                    "dual_hit_count",
+                    "dual_append_count",
+                    "has_packed_swa",
+                    "has_packed_comp",
+                )
+            },
         }
