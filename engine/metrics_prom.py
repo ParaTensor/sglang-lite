@@ -31,14 +31,15 @@ def render_prometheus(
     cache = dict(stats.get("cache") or {})
     dual = dict(stats.get("dual_pool") or {})
     v4p = dict(stats.get("v4_prefix") or {})
+    lat = dict(stats.get("latency") or {})
 
     lines: List[str] = [
         "# HELP sglang_lite_up Engine process up",
         "# TYPE sglang_lite_up gauge",
         "sglang_lite_up 1",
-        "# HELP sglang_lite_ready 1 if engine accepted load",
+        "# HELP sglang_lite_ready 1 if engine accepted load and not draining",
         "# TYPE sglang_lite_ready gauge",
-        f"sglang_lite_ready {_num(ready or stats.get('ready')):.0f}",
+        f"sglang_lite_ready {_num(ready and stats.get('ready', ready)):.0f}",
         "# HELP sglang_lite_waiting_requests Scheduler waiting queue length",
         "# TYPE sglang_lite_waiting_requests gauge",
         f"sglang_lite_waiting_requests {_num(stats.get('waiting')):.0f}",
@@ -97,10 +98,51 @@ def render_prometheus(
         "# HELP sglang_lite_prefix_dual_primary Entries stored as dual_primary slim",
         "# TYPE sglang_lite_prefix_dual_primary gauge",
         f"sglang_lite_prefix_dual_primary {_num(v4p.get('prefix_dual_primary')):.0f}",
+        # Phase 2: latency
+        "# HELP sglang_lite_draining 1 if engine rejects new requests",
+        "# TYPE sglang_lite_draining gauge",
+        f"sglang_lite_draining {_num(stats.get('draining')):.0f}",
+        "# HELP sglang_lite_requests_completed_total Finished generate requests",
+        "# TYPE sglang_lite_requests_completed_total counter",
+        f"sglang_lite_requests_completed_total {_num(lat.get('requests_completed')):.0f}",
+        "# HELP sglang_lite_completion_tokens_total Completion tokens emitted",
+        "# TYPE sglang_lite_completion_tokens_total counter",
+        f"sglang_lite_completion_tokens_total {_num(lat.get('completion_tokens_total')):.0f}",
+        "# HELP sglang_lite_ttft_seconds_sum Sum of time-to-first-token (s)",
+        "# TYPE sglang_lite_ttft_seconds_sum counter",
+        f"sglang_lite_ttft_seconds_sum {_num(lat.get('ttft_sum_s'))}",
+        "# HELP sglang_lite_ttft_seconds_count TTFT sample count",
+        "# TYPE sglang_lite_ttft_seconds_count counter",
+        f"sglang_lite_ttft_seconds_count {_num(lat.get('ttft_count')):.0f}",
+        "# HELP sglang_lite_ttft_seconds_avg Mean TTFT (s)",
+        "# TYPE sglang_lite_ttft_seconds_avg gauge",
+        f"sglang_lite_ttft_seconds_avg {_num(lat.get('ttft_avg_s'))}",
+        "# HELP sglang_lite_ttft_seconds_last Last request TTFT (s)",
+        "# TYPE sglang_lite_ttft_seconds_last gauge",
+        f"sglang_lite_ttft_seconds_last {_num(lat.get('last_ttft_s'))}",
+        "# HELP sglang_lite_tok_s_avg Mean decode tokens/s (completed requests)",
+        "# TYPE sglang_lite_tok_s_avg gauge",
+        f"sglang_lite_tok_s_avg {_num(lat.get('tok_s_avg'))}",
+        "# HELP sglang_lite_tok_s_last Last request decode tokens/s",
+        "# TYPE sglang_lite_tok_s_last gauge",
+        f"sglang_lite_tok_s_last {_num(lat.get('last_tok_s'))}",
+        # TTFT coarse cumulative buckets (no label cardinality)
+        "# HELP sglang_lite_ttft_bucket_le_0_1s TTFT samples <= 0.1s",
+        "# TYPE sglang_lite_ttft_bucket_le_0_1s counter",
+        f"sglang_lite_ttft_bucket_le_0_1s {_num(lat.get('ttft_le_0_1')):.0f}",
+        "# HELP sglang_lite_ttft_bucket_le_0_5s TTFT samples <= 0.5s",
+        "# TYPE sglang_lite_ttft_bucket_le_0_5s counter",
+        f"sglang_lite_ttft_bucket_le_0_5s {_num(lat.get('ttft_le_0_5')):.0f}",
+        "# HELP sglang_lite_ttft_bucket_le_1s TTFT samples <= 1s",
+        "# TYPE sglang_lite_ttft_bucket_le_1s counter",
+        f"sglang_lite_ttft_bucket_le_1s {_num(lat.get('ttft_le_1')):.0f}",
+        "# HELP sglang_lite_ttft_bucket_le_5s TTFT samples <= 5s",
+        "# TYPE sglang_lite_ttft_bucket_le_5s counter",
+        f"sglang_lite_ttft_bucket_le_5s {_num(lat.get('ttft_le_5')):.0f}",
+        "# HELP sglang_lite_ttft_bucket_le_inf TTFT samples (total)",
+        "# TYPE sglang_lite_ttft_bucket_le_inf counter",
+        f"sglang_lite_ttft_bucket_le_inf {_num(lat.get('ttft_le_inf')):.0f}",
     ]
-    # Backend names as info-like gauges (1) with fixed metric names only — encode
-    # backend id in the metric suffix would explode cardinality; expose length-0
-    # text via comments instead for humans scraping raw /metrics.
     sparse = str(stats.get("sparse_mla_backend") or "none")
     moe = str(stats.get("moe_gemm_backend") or "none")
     arch = str(stats.get("arch_family") or "unknown")

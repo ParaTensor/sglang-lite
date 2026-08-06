@@ -245,6 +245,13 @@ class LiteEngine:
     def cancel(self, request_id: str) -> bool:
         return self.loop.cancel(request_id)
 
+    def begin_drain(self) -> Dict:
+        """Stop accepting new requests; drain in-flight work."""
+        return self.loop.begin_drain()
+
+    def drain_status(self) -> Dict:
+        return self.loop.drain_status()
+
     def get_stats(self) -> Dict:
         return self.loop.get_stats()
 

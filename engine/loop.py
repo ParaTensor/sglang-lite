@@ -113,18 +113,44 @@ class EngineLoop:
         self._lock = threading.Lock()
         self._ready = False
         self._stopping = False
+        # Phase 2: reject new submits while draining in-flight work.
+        self._draining = False
         self._thread: Optional[threading.Thread] = None
         self.steps = 0
         self.multi_request_batches = 0
+        # Phase 2 latency aggregates (seconds / counts).
+        self.latency: Dict[str, float] = {
+            "requests_completed": 0.0,
+            "completion_tokens_total": 0.0,
+            "ttft_sum_s": 0.0,
+            "ttft_count": 0.0,
+            "ttft_le_0_1": 0.0,
+            "ttft_le_0_25": 0.0,
+            "ttft_le_0_5": 0.0,
+            "ttft_le_1": 0.0,
+            "ttft_le_2": 0.0,
+            "ttft_le_5": 0.0,
+            "ttft_le_inf": 0.0,
+            "request_duration_sum_s": 0.0,
+            "decode_duration_sum_s": 0.0,
+            "decode_tokens_total": 0.0,
+            "last_ttft_s": 0.0,
+            "last_tok_s": 0.0,
+        }
 
     @property
     def ready(self) -> bool:
-        return self._ready
+        return self._ready and not self._draining and not self._stopping
+
+    @property
+    def draining(self) -> bool:
+        return self._draining or self._stopping
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stopping = False
+        self._draining = False
         self._thread = threading.Thread(target=self._run, name="sglang-lite-engine-loop", daemon=True)
         self._thread.start()
         self._ready = True
@@ -132,8 +158,32 @@ class EngineLoop:
     def mark_ready(self) -> None:
         """Mark ready without a background thread (TP sync / pump_until_idle)."""
         self._ready = True
+        self._draining = False
+
+    def begin_drain(self) -> Dict[str, Any]:
+        """Stop accepting new requests; keep pumping in-flight work.
+
+        Returns current drain snapshot. Callers poll :meth:`drain_status` until
+        ``idle`` is true, then :meth:`stop`.
+        """
+        self._draining = True
+        return self.drain_status()
+
+    def drain_status(self) -> Dict[str, Any]:
+        pending = self._submit_q.qsize()
+        waiting = len(self.scheduler.waiting)
+        running = len(self.scheduler.running)
+        idle = pending == 0 and waiting == 0 and running == 0
+        return {
+            "draining": self.draining,
+            "pending": pending,
+            "waiting": waiting,
+            "running": running,
+            "idle": idle,
+        }
 
     def stop(self, drain: bool = True) -> None:
+        self._draining = True
         self._stopping = True
         self._submit_q.put(None)
         if self._thread:
@@ -141,7 +191,7 @@ class EngineLoop:
         self._ready = False
 
     def submit(self, request_id: str, input_ids: List[int], params: Optional[GenParams] = None) -> SubmitResult:
-        if self._stopping:
+        if self._stopping or self._draining:
             raise RuntimeError("engine is draining; not accepting new requests")
         params = params or GenParams()
         if params.max_tokens <= 0:
@@ -303,6 +353,42 @@ class EngineLoop:
             "cache_hit_tokens": int(getattr(seq, "cache_hit_tokens", 0) or 0),
         }
 
+    def _record_first_token(self, seq: Sequence) -> None:
+        """Record TTFT on first completion token of a request."""
+        if seq.first_token_ts is not None:
+            return
+        now = time.time()
+        seq.first_token_ts = now
+        ttft = max(0.0, now - float(seq.created_ts))
+        self.latency["ttft_sum_s"] += ttft
+        self.latency["ttft_count"] += 1.0
+        self.latency["last_ttft_s"] = ttft
+        self.latency["ttft_le_inf"] += 1.0
+        for le, key in (
+            (0.1, "ttft_le_0_1"),
+            (0.25, "ttft_le_0_25"),
+            (0.5, "ttft_le_0_5"),
+            (1.0, "ttft_le_1"),
+            (2.0, "ttft_le_2"),
+            (5.0, "ttft_le_5"),
+        ):
+            if ttft <= le:
+                self.latency[key] += 1.0
+
+    def _record_request_finished(self, seq: Sequence) -> None:
+        """Aggregate e2e duration and decode tok/s when a request completes."""
+        now = time.time()
+        n = len(seq.output_ids)
+        dur = max(now - float(seq.created_ts), 1e-9)
+        self.latency["requests_completed"] += 1.0
+        self.latency["completion_tokens_total"] += float(n)
+        self.latency["request_duration_sum_s"] += dur
+        if n > 0 and seq.first_token_ts is not None:
+            gen_dur = max(now - float(seq.first_token_ts), 1e-9)
+            self.latency["decode_duration_sum_s"] += gen_dur
+            self.latency["decode_tokens_total"] += float(n)
+            self.latency["last_tok_s"] = float(n) / gen_dur
+
     def _apply_stop_and_limits(
         self, seq: Sequence, tok: int, prev_text: str
     ) -> tuple[bool, str, Optional[int]]:
@@ -371,6 +457,7 @@ class EngineLoop:
             except Exception as e:
                 for seq in batch:
                     self.scheduler.mark_finished(seq, "error")
+                    self._record_request_finished(seq)
                     self._emit(
                         seq.request_id,
                         {
@@ -389,6 +476,7 @@ class EngineLoop:
                 with self._lock:
                     if seq.request_id in self._cancelled:
                         self.scheduler.mark_finished(seq, "cancelled")
+                        self._record_request_finished(seq)
                         self._emit(
                             seq.request_id,
                             {
@@ -412,6 +500,10 @@ class EngineLoop:
                 prev = self._prev_text.get(seq.request_id, "")
                 finished, delta_text, emit_tok = self._apply_stop_and_limits(seq, tok, prev)
                 self._prev_text[seq.request_id] = self.runner.detokenize(seq.output_ids)
+                if emit_tok is not None or delta_text:
+                    self._record_first_token(seq)
+                if finished:
+                    self._record_request_finished(seq)
 
                 payload = {
                     "text": delta_text,
@@ -439,6 +531,7 @@ class EngineLoop:
         except Exception as e:
             for seq in batch:
                 self.scheduler.mark_finished(seq, "error")
+                self._record_request_finished(seq)
                 self._emit(
                     seq.request_id,
                     {
@@ -457,6 +550,7 @@ class EngineLoop:
             with self._lock:
                 if seq.request_id in self._cancelled:
                     self.scheduler.mark_finished(seq, "cancelled")
+                    self._record_request_finished(seq)
                     self._emit(
                         seq.request_id,
                         {
@@ -479,6 +573,10 @@ class EngineLoop:
             prev = self._prev_text.get(seq.request_id, "")
             finished, delta_text, emit_tok = self._apply_stop_and_limits(seq, tok, prev)
             self._prev_text[seq.request_id] = self.runner.detokenize(seq.output_ids)
+            if emit_tok is not None or delta_text:
+                self._record_first_token(seq)
+            if finished:
+                self._record_request_finished(seq)
 
             payload = {
                 "text": delta_text,
@@ -506,12 +604,22 @@ class EngineLoop:
                 time.sleep(self.idle_sleep_s)
 
     def get_stats(self) -> Dict[str, Any]:
+        lat = dict(self.latency)
+        ttft_n = lat.get("ttft_count") or 0.0
+        lat["ttft_avg_s"] = (
+            (lat["ttft_sum_s"] / ttft_n) if ttft_n > 0 else 0.0
+        )
+        dec_tok = lat.get("decode_tokens_total") or 0.0
+        dec_dur = lat.get("decode_duration_sum_s") or 0.0
+        lat["tok_s_avg"] = (dec_tok / dec_dur) if dec_dur > 0 else 0.0
         return {
-            "ready": self._ready,
+            "ready": self.ready,
+            "draining": self.draining,
             "waiting": len(self.scheduler.waiting),
             "running": len(self.scheduler.running),
             "steps": self.steps,
             "multi_request_batches": self.multi_request_batches,
+            "latency": lat,
             "last_batch_trace": list(self.scheduler.last_batch_trace),
             "cache": self.radix.get_cache_stats(),
             "model": self.runner.model_name,

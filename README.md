@@ -158,10 +158,11 @@ UniGateway owns cross-backend routing, auth, rate limits, global policy, and agg
 - Production default: official TileLang `sparse_attn` (`DISABLE_FI_SPARSE=1`)
 - FI SM120: numerical OK (Path A), e2e slower with Hybrid pack; FORCE only
 
-**Phase 2 (Production hardening)** — in progress (slice 1)
+**Phase 2 (Production hardening)** — in progress (slices 1–2)
 
-- Prometheus: `engine/metrics_prom.py` + process `GET /metrics` (dual_stage, cache, queue)
-- Next: TTFT/t/s histograms, graceful drain, structured request-id logs
+- Prometheus: dual_pool/0c + **TTFT / tok/s** (`metrics_prom` + process `/metrics`)
+- **Graceful drain**: `POST /v1/drain`, readyz=503 while draining; submit rejected
+- Next: structured request-id logs, soak, multi-MoE regression
 
 **Phase 2**
 

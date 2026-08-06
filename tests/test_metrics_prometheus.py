@@ -36,6 +36,22 @@ def test_render_includes_dual_stage_and_core_gauges():
             "prefix_dual_primary": 1,
             "dual_hit_count": 1,
         },
+        "draining": False,
+        "latency": {
+            "requests_completed": 3,
+            "completion_tokens_total": 30,
+            "ttft_sum_s": 0.6,
+            "ttft_count": 3,
+            "ttft_avg_s": 0.2,
+            "last_ttft_s": 0.15,
+            "tok_s_avg": 12.0,
+            "last_tok_s": 11.0,
+            "ttft_le_0_1": 0,
+            "ttft_le_0_5": 3,
+            "ttft_le_1": 3,
+            "ttft_le_5": 3,
+            "ttft_le_inf": 3,
+        },
     }
     body = render_prometheus(stats, ready=True, tp_world_size=8)
     assert "sglang_lite_up 1" in body
@@ -45,11 +61,15 @@ def test_render_includes_dual_stage_and_core_gauges():
     assert "sglang_lite_tp_world_size 8" in body
     assert "sglang_lite_v4_hybrid 1" in body
     assert "official_sparse_attn" in body
+    assert "sglang_lite_ttft_seconds_avg 0.2" in body
+    assert "sglang_lite_tok_s_avg 12" in body
+    assert "sglang_lite_requests_completed_total 3" in body
 
     flat = metrics_dict_from_stats(stats)
     assert flat["sglang_lite_dual_stage_count"] == 14.0
     assert flat["sglang_lite_cache_hit_count"] == 4.0
     assert flat["sglang_lite_waiting_requests"] == 1.0
+    assert flat["sglang_lite_ttft_seconds_count"] == 3.0
 
 
 def test_render_empty_stats_safe():

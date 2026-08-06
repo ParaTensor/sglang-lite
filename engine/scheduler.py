@@ -23,6 +23,8 @@ class Sequence:
     last_logits: Optional[object] = None  # torch.Tensor; logits after last prompt token
     created_ts: float = field(default_factory=time.time)
     last_token_ts: float = field(default_factory=time.time)
+    # Phase 2: first completion token wall time (for TTFT).
+    first_token_ts: Optional[float] = None
     finished: bool = False
     finish_reason: str = ""
     prefill_tokens: int = 0

@@ -741,8 +741,20 @@ UniGateway 仅协议/metrics 联调，不引入业务逻辑进 engine。
 | v4_hybrid + TP world | **done** | gauges |
 | 单测 | **done** | `tests/test_metrics_prometheus.py` |
 
-控制面 `control` 仍可代理 `engine-url/metrics`。后续切片：TTFT/t/s 直方图、
-drain、结构化 request-id 日志。
+控制面 `control` 仍可代理 `engine-url/metrics`。
+
+#### 8.4.2 切片 2（已落地）— TTFT / tok/s + graceful drain
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| TTFT | **done** | 首 completion token 时记 `first_token_ts`；sum/count/avg/last + 粗桶 |
+| tok/s | **done** | 完成请求的 decode tokens / (finish−first_token)；avg/last |
+| Prometheus | **done** | `ttft_seconds_*`、`tok_s_*`、`requests_completed_total`、`completion_tokens_total` |
+| Drain | **done** | `EngineLoop.begin_drain` / `drain_status`；process `POST/GET /v1/drain` |
+| Ready | **done** | drain 中 `GET /readyz` → 503 `draining`；`submit` 拒绝新请求 |
+| 单测 | **done** | `tests/test_latency_drain.py` |
+
+后续：结构化 request-id 日志、长稳 soak、Mixtral/Qwen 回归。
 
 ### 8.5 明确永远不做
 

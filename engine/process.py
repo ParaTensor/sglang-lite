@@ -151,7 +151,15 @@ async def healthz():
 
 @app.get("/readyz")
 async def readyz():
-    if not READY or LOOP is None or not LOOP.ready:
+    if LOOP is None or not READY:
+        return JSONResponse({"status": "not_ready"}, status_code=503)
+    if LOOP.draining:
+        st = LOOP.drain_status()
+        return JSONResponse(
+            {"status": "draining", "model": MODEL_NAME, **st},
+            status_code=503,
+        )
+    if not LOOP.ready:
         return JSONResponse({"status": "not_ready"}, status_code=503)
     return {
         "status": "ready",
@@ -198,11 +206,42 @@ async def cancel(req: CancelRequest):
     return {"ok": ok, "request_id": req.request_id, "tp": _TP_MODE}
 
 
+@app.post("/v1/drain")
+async def drain():
+    """Phase 2: reject new requests; keep serving in-flight until idle.
+
+    Poll ``GET /v1/drain`` or ``GET /readyz`` (503 + draining) until idle, then
+    stop the process externally if desired.
+    """
+    if LOOP is None:
+        return JSONResponse({"ok": False, "error": "no engine"}, status_code=503)
+    snap = LOOP.begin_drain()
+    return {"ok": True, "tp": _TP_MODE, **snap}
+
+
+@app.get("/v1/drain")
+async def drain_status():
+    if LOOP is None:
+        return JSONResponse({"ok": False}, status_code=503)
+    return {"ok": True, **LOOP.drain_status()}
+
+
 @app.post("/v1/generate")
 async def generate(req: GenerationRequest, request: Request):
     if LOOP is None or not READY:
         return JSONResponse(
             {"error": "engine not ready"},
+            status_code=503,
+        )
+    if LOOP.draining:
+        return JSONResponse(
+            {
+                "error": {
+                    "message": "engine is draining; not accepting new requests",
+                    "type": "unavailable",
+                    "code": "draining",
+                }
+            },
             status_code=503,
         )
     if req.model and req.model != MODEL_NAME and req.model not in list_verified_models():
