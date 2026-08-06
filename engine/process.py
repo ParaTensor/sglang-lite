@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .loop import EngineLoop, GenParams
 from .models import list_verified_models, register_verified
+from .reqlog import log_event
 from .runner import ModelRunner
 
 logger = logging.getLogger("sglang_lite.process")
@@ -203,6 +204,7 @@ async def cancel(req: CancelRequest):
     # Local cancel only — TP workers may finish the current pump step; do not
     # take _TP_LOCK (would deadlock with an in-flight generate).
     ok = LOOP.cancel(req.request_id)
+    log_event("http_cancel", request_id=req.request_id, ok=ok, tp=_TP_MODE)
     return {"ok": ok, "request_id": req.request_id, "tp": _TP_MODE}
 
 
@@ -216,6 +218,7 @@ async def drain():
     if LOOP is None:
         return JSONResponse({"ok": False, "error": "no engine"}, status_code=503)
     snap = LOOP.begin_drain()
+    log_event("http_drain", **{k: snap[k] for k in ("pending", "waiting", "running", "idle")})
     return {"ok": True, "tp": _TP_MODE, **snap}
 
 
@@ -278,15 +281,30 @@ async def generate(req: GenerationRequest, request: Request):
 async def _generate_local(req: GenerationRequest, request: Request, input_ids: List[int]):
     assert LOOP is not None
     params = _params_from_req(req)
+    log_event(
+        "http_generate",
+        request_id=req.request_id,
+        stream=req.stream,
+        prompt_tokens=len(input_ids),
+        max_tokens=req.max_tokens,
+        tp=False,
+    )
     try:
         submitted = LOOP.submit(req.request_id, input_ids, params)
     except Exception as e:
+        log_event(
+            "http_generate_reject",
+            request_id=req.request_id,
+            error=str(e),
+            status=429,
+        )
         return JSONResponse({"error": str(e)}, status_code=429)
 
     async def ndjson_stream():
         dq = submitted.delta_queue
         while True:
             if await request.is_disconnected():
+                log_event("http_client_disconnect", request_id=req.request_id)
                 LOOP.cancel(req.request_id)
                 break
             try:
@@ -352,6 +370,14 @@ def _start_tp_cuda_thread() -> None:
 async def _generate_tp(req: GenerationRequest, request: Request, input_ids: List[int]):
     """Rank-0 only: enqueue CUDA work, stream NDJSON deltas."""
     assert LOOP is not None
+    log_event(
+        "http_generate",
+        request_id=req.request_id,
+        stream=req.stream,
+        prompt_tokens=len(input_ids),
+        max_tokens=req.max_tokens,
+        tp=True,
+    )
     if _TP_CUDA_Q is None:
         _start_tp_cuda_thread()
     msg = _msg_generate(req, input_ids)
@@ -376,6 +402,7 @@ async def _generate_tp(req: GenerationRequest, request: Request, input_ids: List
         try:
             while True:
                 if await request.is_disconnected():
+                    log_event("http_client_disconnect", request_id=req.request_id, tp=True)
                     LOOP.cancel(req.request_id)
                     break
                 try:

@@ -754,7 +754,24 @@ UniGateway 仅协议/metrics 联调，不引入业务逻辑进 engine。
 | Ready | **done** | drain 中 `GET /readyz` → 503 `draining`；`submit` 拒绝新请求 |
 | 单测 | **done** | `tests/test_latency_drain.py` |
 
-后续：结构化 request-id 日志、长稳 soak、Mixtral/Qwen 回归。
+#### 8.4.3 切片 3（已落地）— request-id 结构化日志
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| `engine/reqlog.py` | **done** | JSON 单行：`ts/event/request_id/...` → logger `sglang_lite.req` |
+| loop 事件 | **done** | submit / first_token / finish / cancel / drain |
+| process HTTP | **done** | generate / reject / disconnect / cancel / drain |
+| Rust control | **done** | `chat_completions_accept` 带 `request_id` |
+| 开关 | **done** | `SGLANG_LITE_LOG_JSON=0` 关闭；默认开 |
+| 单测 | **done** | `tests/test_reqlog.py` |
+
+示例：
+
+```json
+{"ts":...,"event":"request_finish","request_id":"...","finish_reason":"length","completion_tokens":8,"ttft_s":0.12,"tok_s":7.5}
+```
+
+后续：长稳 soak、Mixtral/Qwen 回归、`lite` 预设。
 
 ### 8.5 明确永远不做
 

@@ -200,6 +200,12 @@ pub async fn chat_completions(
     }
 
     let request_id = format!("chatcmpl-{}", Uuid::new_v4());
+    info!(
+        request_id = %request_id,
+        model = %req.model,
+        stream = req.stream.unwrap_or(false),
+        "chat_completions_accept"
+    );
     let created = chrono::Utc::now().timestamp();
 
     let gen_req = GenerationRequest {

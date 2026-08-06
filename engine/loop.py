@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from .kv_cache import RadixCache
+from .reqlog import log_event
 from .runner import ModelRunner
 from .scheduler import Scheduler, Sequence
 
@@ -167,7 +168,15 @@ class EngineLoop:
         ``idle`` is true, then :meth:`stop`.
         """
         self._draining = True
-        return self.drain_status()
+        snap = self.drain_status()
+        log_event(
+            "engine_drain",
+            pending=snap["pending"],
+            waiting=snap["waiting"],
+            running=snap["running"],
+            idle=snap["idle"],
+        )
+        return snap
 
     def drain_status(self) -> Dict[str, Any]:
         pending = self._submit_q.qsize()
@@ -216,6 +225,13 @@ class EngineLoop:
             self._prev_text[request_id] = ""
             self._deadlines[request_id] = time.time() + params.timeout_s
         self._submit_q.put(pending)
+        log_event(
+            "request_submit",
+            request_id=request_id,
+            prompt_tokens=len(input_ids),
+            max_tokens=params.max_tokens,
+            timeout_s=params.timeout_s,
+        )
         # seq filled after admission; return placeholder — caller uses delta_queue
         return SubmitResult(request_id=request_id, delta_queue=dq, seq=None)  # type: ignore[arg-type]
 
@@ -225,6 +241,7 @@ class EngineLoop:
             self._cancelled.add(request_id)
             had_delta = request_id in self._delta_qs
         ok = self.scheduler.cancel(request_id)
+        log_event("request_cancel", request_id=request_id, had_delta=had_delta, ok=ok)
         # Always notify client if we still own a delta queue
         if had_delta or ok:
             self._emit(
@@ -374,6 +391,12 @@ class EngineLoop:
         ):
             if ttft <= le:
                 self.latency[key] += 1.0
+        log_event(
+            "request_first_token",
+            request_id=seq.request_id,
+            ttft_s=ttft,
+            cache_hit_tokens=int(getattr(seq, "cache_hit_tokens", 0) or 0),
+        )
 
     def _record_request_finished(self, seq: Sequence) -> None:
         """Aggregate e2e duration and decode tok/s when a request completes."""
@@ -383,11 +406,27 @@ class EngineLoop:
         self.latency["requests_completed"] += 1.0
         self.latency["completion_tokens_total"] += float(n)
         self.latency["request_duration_sum_s"] += dur
+        tok_s = 0.0
+        ttft_s = None
+        if seq.first_token_ts is not None:
+            ttft_s = max(0.0, float(seq.first_token_ts) - float(seq.created_ts))
         if n > 0 and seq.first_token_ts is not None:
             gen_dur = max(now - float(seq.first_token_ts), 1e-9)
             self.latency["decode_duration_sum_s"] += gen_dur
             self.latency["decode_tokens_total"] += float(n)
-            self.latency["last_tok_s"] = float(n) / gen_dur
+            tok_s = float(n) / gen_dur
+            self.latency["last_tok_s"] = tok_s
+        log_event(
+            "request_finish",
+            request_id=seq.request_id,
+            finish_reason=seq.finish_reason or "stop",
+            completion_tokens=n,
+            prompt_tokens=len(seq.input_ids),
+            cache_hit_tokens=int(getattr(seq, "cache_hit_tokens", 0) or 0),
+            duration_s=dur,
+            ttft_s=ttft_s,
+            tok_s=tok_s if tok_s > 0 else None,
+        )
 
     def _apply_stop_and_limits(
         self, seq: Sequence, tok: int, prev_text: str
