@@ -420,8 +420,8 @@ S5  注册 deepseek_v4 家族：tokenizer 直接引用；模型图 Hybrid
   （不完整多字节空 delta；发散改写不回吐整段；lone `�` 抑制）；
   `SchedulerLoop._apply_stop_and_limits` 全分支走 delta；NDJSON
   `ensure_ascii=True`。单测 `tests/test_detokenize_delta.py`。
-- **下一阶段**：Radix compressed+SWA 双池 COW 真写；FI SM120 换核（等上游
-  absmean≠0）。
+- **下一阶段**：见 **§8 通往健全引擎**（Phase 0c 自持 KV → Phase 1 换核 →
+  Phase 2 生产硬化）。不再把 UTF-8 / logits 门禁当作未完成项。
 
 ### 6.3 SM120 sparse MLA decode 换核（2026-08-05）
 
@@ -445,6 +445,38 @@ S5  注册 deepseek_v4 家族：tokenizer 直接引用；模型图 Hybrid
   调用约定未闭环。hook 零输出探测会回退官方 `sparse_attn`。
   远端直连 GitHub 超时，wheel 需本机下载后 `scp`。
 
+### 6.4 PRO6000（8× RTX PRO 6000 / sm_120，2026-08-06）
+
+Host：`ssh -p 2208 bodesi@39.183.171.3`（`pro6000`）。单卡 ~96GB，compute_cap 12.0。
+
+| 项 | 结果 | 说明 |
+| --- | --- | --- |
+| FI 0.6.16 SM120 sparse MLA | **仍 blocked** | 与 5090 相同：probe **absmean=0**（finite）；换核继续默认关 |
+| MP8 convert | **PASS** | `~/models/ds-v4-mp8`；缺失键仅 MTP（spec 外） |
+| 官方 generate（**宿主** torch 2.11+cu130） | **PASS** | CVD remap + `set_device(0)`；`Hello` → `Hello! How can I help you today?`；prefill top1=`Hello`≈28.9 |
+| 官方 / Hybrid（**Docker** torch 2.9.1+cu129） | **FAIL 数值** | prefill top5=`to`/`:`/`?`，logit~16；soft gate 失败。**非 Hybrid bug**，官方路径同坏 |
+| Hybrid logits 门禁（宿主） | **PASS** | `gate_soft=true`；argmax=`Hello`≈28.27；top5 含 `Hello`/`Hi`/`你好` |
+| SGLang blackwell 镜像 | **SM120 内核不足** | `flash_mla sparse_decode_fwd: Unsupported architecture`；`latest` 亦无 sm_120 |
+
+**关键环境结论（PRO6000）**
+
+1. **必须在宿主 venv 跑数值路径**：`torch==2.11.0+cu130` + 系统 CUDA 13.0 + `tilelang==0.1.8` + `apache-tvm-ffi==0.1.9` + 自编译 `fast_hadamard_transform`（`TORCH_CUDA_ARCH_LIST=12.0`）。Docker `lmsysorg/sglang:deepseek-v4-blackwell`（cu129 / torch 2.9）在本机 **sm_120 上数值不可用**，不得作为 Hybrid 验收 runtime。
+2. TileLang 仍需 **CVD=`LOCAL_RANK` → 每进程仅见 `cuda:0`**；官方 `generate.py` 的 `set_device(local_rank)` 在 CVD 后须改为 `set_device(0)`（见 `~/bench/host_gen_cvd.py`）。
+3. 宿主 venv 建议：`source ~/venvs/sglang-lite/bin/activate`；`SGLANG_LITE_FI_PREFIX=`（空，避免 `/tmp/fi1616` 残缺 jit-cache 干扰 import）；`SGLANG_LITE_V4_DISABLE_FI_SPARSE=1`。
+4. 装 `flashinfer-python` 时务必 **`--no-deps`**，否则会把 torch 降到 2.9.x / 混入 cu12 NCCL 导致 `undefined symbol: ncclDevCommDestroy`。
+
+复现门禁：
+
+```bash
+source ~/venvs/sglang-lite/bin/activate
+export PATH=/usr/local/cuda/bin:$PATH CUDA_HOME=/usr/local/cuda CPATH=/usr/local/cuda/include
+export SGLANG_LITE_DSV4_HF=~/models/DeepSeek-V4-Flash-0731
+export SGLANG_LITE_DSV4_CONVERTED=~/models/ds-v4-mp8
+export SGLANG_LITE_V4_DISABLE_FI_SPARSE=1 SGLANG_LITE_FI_PREFIX=
+torchrun --nproc-per-node=8 scripts/v4_logits_compare.py --prompt Hello --out ~/bench/v4_logits_host.json
+# 期望 gate_soft=true，lite_argmax_text 含 Hello 或 你好
+```
+
 ## 7. 风险与开放问题
 
 - V4-Flash 的 CSA/HCA、FP4 expert、mHC 细节以官方 `inference/` 参考实现为准，
@@ -457,3 +489,62 @@ S5  注册 deepseek_v4 家族：tokenizer 直接引用；模型图 Hybrid
   需要在 S2/S5 单独验证；
 - vLLM `#43477` / 社区 `#41834` 仅作叶子路由参考，不扩大 sglang-lite 到
   DSpark/宽功能面。
+
+## 8. 通往健全引擎（阶段定义与验收）
+
+「健全」在本项目的窄口径：**不是** vLLM 功能面完整，而是 AGENTS /
+[scope.md](scope.md) 的三类引擎能力在**自持路径**上闭环，外加可部署的
+standalone SSE 与明确数值门禁。
+
+1. **KV 生命周期 + prefix 复用**：Radix（或等价 BlockKV）真写/真读/COW/淘汰；
+   `cache_hit_tokens` = 真实跳过的 prefill。
+2. **Continuous scheduling**：多请求 CB、可取消/超时、TP 可部署。
+3. **Model execution**：decode 热路径走自持 KernelBackend（capability 路由）；
+   官方 `sparse_attn` 仅作回退，不是长期唯一路径。
+
+当前（PR #10/#11 后）：**Phase 0b**——Hybrid MVP + UTF-8 稳态 + logits 软门禁；
+KV 仍靠官方 Attention 缓冲 + CPU 快照；decode 仍绑官方 `sparse_attn`（FI SM120
+absmean=0，§6.3）。
+
+```
+Phase0 HybridMVP → Phase0b Stabilize → Phase0c OwnKV → Phase1 OwnKernels → Phase2 Production
+```
+
+### 8.1 Phase 0b — 稳态与门禁（当前）
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| 增量 decode UTF-8 | **done** | `detokenize_delta` + loop 全分支；`tests/test_detokenize_delta.py` |
+| Prefill logits 门禁 | **done** | `scripts/v4_logits_compare.py`；5090 soft top5 / top2 Δ≈0.09（§6.2）；**PRO6000 宿主** soft `Hello`/`你好`（§6.4） |
+| TP SSE 硬化 | **done** | 专用 CUDA 线程；`v4_remote_acceptance.sh` 手工闸门 |
+| Radix 双池 / FI 换核 | **不做**（本阶段） | 见 0c / 1 |
+
+### 8.2 Phase 0c — 自持 KV（下一实现大 PR）
+
+目标：去掉「官方 Attention 缓冲 + CPU 整包快照」作为唯一 prefix 路径。
+
+- Radix 扩展：compressed MLA + SWA / `dsv4_packed(584)` 双池（`KvLayout` 雏形已有）；
+  page 分配/释放/COW。
+- Hybrid 过渡：先双写或从官方 buffer 导出到 Radix page，再切「Radix 为源」。
+- Scheduler：多 slot 与 `cached_len` 分组在 V4 上正确；结束必释放 page。
+
+验收：二次同前缀 `cache_hit_tokens > 0` 且 prefill forward tokens 下降；取消/结束无泄漏。
+
+### 8.3 Phase 1 — 自持 decode 内核 + MoE
+
+- FI SM120 sparse MLA：仅当上游 probe **absmean≠0** 后默认开启；否则保持
+  `SGLANG_LITE_V4_DISABLE_FI_SPARSE=1` + 官方回退。
+- MoE GEMM：B12x / sgl-kernel 数值门禁；deep-gemm SM120 有再接。
+- 保守 CUDA graph decode——有收益再开。
+- 吞吐：`v4_lite_engine_gen` 1×128 / 4×96 / 1×256 ≥ 官方 warm（允许小幅方差）。
+
+### 8.4 Phase 2 — 生产硬化
+
+Prometheus（t/s、TTFT、cache_hit、batch、queue、TP 健康）、结构化日志 + request id、
+优雅退出 / drain / 超时 / OOM 拒绝、Mixtral/Qwen-MoE 回归、`lite` 预设。
+UniGateway 仅协议/metrics 联调，不引入业务逻辑进 engine。
+
+### 8.5 明确永远不做
+
+与 [scope.md](scope.md) 一致：structured output、投机解码、PD disagg、多模态、
+动态多 LoRA、vLLM 宽 API、完整 EP 调度。健全 ≠ 功能面变宽。

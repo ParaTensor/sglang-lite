@@ -133,29 +133,40 @@ UniGateway owns cross-backend routing, auth, rate limits, global policy, and agg
 
 ## MVP Roadmap (Phases)
 
-**Phase 0 (Core Verification)**
+**Phase 0 (Core Verification)** — largely done for Mixtral-class MoE
 
 - Rust: Full /v1/chat/completions (stream + non-stream) + /v1/models + /healthz
-- Define internal GenerationRequest / Token protocol
-- Python side: Working MoE-aware engine with basic routing + batching (switchable to real HF MoE models)
-- Able to run popular MoE models (e.g. Mixtral, DeepSeek, Qwen-MoE class)
-- Basic continuous batching + simple Radix skeleton (even if imperfect at first)
-- Metrics: tokens/s, TTFT, cache hit (even if mocked)
+- Internal GenerationRequest / TokenDelta protocol
+- MoE-aware engine with continuous batching + Radix skeleton
+- Metrics: tokens/s, TTFT, cache hit
 
-**Phase 1 (Production Ready)**
+**Phase 0b (Stabilize — current for DeepSeek-V4 Hybrid)** — done
 
-- Real Radix KV Cache + deep Scheduler integration
-- CUDA graph decode path
-- Prometheus metrics, structured logging, graceful shutdown, request timeouts
-- Mainstream MoE model support (validate throughput at 70B+ scale)
-- Configuration presets ("lite" defaults)
+- Incremental UTF-8 `detokenize_delta` + unit tests
+- Prefill-final logits gate (`scripts/v4_logits_compare.py`; soft top5 / CVD near-tie)
+- TP process + standalone SSE acceptance (dedicated CUDA thread)
+
+**Phase 0c (Own KV)** — next large PR
+
+- V4 Radix dual-pool (compressed + SWA / `dsv4_packed`) true write/read/COW
+- Drop CPU whole-buffer snapshot as the only prefix path
+- See [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) §8.2
+
+**Phase 1 (Own kernels + production hardening path)**
+
+- FI SM120 sparse MLA / MoE GEMM when upstream probe is non-zero; else official fallback
+- Conservative CUDA graph decode when beneficial
+- Prometheus, structured logging, graceful shutdown, timeouts, `lite` presets
+- Throughput gates vs official warm (`v4_lite_engine_gen`)
 
 **Phase 2**
 
-- Optional Paged strategy
-- Limited model extension points
-- Optionally migrate scheduler/KV hotspots to Rust
-- Deep integration validation with unigateway (KV affinity, etc.)
+- Optional Paged strategy / limited extension points
+- Optional Rust migration of scheduler/KV hotspots
+- UniGateway protocol/metrics integration only (no business logic in engine)
+
+V4 “健全引擎”窄口径与验收表：[docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) §8。
+健全 ≠ vLLM 功能面对等。
 
 ## Quick Start (standalone MoE service)
 

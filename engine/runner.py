@@ -78,8 +78,37 @@ class ModelRunner:
             load_id = model_name
 
         print(f"[sglang-lite] Loading MoE model: {load_id}")
-        config = AutoConfig.from_pretrained(load_id, trust_remote_code=True)
-        model_type = getattr(config, "model_type", None)
+        # Path/name may already identify deepseek_v4 before AutoConfig (older
+        # transformers builds do not register model_type=deepseek_v4).
+        fam_from_id = None
+        try:
+            fam_from_id = assert_moe_supported(model_name)
+        except ValueError:
+            fam_from_id = None
+
+        config = None
+        model_type = None
+        if fam_from_id is None or fam_from_id.name != "deepseek_v4":
+            try:
+                config = AutoConfig.from_pretrained(load_id, trust_remote_code=True)
+                model_type = getattr(config, "model_type", None)
+            except ValueError:
+                config = None
+                model_type = None
+        if config is None and (
+            (fam_from_id and fam_from_id.name == "deepseek_v4")
+            or "deepseek_v4" in model_name.lower()
+            or "deepseek-v4" in model_name.lower()
+            or "ds-v4" in model_name.lower()
+        ):
+            import json
+            from pathlib import Path
+            from types import SimpleNamespace
+
+            raw = json.loads((Path(load_id) / "config.json").read_text(encoding="utf-8"))
+            model_type = raw.get("model_type", "deepseek_v4")
+            config = SimpleNamespace(**raw)
+
         fam = assert_moe_supported(model_name, model_type)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -740,9 +769,18 @@ class ModelRunner:
         """Official Transformer.forward(input_ids, start_pos) → logits [B, vocab]."""
         self.model_forward_count += 1
         self.last_model_forward_size = int(input_ids.shape[0])
+        # Prefer greedy logits for Hybrid numerics / gates.
+        if hasattr(self.model, "temperature"):
+            try:
+                self.model.temperature = 0.0
+            except Exception:
+                pass
         out = self.model(input_ids, start_pos=int(start_pos))
         if isinstance(out, torch.Tensor):
             logits = out
+        elif isinstance(out, (tuple, list)):
+            # Official DeepSeek-V4 Transformer: (output_ids, logits, main_hidden).
+            logits = out[1] if len(out) > 1 else out[0]
         else:
             logits = out.logits
         # Official returns last-position logits [B, vocab]; accept [B, T, vocab] too.

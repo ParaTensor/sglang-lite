@@ -13,11 +13,17 @@ Only the model successfully loaded in the current process is advertised on `GET 
 Local CI uses `fixture:<path>` tiny Mixtral weights. Dense models are rejected. V4 uses Hybrid
 official `inference/` + leaf kernels (FlashInfer/sgl-kernel); see `docs/deepseek-v4-flash-plan.md`.
 
-**Execution status**: prefix reuse stores paged K/V + `last_logits`. On CUDA with FlashInfer,
-paged KV is the sole attention source (FlashInfer prefill/decode kernels; no per-step
-DynamicCache rebuild). On CPU, the runner rebuilds HF attention state from pages before forward.
+**Execution status**（区分 MVP Hybrid 与 Owned 目标态）:
+
+| 路径 | 当前阶段 | KV / prefix | Decode 内核 | 备注 |
+|------|----------|-------------|-------------|------|
+| Mixtral / Qwen-MoE 等 | Phase 0 已验 | Radix paged K/V + `last_logits`；CUDA 上 FlashInfer paged 为 sole attention 源 | HF / FlashInfer paged；MoE 叶子仍 P1 | CPU 仍可从 page 重建 HF attn |
+| DeepSeek-V4-Flash | **Phase 0b**（稳态） | Hybrid：官方 Attention 缓冲 + CPU 快照 prefix（非 Radix 双池真写） | 官方 `sparse_attn`；FI SM120 blocked | 见 `docs/deepseek-v4-flash-plan.md` §6.2 / §8 |
+| 目标态（健全引擎） | Phase 0c → 1 → 2 | Owned Radix 双池真写/COW；`cache_hit_tokens` = 真实跳过 prefill | KernelBackend capability 路由；官方核仅回退 | §8 验收表；不扩大 vLLM 功能面 |
+
 Scheduler groups requests; the runner issues **tensor-batched** forwards when sequences share
-the same `cached_len` (and prefill new-length). FlashInfer MoE kernels remain P1.
+the same `cached_len` (and prefill new-length). V4 下一实现重点是 Phase **0c**（自持 KV），
+不是再堆宽协议面。
 
 The `engine/` core is a **pure library** exposing three further-decomposed building blocks (RadixKVCache, BatchingScheduler, MoEModelRunner). The sglang-lite product also ships a thin standalone control/serving shell so it can serve users without SGLang, vLLM, or UniGateway.
 

@@ -130,6 +130,29 @@ Optional UniGateway
   • Own cross-backend routing, auth, global policy and aggregation
 ```
 
+### DeepSeek-V4 transition topology (Hybrid → Owned)
+
+V4 currently runs a **Hybrid** path (official `Transformer.forward` + in-model
+Attention/Compressor buffers). Prefix reuse is a CPU snapshot
+(`engine/v4_prefix_cache.py`), not Radix dual-pool COW. Decode still calls
+official `sparse_attn` unless FI SM120 probe is non-zero
+(`SGLANG_LITE_V4_DISABLE_FI_SPARSE=1` by default). Stage definitions:
+[deepseek-v4-flash-plan.md](./deepseek-v4-flash-plan.md) §8.
+
+```
+V4 Hybrid (Phase 0 / 0b)          Phase 0c Own KV              Phase 1 Own Kernels
+─────────────────────────         ──────────────────           ───────────────────
+official Attention buffer   →     Radix dual pool              KernelBackend decode
+  kv_cache / kv_state /             compressed MLA pages         FI SM120 sparse MLA
+  score_state                       + SWA / dsv4_packed(584)     (else official fallback)
+CPU snapshot prefix hit     →     page restore / COW / evict   MoE: B12x / sgl-kernel
+clear_v4_kv_slot on final   →     release pages on finish      optional CUDA graph
+LiteEngine CB + TP SSE      →     same scheduler contract      throughput ≥ official warm
+```
+
+Do not treat “FI attached” as Owned KV: FlashInfer is a leaf; Radix page
+lifecycle and scheduler grouping remain the engine’s job.
+
 **Kept outside sglang-lite and optionally provided by UniGateway:**
 - Auth, rate limit, routing, semantic routing
 - Cross-backend retry/failover and tenant policy
