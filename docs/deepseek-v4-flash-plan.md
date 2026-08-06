@@ -456,6 +456,8 @@ Host：`ssh -p 2208 bodesi@39.183.171.3`（`pro6000`）。单卡 ~96GB，compute
 | 官方 generate（**宿主** torch 2.11+cu130） | **PASS** | CVD remap + `set_device(0)`；`Hello` → `Hello! How can I help you today?`；prefill top1=`Hello`≈28.9 |
 | 官方 / Hybrid（**Docker** torch 2.9.1+cu129） | **FAIL 数值** | prefill top5=`to`/`:`/`?`，logit~16；soft gate 失败。**非 Hybrid bug**，官方路径同坏 |
 | Hybrid logits 门禁（宿主） | **PASS** | `gate_soft=true`；argmax=`Hello`≈28.27；top5 含 `Hello`/`Hi`/`你好` |
+| Hybrid 吞吐门禁（宿主） | **PASS（基线）** | 见 §6.4.1；官方 `sparse_attn` + DISABLE_FI=1 |
+| Phase 1 FI 数值探针 | **FAIL absmean=0** | 见 §8.3.1；保守路由保持 official |
 | SGLang blackwell 镜像 | **SM120 内核不足** | `flash_mla sparse_decode_fwd: Unsupported architecture`；`latest` 亦无 sm_120 |
 
 **关键环境结论（PRO6000）**
@@ -476,6 +478,22 @@ export SGLANG_LITE_V4_DISABLE_FI_SPARSE=1 SGLANG_LITE_FI_PREFIX=
 torchrun --nproc-per-node=8 scripts/v4_logits_compare.py --prompt Hello --out ~/bench/v4_logits_host.json
 # 期望 gate_soft=true，lite_argmax_text 含 Hello 或 你好
 ```
+
+#### 6.4.1 PRO6000 Hybrid 吞吐基线（2026-08-06，宿主 torch 2.11+cu130）
+
+脚本：`scripts/v4_lite_engine_gen.py`（TP=8，prompt `Hello`，ignore_eos，
+`SGLANG_LITE_V4_DISABLE_FI_SPARSE=1`，官方 `sparse_attn`）。日志：
+`~/bench/v4_thru_pro6000.log`。
+
+| Case | cold tok/s | warm tok/s | load_s | sample 前缀 |
+| --- | --- | --- | --- | --- |
+| 1×128 | 6.90 | **7.59** | ~8.1 | `Hello! How can I help you today?` |
+| 4×96 | 15.51 | **16.74** | ~7.6 | 同上 + 中文 DeepSeek 说明 |
+| 1×256 | 7.12 | **7.51** | ~7.6 | 同上 + capital of France |
+
+相对 8×5090 Hybrid 基线（§6.2：1×128 ~4.8–5.1 / 4×96 ~18.3 / 1×256 ~4.8）：
+PRO6000 单请求 decode 更高，batch=4 接近同量级。本表为 **Phase 1 换核对照
+基线**——FI SM120 默认未开；换核后必须 ≥ 此表 warm（允许小幅方差）。
 
 ## 7. 风险与开放问题
 
@@ -502,15 +520,15 @@ standalone SSE 与明确数值门禁。
 3. **Model execution**：decode 热路径走自持 KernelBackend（capability 路由）；
    官方 `sparse_attn` 仅作回退，不是长期唯一路径。
 
-当前（PR #10/#11 后）：**Phase 0b**——Hybrid MVP + UTF-8 稳态 + logits 软门禁；
-KV 仍靠官方 Attention 缓冲 + CPU 快照；decode 仍绑官方 `sparse_attn`（FI SM120
-absmean=0，§6.3）。
+当前：**Phase 0c 切片 1–3 + Phase 1 门禁骨架**——Hybrid + dual-pool page
+restore + PRO6000 吞吐基线（§6.4.1）；decode 仍绑官方 `sparse_attn`（FI SM120
+absmean=0，§6.3 / §8.3.1）。
 
 ```
 Phase0 HybridMVP → Phase0b Stabilize → Phase0c OwnKV → Phase1 OwnKernels → Phase2 Production
 ```
 
-### 8.1 Phase 0b — 稳态与门禁（当前）
+### 8.1 Phase 0b — 稳态与门禁（已完成）
 
 | 项 | 状态 | 说明 |
 | --- | --- | --- |
@@ -519,7 +537,7 @@ Phase0 HybridMVP → Phase0b Stabilize → Phase0c OwnKV → Phase1 OwnKernels �
 | TP SSE 硬化 | **done** | 专用 CUDA 线程；`v4_remote_acceptance.sh` 手工闸门 |
 | Radix 双池 / FI 换核 | **不做**（本阶段） | 见 0c / 1 |
 
-### 8.2 Phase 0c — 自持 KV（进行中）
+### 8.2 Phase 0c — 自持 KV（切片 1–3 完成；0c-4 待做）
 
 目标：去掉「官方 Attention 缓冲 + CPU 整包快照」作为唯一 prefix 路径。
 
@@ -587,7 +605,46 @@ Phase0 HybridMVP → Phase0b Stabilize → Phase0c OwnKV → Phase1 OwnKernels �
   `SGLANG_LITE_V4_DISABLE_FI_SPARSE=1` + 官方回退。
 - MoE GEMM：B12x / sgl-kernel 数值门禁；deep-gemm SM120 有再接。
 - 保守 CUDA graph decode——有收益再开。
-- 吞吐：`v4_lite_engine_gen` 1×128 / 4×96 / 1×256 ≥ 官方 warm（允许小幅方差）。
+- 吞吐：`v4_lite_engine_gen` 1×128 / 4×96 / 1×256 ≥ §6.4.1 warm（允许小幅方差）。
+
+#### 8.3.1 换核门禁骨架（2026-08-06 已落地）
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| 保守路由 | **done** | `select_sparse_mla_backend`：SM120 默认 `official_sparse_attn`；仅 `numerical_ok=True` 或 `SGLANG_LITE_V4_FORCE_FI_SPARSE=1` 才选 FI |
+| 数值探针 API | **done** | `probe_sm120_sparse_numerical` + `probe_kernel_capabilities(numerical_probe=…)` / env `SGLANG_LITE_V4_FI_SPARSE_NUM_PROBE=1` |
+| 独立脚本 | **done** | `scripts/phase1_kernel_probe.py`（可选 `SGLANG_LITE_FI_PREFIX`） |
+| 单测 | **done** | `tests/test_capability_routing.py`（symbol-only / num-ok / FORCE / fail） |
+| 运行时零输出护栏 | **done**（既有） | `attach_v4_sparse_mla` 若 FI 输出 absmax≈0 则进程内禁用回退官方 |
+| Hybrid DISABLE | **保持 1** | 生产路径仍建议 `SGLANG_LITE_V4_DISABLE_FI_SPARSE=1` 直到上游 absmean≠0 |
+
+**PRO6000 探针结果**（宿主 torch 2.11+cu130）：
+
+| 配置 | FI 版本 | SM120 symbol | absmean | finite | 选择 |
+| --- | --- | --- | --- | --- | --- |
+| 默认 venv | 0.6.12 | **无** | — | — | `official_sparse_attn` |
+| `SGLANG_LITE_FI_PREFIX=/tmp/fi1616` | 0.6.16.post1 | **有** | **0.0** | true | `official_sparse_attn`（num fail） |
+
+摘要：`~/bench/phase1_kernel_probe_default.json`、
+`~/bench/phase1_kernel_probe_fi1616.json`。
+
+**结论**：Phase 1 **入口与门禁已就绪**；FI SM120 sparse **仍不得默认开启**。
+下一步（上游或本地 kernel 修复后）：复跑 `phase1_kernel_probe` → absmean>0 →
+清 DISABLE / 清 FORCE 依赖 → 对照 §6.4.1 吞吐。
+
+复现：
+
+```bash
+source ~/venvs/sglang-lite/bin/activate
+cd ~/project/sglang-lite
+export PYTHONPATH=$PWD/engine:$PWD
+CUDA_VISIBLE_DEVICES=0 python scripts/phase1_kernel_probe.py \
+  --out ~/bench/phase1_kernel_probe_default.json
+# 带 0.6.16 隔离前缀：
+SGLANG_LITE_FI_PREFIX=/tmp/fi1616 FLASHINFER_DISABLE_VERSION_CHECK=1 \
+  CUDA_VISIBLE_DEVICES=0 python scripts/phase1_kernel_probe.py \
+  --out ~/bench/phase1_kernel_probe_fi1616.json
+```
 
 ### 8.4 Phase 2 — 生产硬化
 

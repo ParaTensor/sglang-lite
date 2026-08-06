@@ -161,8 +161,15 @@ LiteEngine CB + TP SSE      →     same scheduler contract      throughput ≥ 
    Decode still runs official `sparse_attn` (pages are not yet the attention
    source).
 
-Metrics: `dual_restore_count`, `prefix_dual_primary`. Next: attention reads
-pages / FI SM120.
+Metrics: `dual_restore_count`, `prefix_dual_primary`.
+
+**Phase 1 gate skeleton (landed):** SM120 sparse selection is **conservative**
+(`official_sparse_attn` unless `sparse_mla_sm120_numerical_ok` or
+`SGLANG_LITE_V4_FORCE_FI_SPARSE`). Probe API:
+`probe_sm120_sparse_numerical` / `scripts/phase1_kernel_probe.py`. PRO6000
+FI 0.6.16 still absmean=0. Throughput baseline: plan §6.4.1.
+
+Next: attention reads pages (0c-4) and/or upstream FI non-zero probe.
 
 Do not treat “FI attached” as Owned KV: FlashInfer is a leaf; Radix page
 lifecycle and scheduler grouping remain the engine’s job.

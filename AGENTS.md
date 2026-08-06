@@ -141,9 +141,11 @@ sglang-lite 强调高内聚与整洁，**根目录严禁堆放非核心内容**�
 
 ## 当前阶段
 
-当前处于 **Phase 0c**（自持 KV，切片 1–3：双池写入、生命周期、hit fork、
-decode append、**kv_cache page restore + slim snapshot**）。Decode 仍走官方
-`sparse_attn`。Phase 0b 门禁保留。下一：attention 读 page / Phase 1 换核。
+当前处于 **Phase 0c 完成切片 1–3 + Phase 1 门禁骨架**：
+双池写入/生命周期/hit fork/page restore 已落地；PRO6000 dual stats + 吞吐
+基线已过；`capability` 对 SM120 FI sparse 默认 official，仅 numerical_ok /
+FORCE 才选 FI。Decode 仍走官方 `sparse_attn`（FI absmean=0）。下一：上游
+kernel 修复后复跑 phase1 probe，或 0c-4 attention 读 page。
 
 阶段定义与验收见 [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) **§8**。
 

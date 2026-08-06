@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from sglang_lite.capability import (
     ArchFamily,
     KernelCapabilities,
@@ -32,13 +34,59 @@ def test_sm120_never_selects_sm100_sparse_mla():
     assert select_sparse_mla_backend(caps) != SparseMlaBackend.FLASHINFER_SPARSE_SM100
 
 
-def test_sm120_prefers_flashinfer_sparse_when_present():
+def test_sm120_default_official_when_symbol_only():
+    """Phase 1 conservative: symbol alone is not enough (absmean often 0)."""
     caps = KernelCapabilities(
         arch_family=ArchFamily.SM120,
         cuda_capability=(12, 0),
         has_sparse_mla_sm120=True,
+        sparse_mla_sm120_numerical_ok=None,
+    )
+    # Ensure FORCE is not set during the test.
+    old = os.environ.pop("SGLANG_LITE_V4_FORCE_FI_SPARSE", None)
+    try:
+        assert select_sparse_mla_backend(caps) == SparseMlaBackend.OFFICIAL_SPARSE_ATTN
+    finally:
+        if old is not None:
+            os.environ["SGLANG_LITE_V4_FORCE_FI_SPARSE"] = old
+
+
+def test_sm120_fi_when_numerical_ok():
+    caps = KernelCapabilities(
+        arch_family=ArchFamily.SM120,
+        cuda_capability=(12, 0),
+        has_sparse_mla_sm120=True,
+        sparse_mla_sm120_numerical_ok=True,
+        sparse_mla_sm120_absmean=0.12,
     )
     assert select_sparse_mla_backend(caps) == SparseMlaBackend.FLASHINFER_SPARSE_SM120
+
+
+def test_sm120_fi_when_force_env(monkeypatch):
+    monkeypatch.setenv("SGLANG_LITE_V4_FORCE_FI_SPARSE", "1")
+    caps = KernelCapabilities(
+        arch_family=ArchFamily.SM120,
+        cuda_capability=(12, 0),
+        has_sparse_mla_sm120=True,
+        sparse_mla_sm120_numerical_ok=False,
+    )
+    assert select_sparse_mla_backend(caps) == SparseMlaBackend.FLASHINFER_SPARSE_SM120
+
+
+def test_sm120_official_when_numerical_fail():
+    caps = KernelCapabilities(
+        arch_family=ArchFamily.SM120,
+        cuda_capability=(12, 0),
+        has_sparse_mla_sm120=True,
+        sparse_mla_sm120_numerical_ok=False,
+        sparse_mla_sm120_absmean=0.0,
+    )
+    old = os.environ.pop("SGLANG_LITE_V4_FORCE_FI_SPARSE", None)
+    try:
+        assert select_sparse_mla_backend(caps) == SparseMlaBackend.OFFICIAL_SPARSE_ATTN
+    finally:
+        if old is not None:
+            os.environ["SGLANG_LITE_V4_FORCE_FI_SPARSE"] = old
 
 
 def test_sm100_uses_sm100_sparse():
@@ -76,6 +124,7 @@ def test_kernel_capabilities_properties():
         arch_family=ArchFamily.SM120,
         cuda_capability=(12, 0),
         has_sparse_mla_sm120=True,
+        sparse_mla_sm120_numerical_ok=True,
         has_b12x_moe=True,
     )
     assert caps.sparse_mla_backend == SparseMlaBackend.FLASHINFER_SPARSE_SM120

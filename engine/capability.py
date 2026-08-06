@@ -6,9 +6,10 @@ leaf implementations. Never treat SM120 as SM100 — they are different families
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 
 class ArchFamily(str, Enum):
@@ -63,6 +64,10 @@ def probe_cuda_arch_family(device: Optional[int] = None) -> Tuple[ArchFamily, Tu
     return capability_to_arch_family(major, minor), (major, minor)
 
 
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes")
+
+
 @dataclass(frozen=True)
 class KernelCapabilities:
     """Declared leaf capabilities for the current process/device."""
@@ -71,6 +76,9 @@ class KernelCapabilities:
     cuda_capability: Tuple[int, int]
     flashinfer_version: Optional[str] = None
     has_sparse_mla_sm120: bool = False
+    # Phase 1: optional numerical smoke (absmean>0). None = not run.
+    sparse_mla_sm120_numerical_ok: Optional[bool] = None
+    sparse_mla_sm120_absmean: Optional[float] = None
     has_b12x_moe: bool = False
     has_sgl_kernel: bool = False
     has_deep_gemm_sm120: bool = False
@@ -85,10 +93,26 @@ class KernelCapabilities:
 
 
 def select_sparse_mla_backend(caps: KernelCapabilities) -> SparseMlaBackend:
-    """Pick sparse MLA leaf. SM120 must never fall through to SM100 TRTLLM."""
+    """Pick sparse MLA leaf. SM120 must never fall through to SM100 TRTLLM.
+
+    Phase 1 policy for SM120 (conservative — FI absmean≈0 is common):
+
+    * Symbol missing → ``OFFICIAL_SPARSE_ATTN``
+    * ``sparse_mla_sm120_numerical_ok is True`` → ``FLASHINFER_SPARSE_SM120``
+    * ``SGLANG_LITE_V4_FORCE_FI_SPARSE=1`` → ``FLASHINFER_SPARSE_SM120``
+      (runtime zero-out guard in ``attach_v4_sparse_mla`` still applies)
+    * else → ``OFFICIAL_SPARSE_ATTN``
+
+    ``SGLANG_LITE_V4_DISABLE_FI_SPARSE=1`` is enforced by the Hybrid loader,
+    not here (it skips arming even if selection would be FI).
+    """
     fam = caps.arch_family
     if fam == ArchFamily.SM120:
-        if caps.has_sparse_mla_sm120:
+        if not caps.has_sparse_mla_sm120:
+            return SparseMlaBackend.OFFICIAL_SPARSE_ATTN
+        if caps.sparse_mla_sm120_numerical_ok is True:
+            return SparseMlaBackend.FLASHINFER_SPARSE_SM120
+        if _env_truthy("SGLANG_LITE_V4_FORCE_FI_SPARSE"):
             return SparseMlaBackend.FLASHINFER_SPARSE_SM120
         return SparseMlaBackend.OFFICIAL_SPARSE_ATTN
     if fam == ArchFamily.SM100:
@@ -117,8 +141,122 @@ def select_moe_gemm_backend(caps: KernelCapabilities) -> MoeGemmBackend:
     return MoeGemmBackend.TORCH
 
 
-def probe_kernel_capabilities(device: str = "cuda") -> KernelCapabilities:
-    """Runtime probe of arch family and available leaf modules."""
+def probe_sm120_sparse_numerical(
+    *,
+    device: str = "cuda",
+    absmean_eps: float = 1e-6,
+) -> Dict[str, Any]:
+    """Tiny numerical smoke for FlashInfer SM120 sparse MLA.
+
+    Returns a dict with keys: ok, absmean, finite, error, shape.
+    Does **not** import heavy model code — only FI symbol + random tensors.
+    """
+    result: Dict[str, Any] = {
+        "ok": False,
+        "absmean": None,
+        "finite": None,
+        "error": None,
+        "shape": None,
+    }
+    try:
+        import torch
+        import flashinfer.mla as mla  # type: ignore
+    except Exception as e:
+        result["error"] = f"import: {type(e).__name__}: {e}"
+        return result
+
+    if not torch.cuda.is_available():
+        result["error"] = "cuda_unavailable"
+        return result
+
+    try:
+        B, qlen, H = 1, 1, 8
+        page_size, swa_pages, comp_pages = 64, 4, 16
+        packed_dim = 584
+        swa_topk, sparse_topk = 128, 128
+        q = torch.randn(B, qlen, H, 512, device=device, dtype=torch.bfloat16)
+        swa = torch.zeros(
+            swa_pages, 1, page_size, packed_dim, device=device, dtype=torch.uint8
+        )
+        # Non-zero packed bytes so a working kernel is less likely to be pure zero
+        # solely from empty KV (still may be zero if the kernel is broken).
+        swa.view(-1)[:4096] = torch.randint(
+            1, 200, (4096,), device=device, dtype=torch.uint8
+        )
+        compressed = torch.zeros(
+            comp_pages, 1, page_size, packed_dim, device=device, dtype=torch.uint8
+        )
+        compressed.view(-1)[:4096] = torch.randint(
+            1, 200, (4096,), device=device, dtype=torch.uint8
+        )
+        swa_idx = torch.randint(
+            0,
+            swa_pages * page_size,
+            (B * qlen, swa_topk),
+            device=device,
+            dtype=torch.int32,
+        )
+        extra_idx = torch.randint(
+            0,
+            max(comp_pages * page_size, 1),
+            (B * qlen, sparse_topk),
+            device=device,
+            dtype=torch.int32,
+        )
+        swa_topk_lens = torch.full(
+            (B * qlen,), swa_topk, device=device, dtype=torch.int32
+        )
+        extra_topk_lens = torch.full(
+            (B * qlen,), sparse_topk, device=device, dtype=torch.int32
+        )
+        seq = torch.full(
+            (B,), swa_pages * page_size, device=device, dtype=torch.int32
+        )
+        workspace = torch.empty(256 * 1024 * 1024, device=device, dtype=torch.uint8)
+        # FI 0.6.16 signature (positional): query, swa_kv_cache, workspace_buffer,
+        # sparse_indices, compressed_kv_cache, sparse_topk_lens, seq_lens, ...
+        # SM120 also accepts swa_topk_lens / extra_sparse_*.
+        out = mla.trtllm_batch_decode_sparse_mla_dsv4(
+            q,
+            swa,
+            workspace,
+            swa_idx,
+            compressed,
+            None,
+            seq,
+            kv_layout="HND",
+            swa_topk_lens=swa_topk_lens,
+            extra_sparse_indices=extra_idx,
+            extra_sparse_topk_lens=extra_topk_lens,
+        )
+        of = out.detach().float()
+        absmean = float(of.abs().mean().item())
+        finite = bool(torch.isfinite(of).all().item())
+        result["absmean"] = absmean
+        result["finite"] = finite
+        result["shape"] = list(out.shape)
+        result["ok"] = finite and absmean > absmean_eps
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+    return result
+
+
+def probe_kernel_capabilities(
+    device: str = "cuda",
+    *,
+    numerical_probe: Optional[bool] = None,
+) -> KernelCapabilities:
+    """Runtime probe of arch family and available leaf modules.
+
+    Parameters
+    ----------
+    device:
+        ``"cuda"`` or ``"cpu"``.
+    numerical_probe:
+        If True, run :func:`probe_sm120_sparse_numerical` when the SM120 sparse
+        symbol exists. If None, honor env ``SGLANG_LITE_V4_FI_SPARSE_NUM_PROBE=1``.
+        Default is **off** so import/load stays cheap; Phase 1 scripts opt in.
+    """
     arch = ArchFamily.UNKNOWN
     cap = (0, 0)
     fi_ver: Optional[str] = None
@@ -126,6 +264,11 @@ def probe_kernel_capabilities(device: str = "cuda") -> KernelCapabilities:
     has_b12x = False
     has_sgl = False
     has_dg = False
+    num_ok: Optional[bool] = None
+    num_absmean: Optional[float] = None
+
+    if numerical_probe is None:
+        numerical_probe = _env_truthy("SGLANG_LITE_V4_FI_SPARSE_NUM_PROBE")
 
     if device != "cpu":
         try:
@@ -167,11 +310,21 @@ def probe_kernel_capabilities(device: str = "cuda") -> KernelCapabilities:
             except Exception:
                 has_dg = False
 
+        if numerical_probe and arch == ArchFamily.SM120 and has_sm120_sparse:
+            num = probe_sm120_sparse_numerical(
+                device=device if device.startswith("cuda") else "cuda",
+            )
+            num_ok = bool(num.get("ok"))
+            if num.get("absmean") is not None:
+                num_absmean = float(num["absmean"])
+
     return KernelCapabilities(
         arch_family=arch,
         cuda_capability=cap,
         flashinfer_version=fi_ver,
         has_sparse_mla_sm120=has_sm120_sparse,
+        sparse_mla_sm120_numerical_ok=num_ok,
+        sparse_mla_sm120_absmean=num_absmean,
         has_b12x_moe=has_b12x,
         has_sgl_kernel=has_sgl,
         has_deep_gemm_sm120=has_dg,

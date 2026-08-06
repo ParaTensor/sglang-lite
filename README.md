@@ -146,19 +146,21 @@ UniGateway owns cross-backend routing, auth, rate limits, global policy, and agg
 - Prefill-final logits gate (`scripts/v4_logits_compare.py`; soft top5 / CVD near-tie)
 - TP process + standalone SSE acceptance (dedicated CUDA thread)
 
-**Phase 0c (Own KV)** — in progress (slices 1–3)
+**Phase 0c (Own KV)** — slices 1–3 landed (PRO6000 dual stats PASS)
 
 - Dual-pool packed + bf16 restore pages; Hybrid dual-write / hit fork / append
 - Hit restores ``kv_cache`` from pages; slim CPU snapshot keeps state only
 - Decode still official ``sparse_attn`` (pages not yet attention source)
+- Throughput baseline on PRO6000 host: see plan §6.4.1
 - See [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) §8.2
 
-**Phase 1 (Own kernels + production hardening path)**
+**Phase 1 (Own kernels)** — gate skeleton landed; FI SM120 still blocked
 
-- FI SM120 sparse MLA / MoE GEMM when upstream probe is non-zero; else official fallback
-- Conservative CUDA graph decode when beneficial
-- Prometheus, structured logging, graceful shutdown, timeouts, `lite` presets
-- Throughput gates vs official warm (`v4_lite_engine_gen`)
+- Conservative SM120 routing: official unless numerical_ok or FORCE
+- `scripts/phase1_kernel_probe.py` + `probe_sm120_sparse_numerical`
+- PRO6000 FI 0.6.16: symbol present, **absmean=0** → keep DISABLE / official
+- Throughput must stay ≥ §6.4.1 warm after any kernel swap
+- MoE GEMM B12x path selected on SM120 when available
 
 **Phase 2**
 
