@@ -771,7 +771,17 @@ UniGateway 仅协议/metrics 联调，不引入业务逻辑进 engine。
 {"ts":...,"event":"request_finish","request_id":"...","finish_reason":"length","completion_tokens":8,"ttft_s":0.12,"tok_s":7.5}
 ```
 
-后续：长稳 soak、Mixtral/Qwen 回归、`lite` 预设。
+#### 8.4.4 切片 4（已落地）— soak / 多 MoE 回归 / lite 预设 / Runbook
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| Soak | **done** | `scripts/soak_stability.py`：多轮并发 + blocks/oom/error 门禁 |
+| MoE 回归 | **done** | `scripts/moe_regression.py`：默认 tiny Mixtral fixture；可加多 `--model` |
+| Fixture 构建 | **done** | `scripts/build_tiny_moe_fixture.py` |
+| lite env | **done** | `scripts/env_lite.sh` + `Config.from_env("lite")` 默认 DISABLE_FI |
+| Runbook | **done** | [runbook.md](./runbook.md) 起停 / metrics / drain / 门禁 / 故障 |
+
+CPU 默认 soak/回归应 `overall: PASS`。PRO6000 V4 soak 可选（见 runbook §5）。
 
 ### 8.5 明确永远不做
 

@@ -28,14 +28,26 @@ class Config:
 
     @classmethod
     def from_env(cls, preset: str = "lite") -> "Config":
+        """Load config from env. ``preset=lite`` applies stable deploy defaults.
+
+        Also applies production safety defaults when missing:
+        ``SGLANG_LITE_V4_DISABLE_FI_SPARSE=1`` (official sparse main path).
+        """
         if preset == "lite":
-            # Lite preset: minimal, stable, low resource
+            # Lite preset: minimal, stable, low resource, official attention path.
             base = {
                 "max_batch_size": 4,
                 "max_concurrent": 32,
                 "request_timeout": 300.0,
                 "queue_timeout": 60.0,
+                "max_tokens_default": 128,
+                "device": "cuda",
+                "port": 9001,
+                "log_level": "INFO",
             }
+            # Official main path unless operator explicitly set FI envs.
+            os.environ.setdefault("SGLANG_LITE_V4_DISABLE_FI_SPARSE", "1")
+            os.environ.setdefault("SGLANG_LITE_LOG_JSON", "1")
         else:
             base = {}
 
