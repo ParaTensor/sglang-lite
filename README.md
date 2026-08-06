@@ -154,13 +154,12 @@ UniGateway owns cross-backend routing, auth, rate limits, global policy, and agg
 - Throughput baseline on PRO6000 host: see plan §6.4.1
 - See [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) §8.2
 
-**Phase 1 (Own kernels)** — gate skeleton landed; FI SM120 still blocked
+**Phase 1 (Own kernels)** — optional leaf only; **not** the default product path
 
-- Conservative SM120 routing: official unless numerical_ok or FORCE
-- `scripts/phase1_kernel_probe.py` + `probe_sm120_sparse_numerical`
-- PRO6000 FI 0.6.16: symbol present, **absmean=0** → keep DISABLE / official
-- Throughput must stay ≥ §6.4.1 warm after any kernel swap
-- MoE GEMM B12x path selected on SM120 when available
+- **Production default**: official TileLang `sparse_attn` (`DISABLE_FI_SPARSE=1`)
+- FI SM120: numerical OK after footer pack (Path A), but Hybrid pack tax → e2e slower; **opt-in FORCE only**
+- Next mainline: Phase **0c-4** (decode from dual-pool pages), not “default FI”
+- Throughput baseline remains official §6.4.1; FI never auto-selected in prod
 
 **Phase 2**
 

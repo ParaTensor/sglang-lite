@@ -95,24 +95,26 @@ class KernelCapabilities:
 def select_sparse_mla_backend(caps: KernelCapabilities) -> SparseMlaBackend:
     """Pick sparse MLA leaf. SM120 must never fall through to SM100 TRTLLM.
 
-    Phase 1 policy for SM120 (conservative — FI absmean≈0 is common):
+    Product policy (sglang-lite): **official TileLang is the production path**.
+    Hybrid loaders set ``SGLANG_LITE_V4_DISABLE_FI_SPARSE=1`` so the FI leaf is
+    never armed in normal serve/bench — even if this selector would return FI.
+    FORCE is the only supported way to experiment with FI today.
+
+    Selection for SM120 (capability table only; arming is separate):
 
     * Symbol missing → ``OFFICIAL_SPARSE_ATTN``
-    * ``sparse_mla_sm120_numerical_ok is True`` → ``FLASHINFER_SPARSE_SM120``
     * ``SGLANG_LITE_V4_FORCE_FI_SPARSE=1`` → ``FLASHINFER_SPARSE_SM120``
-      (runtime zero-out guard in ``attach_v4_sparse_mla`` still applies)
+    * ``sparse_mla_sm120_numerical_ok is True`` → ``FLASHINFER_SPARSE_SM120``
+      (eligible for leaf; Hybrid still requires DISABLE=0 + attach)
     * else → ``OFFICIAL_SPARSE_ATTN``
-
-    ``SGLANG_LITE_V4_DISABLE_FI_SPARSE=1`` is enforced by the Hybrid loader,
-    not here (it skips arming even if selection would be FI).
     """
     fam = caps.arch_family
     if fam == ArchFamily.SM120:
         if not caps.has_sparse_mla_sm120:
             return SparseMlaBackend.OFFICIAL_SPARSE_ATTN
-        if caps.sparse_mla_sm120_numerical_ok is True:
-            return SparseMlaBackend.FLASHINFER_SPARSE_SM120
         if _env_truthy("SGLANG_LITE_V4_FORCE_FI_SPARSE"):
+            return SparseMlaBackend.FLASHINFER_SPARSE_SM120
+        if caps.sparse_mla_sm120_numerical_ok is True:
             return SparseMlaBackend.FLASHINFER_SPARSE_SM120
         return SparseMlaBackend.OFFICIAL_SPARSE_ATTN
     if fam == ArchFamily.SM100:

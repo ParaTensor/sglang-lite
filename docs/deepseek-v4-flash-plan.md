@@ -457,7 +457,7 @@ Host：`ssh -p 2208 bodesi@39.183.171.3`（`pro6000`）。单卡 ~96GB，compute
 | 官方 / Hybrid（**Docker** torch 2.9.1+cu129） | **FAIL 数值** | prefill top5=`to`/`:`/`?`，logit~16；soft gate 失败。**非 Hybrid bug**，官方路径同坏 |
 | Hybrid logits 门禁（宿主） | **PASS** | `gate_soft=true`；argmax=`Hello`≈28.27；top5 含 `Hello`/`Hi`/`你好` |
 | Hybrid 吞吐门禁（宿主） | **PASS（基线）** | 见 §6.4.1；官方 `sparse_attn` + DISABLE_FI=1 |
-| Phase 1 FI 数值探针 | **FAIL absmean=0** | 见 §8.3.1；保守路由保持 official |
+| Phase 1 FI（实验） | **数值可对齐；e2e 未加速** | footer pack 后 vs 官方 maxdiff≈0.018；1×128 warm 仍慢于官方；**不默认开** |
 | SGLang blackwell 镜像 | **SM120 内核不足** | `flash_mla sparse_decode_fwd: Unsupported architecture`；`latest` 亦无 sm_120 |
 
 **关键环境结论（PRO6000）**
@@ -597,26 +597,31 @@ Phase0 HybridMVP → Phase0b Stabilize → Phase0c OwnKV → Phase1 OwnKernels �
 
 摘要：`~/bench/v4_dual_stats_pro6000.json`。退出时 NCCL destroy SIGABRT 仍有（与 align 相同，**不影响门禁结果**）。
 
-**仍未做（0c-4 / Phase 1）**：decode 直接读 page 做 attention；FI SM120 用 packed 池。
+**下一主线（0c-4）**：decode attention **以 dual-pool page 为源**（可先仍调官方核
+做正确性）。FI 读 packed 页是 0c-4 之后的可选 leaf，**不**改生产默认。
 
-### 8.3 Phase 1 — 自持 decode 内核 + MoE
+### 8.3 Phase 1 — 自持 decode 内核 + MoE（**非当前主线**）
 
-- FI SM120 sparse MLA：仅当上游 probe **absmean≠0** 后默认开启；否则保持
-  `SGLANG_LITE_V4_DISABLE_FI_SPARSE=1` + 官方回退。
-- MoE GEMM：B12x / sgl-kernel 数值门禁；deep-gemm SM120 有再接。
-- 保守 CUDA graph decode——有收益再开。
-- 吞吐：`v4_lite_engine_gen` 1×128 / 4×96 / 1×256 ≥ §6.4.1 warm（允许小幅方差）。
+**产品策略（2026-08-06 冻结）**：
+
+- **主路径 = 官方 `sparse_attn`**；生产默认 `SGLANG_LITE_V4_DISABLE_FI_SPARSE=1`。
+- **FI 永不因 probe 自动成为默认**；仅 `SGLANG_LITE_V4_FORCE_FI_SPARSE=1` 或
+  显式实验。sglang-lite 下一刀是 **0c-4 页为源**，不是默认换核。
+- FI 仅 `KernelBackend` leaf；layout 知识留在 dual-pool / `dsv4_kv_pack`。
+- 吞吐主门禁始终对照 **官方主路径** §6.4.1；FI 另表记录，不替代基线。
+
+其余（MoE B12x / CUDA graph 等）有收益再开，不阻塞 0c-4。
 
 #### 8.3.1 换核门禁骨架（2026-08-06 已落地）
 
 | 项 | 状态 | 说明 |
 | --- | --- | --- |
-| 保守路由 | **done** | `select_sparse_mla_backend`：SM120 默认 `official_sparse_attn`；仅 `numerical_ok=True` 或 `SGLANG_LITE_V4_FORCE_FI_SPARSE=1` 才选 FI |
-| 数值探针 API | **done** | `probe_sm120_sparse_numerical` + `probe_kernel_capabilities(numerical_probe=…)` / env `SGLANG_LITE_V4_FI_SPARSE_NUM_PROBE=1` |
-| 独立脚本 | **done** | `scripts/phase1_kernel_probe.py`（可选 `SGLANG_LITE_FI_PREFIX`） |
-| 单测 | **done** | `tests/test_capability_routing.py`（symbol-only / num-ok / FORCE / fail） |
-| 运行时零输出护栏 | **done**（既有） | `attach_v4_sparse_mla` 若 FI 输出 absmax≈0 则进程内禁用回退官方 |
-| Hybrid DISABLE | **暂保持 1** | 生产仍默认关；Path A 数值对齐后可试 FORCE / 清 DISABLE 做 e2e |
+| 保守路由 | **done** | SM120 默认 `official_sparse_attn`；FI 仅 FORCE 或（实验）numerical_ok |
+| 数值探针 API | **done** | footer pack 后探针可非零；**不等于**生产切 FI |
+| 独立脚本 | **done** | `phase1_kernel_probe.py` / `phase1_fi_vs_official.py` |
+| 单测 | **done** | `tests/test_capability_routing.py` |
+| 零输出护栏 | **done** | hook 若 FI 空输出则进程内回退官方 |
+| Hybrid 生产默认 | **官方** | `DISABLE_FI_SPARSE=1`；不计划在 0c-4 前改默认 |
 
 #### 8.3.2 Path A：真实 tensor 对齐（2026-08-06 PRO6000）
 
@@ -645,9 +650,16 @@ page 内: [0, page*576) = 每 token 的 [nope|rope]（576B）
 摘要：`~/bench/phase1_fi_vs_official_footer.json`。捕获层为纯 SWA
 （`comp_cols=0`，`swa_lens=6`，prompt 短 decode）。
 
-**结论**：FI SM120 sparse **在正确 pack/footer + 真实 q/kv/topk 下已数值可用**
-（bf16 量级误差）。下一步：compress 层对照、FORCE 端到端 logits/吞吐、
-再考虑默认开 FI。
+**结论**：FI **数值可用**（footer + 真实 tensor，max_abs_diff≈0.018），但 Hybrid
+每步 pack 的 e2e **1×128 warm 慢于官方**（~6.13 vs ~7.47 tok/s，FORCE 试跑）。
+**不**据此默认开 FI。主线回到 **0c-4 页为源**；FI 作页就绪后的可选 leaf。
+
+#### 8.3.3 e2e 吞吐试跑（PRO6000，1×128，2026-08-06）
+
+| 路径 | warm tok/s | 说明 |
+| --- | --- | --- |
+| 官方主路径 | **~7.47** | `DISABLE=1`，生产基线 |
+| FI FORCE | ~6.13 | armed=True，fallback=0；仍慢（pack 税） |
 
 复现：
 
