@@ -146,20 +146,22 @@ UniGateway owns cross-backend routing, auth, rate limits, global policy, and agg
 - Prefill-final logits gate (`scripts/v4_logits_compare.py`; soft top5 / CVD near-tie)
 - TP process + standalone SSE acceptance (dedicated CUDA thread)
 
-**Phase 0c (Own KV)** — slices 1–4 landed (PRO6000 dual stats PASS)
+**Phase 0c (Own KV)** — **done** (slices 1–4 + PRO6000 gates)
 
-- Dual-pool packed + bf16 restore pages; Hybrid dual-write / hit fork / append
-- Hit restores ``kv_cache`` from pages; slim CPU snapshot keeps state only
+- Dual-pool packed + bf16 restore; dual-write / hit fork / append / page restore
 - **0c-4 page-primary**: decode stages official buffers from pages; kernel still official
-- Throughput baseline on PRO6000 host: see plan §6.4.1
+- Throughput regression §6.4.2: stage overhead ~1–2.5% warm (PASS)
 - See [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) §8.2
 
-**Phase 1 (Own kernels)** — optional leaf only; **not** the default product path
+**Phase 1 (Own kernels)** — optional leaf only; **not** default
 
-- **Production default**: official TileLang `sparse_attn` (`DISABLE_FI_SPARSE=1`)
-- FI SM120: numerical OK after footer pack (Path A), but Hybrid pack tax → e2e slower; **opt-in FORCE only**
-- Next mainline: Phase **0c-4** (decode from dual-pool pages), not “default FI”
-- Throughput baseline remains official §6.4.1; FI never auto-selected in prod
+- Production default: official TileLang `sparse_attn` (`DISABLE_FI_SPARSE=1`)
+- FI SM120: numerical OK (Path A), e2e slower with Hybrid pack; FORCE only
+
+**Phase 2 (Production hardening)** — in progress (slice 1)
+
+- Prometheus: `engine/metrics_prom.py` + process `GET /metrics` (dual_stage, cache, queue)
+- Next: TTFT/t/s histograms, graceful drain, structured request-id logs
 
 **Phase 2**
 

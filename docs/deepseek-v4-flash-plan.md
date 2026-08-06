@@ -553,7 +553,7 @@ Phase0 HybridMVP → Phase0b Stabilize → Phase0c OwnKV → Phase1 OwnKernels �
 | TP SSE 硬化 | **done** | 专用 CUDA 线程；`v4_remote_acceptance.sh` 手工闸门 |
 | Radix 双池 / FI 换核 | **不做**（本阶段） | 见 0c / 1 |
 
-### 8.2 Phase 0c — 自持 KV（切片 1–3 完成；0c-4 待做）
+### 8.2 Phase 0c — 自持 KV（切片 1–4 + 真机门禁 **完成**）
 
 目标：去掉「官方 Attention 缓冲 + CPU 整包快照」作为唯一 prefix 路径。
 
@@ -730,6 +730,19 @@ SGLANG_LITE_FI_PREFIX=/tmp/fi1616 FLASHINFER_DISABLE_VERSION_CHECK=1 \
 Prometheus（t/s、TTFT、cache_hit、batch、queue、TP 健康）、结构化日志 + request id、
 优雅退出 / drain / 超时 / OOM 拒绝、Mixtral/Qwen-MoE 回归、`lite` 预设。
 UniGateway 仅协议/metrics 联调，不引入业务逻辑进 engine。
+
+#### 8.4.1 切片 1（已落地）— Prometheus dual / 0c 指标
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| `engine/metrics_prom.py` | **done** | `render_prometheus(stats)` 纯函数 |
+| process `GET /metrics` | **done** | 使用 render；含 dual_write/hit/append/restore/**stage** |
+| 既有 queue / cache / OOM | **done** | waiting/running/steps/hit/miss/blocks/oom |
+| v4_hybrid + TP world | **done** | gauges |
+| 单测 | **done** | `tests/test_metrics_prometheus.py` |
+
+控制面 `control` 仍可代理 `engine-url/metrics`。后续切片：TTFT/t/s 直方图、
+drain、结构化 request-id 日志。
 
 ### 8.5 明确永远不做
 

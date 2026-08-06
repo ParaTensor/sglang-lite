@@ -163,26 +163,16 @@ async def readyz():
 
 @app.get("/metrics")
 async def metrics():
+    from .metrics_prom import render_prometheus
+
     if LOOP is None:
-        body = "# no engine\n"
+        body = "# no engine\nsglang_lite_up 0\n"
     else:
-        stats = LOOP.get_stats()
-        lines = [
-            "# HELP sglang_lite_up Engine process up",
-            "# TYPE sglang_lite_up gauge",
-            "sglang_lite_up 1",
-            f"sglang_lite_ready {1 if READY else 0}",
-            f"sglang_lite_waiting_requests {stats['waiting']}",
-            f"sglang_lite_running_requests {stats['running']}",
-            f"sglang_lite_engine_steps {stats['steps']}",
-            f"sglang_lite_multi_request_batches {stats['multi_request_batches']}",
-            f"sglang_lite_cache_hit_count {stats['cache'].get('hit_count', 0)}",
-            f"sglang_lite_cache_miss_count {stats['cache'].get('miss_count', 0)}",
-            f"sglang_lite_kv_blocks_used {stats['cache'].get('blocks_used', 0)}",
-            f"sglang_lite_oom_reject_count {stats['cache'].get('oom_reject_count', 0)}",
-            f"sglang_lite_tp_world_size {world_size()}",
-        ]
-        body = "\n".join(lines) + "\n"
+        body = render_prometheus(
+            LOOP.get_stats(),
+            ready=READY,
+            tp_world_size=world_size(),
+        )
     return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 

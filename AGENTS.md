@@ -141,15 +141,16 @@ sglang-lite 强调高内聚与整洁，**根目录严禁堆放非核心内容**�
 
 ## 当前阶段
 
-当前处于 **Phase 0c 切片 1–4**：双写 / 生命周期 / page restore / **page-primary
-stage**（decode 前从 pages 灌回官方 buffer，核仍官方）。继续自持 Token Factory。
+当前处于 **Phase 0c 完成 + Phase 2 切片 1（metrics）**：
+双写 / 生命周期 / page restore / page-primary stage 与 PRO6000 门禁已过；
+`GET /metrics` 暴露 dual_stage 等 Prometheus 计数。主路径仍官方核。
 
 **产品策略（已定）**：
 
 - **主路径**：官方 TileLang `sparse_attn`（Hybrid 生产默认）。
-- **FI SM120 sparse**：**非默认**；仅 `FORCE` / 显式实验。Path A 数值可对齐，
-  e2e 仍慢于官方；不自动切 FI。
-- 0c-4 契约：`_v4_page_primary` 时 pages 为 KV SoT；官方 buffer 仅 staging。
+- **FI SM120 sparse**：**非默认**；仅 `FORCE` / 显式实验。
+- 0c-4：`_v4_page_primary` 时 pages 为 KV SoT；官方 buffer 仅 staging。
+- 下一 Phase 2：TTFT/t/s、drain、request-id 日志（不扩宽协议面）。
 - FI 只作 `KernelBackend` leaf；禁止泄漏进 Scheduler / control。
 
 阶段定义与验收见 [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) **§8**。
