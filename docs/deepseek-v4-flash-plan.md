@@ -616,21 +616,38 @@ Phase0 HybridMVP → Phase0b Stabilize → Phase0c OwnKV → Phase1 OwnKernels �
 | 独立脚本 | **done** | `scripts/phase1_kernel_probe.py`（可选 `SGLANG_LITE_FI_PREFIX`） |
 | 单测 | **done** | `tests/test_capability_routing.py`（symbol-only / num-ok / FORCE / fail） |
 | 运行时零输出护栏 | **done**（既有） | `attach_v4_sparse_mla` 若 FI 输出 absmax≈0 则进程内禁用回退官方 |
-| Hybrid DISABLE | **保持 1** | 生产路径仍建议 `SGLANG_LITE_V4_DISABLE_FI_SPARSE=1` 直到上游 absmean≠0 |
+| Hybrid DISABLE | **暂保持 1** | 生产仍默认关；Path A 数值对齐后可试 FORCE / 清 DISABLE 做 e2e |
 
-**PRO6000 探针结果**（宿主 torch 2.11+cu130）：
+#### 8.3.2 Path A：真实 tensor 对齐（2026-08-06 PRO6000）
 
-| 配置 | FI 版本 | SM120 symbol | absmean | finite | 选择 |
-| --- | --- | --- | --- | --- | --- |
-| 默认 venv | 0.6.12 | **无** | — | — | `official_sparse_attn` |
-| `SGLANG_LITE_FI_PREFIX=/tmp/fi1616` | 0.6.16.post1 | **有** | **0.0** | true | `official_sparse_attn`（num fail） |
+脚本：`scripts/phase1_fi_vs_official.py`（hook 首个 decode 的官方
+`sparse_attn` 张量 → pack → FI 多变体对照）。
 
-摘要：`~/bench/phase1_kernel_probe_default.json`、
-`~/bench/phase1_kernel_probe_fi1616.json`。
+**根因（已修）**：`to_paged_hnd` 原先按 token 交错存 584 B；FI SM120 DSV4
+物理页是 **footer 布局**：
 
-**结论**：Phase 1 **入口与门禁已就绪**；FI SM120 sparse **仍不得默认开启**。
-下一步（上游或本地 kernel 修复后）：复跑 `phase1_kernel_probe` → absmean>0 →
-清 DISABLE / 清 FORCE 依赖 → 对照 §6.4.1 吞吐。
+```
+page 内: [0, page*576) = 每 token 的 [nope|rope]（576B）
+         [page*576, page*584) = scale footer（每 token 8B）
+```
+
+见 FI `kv_cache_traits.cuh` / `kv_cache_io.cuh`。交错布局 → absmean=0 或
+爆炸；footer 布局后与官方对齐。
+
+| 变体 | FI absmean | max‖FI−ref‖ | mean‖diff‖ | 备注 |
+| --- | --- | --- | --- | --- |
+| official ref | 0.281 | — | — | TileLang |
+| act_quant + footer | **0.281** | **0.0176** | 0.00284 | 推荐 |
+| torch_fp8 + footer | 0.281 | 0.0176 | 0.00284 | 同量级 |
+| no sinks | 0.292 | 0.69 | 0.012 | sinks 需保留 |
+| 随机 uint8（旧探针） | 0.0 | — | — | 无效输入，不能当门禁 |
+
+摘要：`~/bench/phase1_fi_vs_official_footer.json`。捕获层为纯 SWA
+（`comp_cols=0`，`swa_lens=6`，prompt 短 decode）。
+
+**结论**：FI SM120 sparse **在正确 pack/footer + 真实 q/kv/topk 下已数值可用**
+（bf16 量级误差）。下一步：compress 层对照、FORCE 端到端 logits/吞吐、
+再考虑默认开 FI。
 
 复现：
 

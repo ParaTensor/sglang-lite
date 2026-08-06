@@ -31,6 +31,28 @@ def test_to_paged_pads_to_page_size():
     assert pages.shape == (1, 1, DSV4_PAGE_SIZE, DSV4_PACKED_BYTES)
 
 
+def test_to_paged_footer_physical_layout():
+    """FI SM120 DSV4: data is local*576, scales at page*576 + local*8."""
+    from sglang_lite.dsv4_kv_pack import DSV4_DATA_BYTES, DSV4_SCALE_STRIDE
+
+    packed = torch.arange(70 * DSV4_PACKED_BYTES, dtype=torch.int64).to(torch.uint8)
+    packed = packed.view(70, DSV4_PACKED_BYTES).clone()
+    # Mark token0/1 data and scales uniquely
+    packed[0, :DSV4_DATA_BYTES] = 11
+    packed[0, DSV4_DATA_BYTES:] = 22
+    packed[1, :DSV4_DATA_BYTES] = 33
+    packed[1, DSV4_DATA_BYTES:] = 44
+    pages = to_paged_hnd(packed, page_size=DSV4_PAGE_SIZE)
+    flat = pages.view(2, -1)[0]
+    assert (flat[0:DSV4_DATA_BYTES] == 11).all()
+    assert (flat[DSV4_DATA_BYTES : 2 * DSV4_DATA_BYTES] == 33).all()
+    scale0 = DSV4_PAGE_SIZE * DSV4_DATA_BYTES
+    assert (flat[scale0 : scale0 + DSV4_SCALE_STRIDE] == 22).all()
+    assert (
+        flat[scale0 + DSV4_SCALE_STRIDE : scale0 + 2 * DSV4_SCALE_STRIDE] == 44
+    ).all()
+
+
 def test_split_swa_compress_indices():
     # window=4, plus 2 compress cols (already offset by window in official layout)
     topk = torch.tensor(

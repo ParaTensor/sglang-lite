@@ -1,10 +1,22 @@
-"""DeepSeek-V4 packed KV (FlashInfer SM120 sparse MLA, 584 B/token).
+"""DeepSeek-V4 packed KV for FlashInfer SM120 sparse MLA.
 
-Layout (matches vLLM fp8_ds_mla / FlashInfer SM120 docs):
+Logical per-token layout (584 B) — used for packing intermediates:
+
   bytes[0:448]   — NoPE as float8_e4m3 (448 dims)
   bytes[448:576] — RoPE as 64×bfloat16 (128 bytes)
   bytes[576:583] — 7×ue8m0 block scales (block_size=64)
   bytes[583:584] — pad
+
+Physical page layout (FlashInfer DSV4 footer ABI, page_block_size=64)::
+
+  [0 : page*576)              — per-token [nope|rope] only (576 B each)
+  [page*576 : page*584)       — scale footer (8 B each: 7×ue8m0 + pad)
+
+PyTorch API still exposes ``[num_pages, 1, page_size, 584]`` (HND), but the
+underlying bytes within each page **must** be the footer layout — the kernel
+addresses data as ``local_idx * 576`` and scales as
+``page_size * 576 + local_idx * 8``. Interleaved 584-per-token storage yields
+absmean≈0 / garbage (Path A finding, PRO6000 2026-08-06).
 """
 
 from __future__ import annotations
@@ -17,9 +29,12 @@ DSV4_HEAD_DIM = 512
 DSV4_NOPE_DIM = 448
 DSV4_ROPE_DIM = 64
 DSV4_PACKED_BYTES = 584
+DSV4_DATA_BYTES = 576  # nope + rope (no scale)
 DSV4_SCALE_BYTES = 7
+DSV4_SCALE_STRIDE = 8  # 7 scales + 1 pad
 DSV4_FP8_BLOCK = 64
 DSV4_PAGE_SIZE = 64
+DSV4_FP8_MAX = 448.0
 
 
 def pack_dsv4_kv_bf16(
@@ -27,7 +42,7 @@ def pack_dsv4_kv_bf16(
     *,
     act_quant_fn=None,
 ) -> torch.Tensor:
-    """Pack bf16 KV ``[..., 512]`` → uint8 ``[..., 584]``.
+    """Pack bf16 KV ``[..., 512]`` → logical uint8 ``[..., 584]``.
 
     Prefers official ``kernel.act_quant`` when ``act_quant_fn`` is provided
     (scale_fmt=ue8m0) so packing matches the Hybrid model's QAT path.
@@ -63,16 +78,23 @@ def pack_dsv4_kv_bf16(
 def _torch_fp8_ue8m0_quant(
     x: torch.Tensor, block_size: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fallback block FP8 + power-of-two ue8m0 scales (no TileLang)."""
+    """Fallback block FP8 + power-of-two ue8m0 scales (matches FI fp8_quant).
+
+    FI / official QAT: ``scale = amax / 448``, rounded **up** to power-of-two;
+    store ``y = clamp(x / scale, ±448)`` as e4m3 and ``scale`` as ue8m0.
+    """
     n = x.shape[-1]
     if n % block_size != 0:
         raise ValueError(f"last dim {n} not divisible by block_size={block_size}")
     xf = x.reshape(-1, n).to(torch.float32)
     groups = xf.view(-1, n // block_size, block_size)
     amax = groups.abs().amax(dim=-1).clamp(min=1e-12)
-    # Power-of-two scale (ue8m0-style).
-    scale = torch.exp2(torch.ceil(torch.log2(amax)))
-    y = (groups / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    # scale = amax / FP8_MAX, power-of-two ceil (UE8M0-friendly).
+    raw = amax * (1.0 / DSV4_FP8_MAX)
+    scale = torch.exp2(torch.ceil(torch.log2(raw.clamp(min=2**-30))))
+    y = (groups / scale.unsqueeze(-1)).clamp(-DSV4_FP8_MAX, DSV4_FP8_MAX).to(
+        torch.float8_e4m3fn
+    )
     s = scale.to(torch.float8_e8m0fnu)
     y = y.view(*x.shape[:-1], n)
     s = s.view(*x.shape[:-1], n // block_size)
@@ -83,7 +105,12 @@ def to_paged_hnd(
     packed_tokens: torch.Tensor,
     page_size: int = DSV4_PAGE_SIZE,
 ) -> torch.Tensor:
-    """``[T, 584]`` uint8 → ``[num_pages, 1, page_size, 584]`` (HND, H=1)."""
+    """``[T, 584]`` logical → ``[num_pages, 1, page_size, 584]`` **footer** pages.
+
+    Rearranges each page from interleaved 584-per-token into the FlashInfer
+    DSV4 physical footer layout (see module docstring). Shape matches the
+    public HND API; byte order within each page matches the CUDA kernel.
+    """
     if packed_tokens.dim() != 2 or packed_tokens.shape[-1] != DSV4_PACKED_BYTES:
         raise ValueError(f"expected [T, 584], got {tuple(packed_tokens.shape)}")
     t = packed_tokens.shape[0]
@@ -97,7 +124,26 @@ def to_paged_hnd(
             dim=0,
         )
     n_pages = packed_tokens.shape[0] // page_size
-    return packed_tokens.view(n_pages, 1, page_size, DSV4_PACKED_BYTES)
+    # [P, page_size, 584] logical interleaved
+    logical = packed_tokens.view(n_pages, page_size, DSV4_PACKED_BYTES)
+    data = logical[:, :, :DSV4_DATA_BYTES].contiguous()  # [P, S, 576]
+    scales = logical[:, :, DSV4_DATA_BYTES:].contiguous()  # [P, S, 8]
+
+    # Physical: [data flat | scale footer]
+    physical = torch.empty(
+        n_pages,
+        page_size * DSV4_PACKED_BYTES,
+        dtype=torch.uint8,
+        device=packed_tokens.device,
+    )
+    physical[:, : page_size * DSV4_DATA_BYTES] = data.reshape(
+        n_pages, page_size * DSV4_DATA_BYTES
+    )
+    physical[:, page_size * DSV4_DATA_BYTES :] = scales.reshape(
+        n_pages, page_size * DSV4_SCALE_STRIDE
+    )
+    # View as HND for FI shape checks; kernel uses flat block pointer + strides.
+    return physical.view(n_pages, 1, page_size, DSV4_PACKED_BYTES)
 
 
 def split_swa_compress_indices(

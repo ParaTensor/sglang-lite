@@ -170,64 +170,37 @@ def probe_sm120_sparse_numerical(
         return result
 
     try:
+        from .dsv4_kv_pack import pack_dsv4_kv_bf16, to_paged_hnd
+
         B, qlen, H = 1, 1, 8
-        page_size, swa_pages, comp_pages = 64, 4, 16
-        packed_dim = 584
-        swa_topk, sparse_topk = 128, 128
+        # Use real bf16 → 584 pack → **footer** paged layout (not random uint8).
+        # Random raw bytes historically produced absmean=0 even when the kernel works.
+        n_swa_tokens = 64  # one page
         q = torch.randn(B, qlen, H, 512, device=device, dtype=torch.bfloat16)
-        swa = torch.zeros(
-            swa_pages, 1, page_size, packed_dim, device=device, dtype=torch.uint8
-        )
-        # Non-zero packed bytes so a working kernel is less likely to be pure zero
-        # solely from empty KV (still may be zero if the kernel is broken).
-        swa.view(-1)[:4096] = torch.randint(
-            1, 200, (4096,), device=device, dtype=torch.uint8
-        )
-        compressed = torch.zeros(
-            comp_pages, 1, page_size, packed_dim, device=device, dtype=torch.uint8
-        )
-        compressed.view(-1)[:4096] = torch.randint(
-            1, 200, (4096,), device=device, dtype=torch.uint8
-        )
-        swa_idx = torch.randint(
-            0,
-            swa_pages * page_size,
-            (B * qlen, swa_topk),
-            device=device,
-            dtype=torch.int32,
-        )
-        extra_idx = torch.randint(
-            0,
-            max(comp_pages * page_size, 1),
-            (B * qlen, sparse_topk),
-            device=device,
-            dtype=torch.int32,
+        kv_bf16 = torch.randn(n_swa_tokens, 512, device=device, dtype=torch.bfloat16)
+        packed = pack_dsv4_kv_bf16(kv_bf16)
+        swa = to_paged_hnd(packed)  # [1, 1, 64, 584] footer physical
+        # Sequential valid indices into the single page; pad to legal topk=128 with -1.
+        swa_idx = torch.full((B * qlen, 128), -1, device=device, dtype=torch.int32)
+        swa_idx[0, :n_swa_tokens] = torch.arange(
+            n_swa_tokens, device=device, dtype=torch.int32
         )
         swa_topk_lens = torch.full(
-            (B * qlen,), swa_topk, device=device, dtype=torch.int32
-        )
-        extra_topk_lens = torch.full(
-            (B * qlen,), sparse_topk, device=device, dtype=torch.int32
-        )
-        seq = torch.full(
-            (B,), swa_pages * page_size, device=device, dtype=torch.int32
+            (B * qlen,), n_swa_tokens, device=device, dtype=torch.int32
         )
         workspace = torch.empty(256 * 1024 * 1024, device=device, dtype=torch.uint8)
-        # FI 0.6.16 signature (positional): query, swa_kv_cache, workspace_buffer,
-        # sparse_indices, compressed_kv_cache, sparse_topk_lens, seq_lens, ...
-        # SM120 also accepts swa_topk_lens / extra_sparse_*.
+        sm_scale = 512 ** -0.5
+        # Prefer kwargs (SM120 path); matches v4_sparse_mla / FI 0.6.16 signature.
         out = mla.trtllm_batch_decode_sparse_mla_dsv4(
-            q,
-            swa,
-            workspace,
-            swa_idx,
-            compressed,
-            None,
-            seq,
+            query=q,
+            swa_kv_cache=swa,
+            workspace_buffer=workspace,
+            sparse_indices=swa_idx,
+            compressed_kv_cache=None,
+            bmm1_scale=float(sm_scale),
+            bmm2_scale=1.0,
             kv_layout="HND",
             swa_topk_lens=swa_topk_lens,
-            extra_sparse_indices=extra_idx,
-            extra_sparse_topk_lens=extra_topk_lens,
         )
         of = out.detach().float()
         absmean = float(of.abs().mean().item())
