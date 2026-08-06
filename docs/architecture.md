@@ -163,13 +163,13 @@ LiteEngine CB + TP SSE      →     same scheduler contract      throughput ≥ 
 
 Metrics: `dual_restore_count`, `prefix_dual_primary`.
 
-**Phase 1 gate skeleton (landed):** SM120 sparse selection is **conservative**
-(`official_sparse_attn` unless `sparse_mla_sm120_numerical_ok` or
-`SGLANG_LITE_V4_FORCE_FI_SPARSE`). Probe API:
-`probe_sm120_sparse_numerical` / `scripts/phase1_kernel_probe.py`. PRO6000
-FI 0.6.16 still absmean=0. Throughput baseline: plan §6.4.1.
+**Phase 0c-4 (landed):** when `seq._v4_page_primary`, each decode **stages**
+official `kv_cache` from dual-pool bf16 pages (`dual_stage_count`) then runs
+official `sparse_attn`. Pages are SoT; module buffers are staging only.
+FI remains opt-in FORCE (Path A numerical OK; e2e not faster yet).
 
-Next: attention reads pages (0c-4) and/or upstream FI non-zero probe.
+**Phase 1:** leaf optional only; production default official. Throughput
+baseline: plan §6.4.1.
 
 Do not treat “FI attached” as Owned KV: FlashInfer is a leaf; Radix page
 lifecycle and scheduler grouping remain the engine’s job.

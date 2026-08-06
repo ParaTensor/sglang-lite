@@ -141,16 +141,16 @@ sglang-lite 强调高内聚与整洁，**根目录严禁堆放非核心内容**�
 
 ## 当前阶段
 
-当前处于 **Phase 0c 切片 1–3 完成**；下一主线是 **0c-4（decode 以 page 为源）**，
-继续 sglang-lite 自持 Token Factory，而不是默认换核。
+当前处于 **Phase 0c 切片 1–4**：双写 / 生命周期 / page restore / **page-primary
+stage**（decode 前从 pages 灌回官方 buffer，核仍官方）。继续自持 Token Factory。
 
 **产品策略（已定）**：
 
 - **主路径**：官方 TileLang `sparse_attn`（Hybrid 生产默认）。
-- **FI SM120 sparse**：**非默认**；仅 `FORCE` / 显式实验。Path A 已证数值可对齐，
-  但 Hybrid 每步 pack 使 e2e 吞吐仍慢于官方（PRO6000 1×128 ~−18%）。
-- **不**在 probe 通过后自动切 FI；FI 收益须等 dual-pool 页为源后再评估。
-- FI 只作 `KernelBackend` leaf；禁止把 FI 布局/分支泄漏进 Scheduler / control。
+- **FI SM120 sparse**：**非默认**；仅 `FORCE` / 显式实验。Path A 数值可对齐，
+  e2e 仍慢于官方；不自动切 FI。
+- 0c-4 契约：`_v4_page_primary` 时 pages 为 KV SoT；官方 buffer 仅 staging。
+- FI 只作 `KernelBackend` leaf；禁止泄漏进 Scheduler / control。
 
 阶段定义与验收见 [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) **§8**。
 

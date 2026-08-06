@@ -18,7 +18,7 @@ official `inference/` + leaf kernels (FlashInfer/sgl-kernel); see `docs/deepseek
 | 路径 | 当前阶段 | KV / prefix | Decode 内核 | 备注 |
 |------|----------|-------------|-------------|------|
 | Mixtral / Qwen-MoE 等 | Phase 0 已验 | Radix paged K/V + `last_logits`；CUDA 上 FlashInfer paged 为 sole attention 源 | HF / FlashInfer paged；MoE 叶子仍 P1 | CPU 仍可从 page 重建 HF attn |
-| DeepSeek-V4-Flash | **0c 切片1–3；下一 0c-4** | dual-pool 双写/生命周期/page restore；PRO6000 dual+吞吐基线 PASS | **主路径官方 `sparse_attn`**；FI 仅 FORCE 实验（数值可对齐，e2e 未加速） | plan §6.4.1 / §8.2–8.3；不默认换核 |
+| DeepSeek-V4-Flash | **0c 切片1–4** | dual-pool 双写/生命周期/page restore；**page-primary stage**（decode 前 pages→buffer） | **主路径官方 `sparse_attn`**；FI 仅 FORCE 实验 | plan §8.2.5 / §6.4.1；不默认换核 |
 | 目标态（健全引擎） | Phase 0c-4 → 1 → 2 | Owned Radix 双池 **为源** restore/COW；`cache_hit_tokens` = 真实跳过 prefill | KernelBackend capability 路由；官方核仅回退 | §8 验收表；不扩大 vLLM 功能面 |
 
 Scheduler groups requests; the runner issues **tensor-batched** forwards when sequences share

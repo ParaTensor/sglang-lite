@@ -597,8 +597,21 @@ Phase0 HybridMVP → Phase0b Stabilize → Phase0c OwnKV → Phase1 OwnKernels �
 
 摘要：`~/bench/v4_dual_stats_pro6000.json`。退出时 NCCL destroy SIGABRT 仍有（与 align 相同，**不影响门禁结果**）。
 
-**下一主线（0c-4）**：decode attention **以 dual-pool page 为源**（可先仍调官方核
-做正确性）。FI 读 packed 页是 0c-4 之后的可选 leaf，**不**改生产默认。
+#### 8.2.5 切片 4（已落地）— page-primary stage（官方核）
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| 页为 SoT 标记 | **done** | `seq._v4_page_primary`：dual-write slim 后 / hit restore 后置位 |
+| decode 前 stage | **done** | `_v4_stage_pages_before_forward` → `stage_official_kv_from_pages` |
+| 与 hit restore 分计数 | **done** | `dual_stage_count` vs `dual_restore_count` |
+| attention 核 | **仍官方** | TileLang `sparse_attn` 读 stage 后的 module buffer；FI 非默认 |
+| 单测 | **done** | `tests/test_v4_dual_pool_stage.py` |
+
+契约：page-primary 时 **pages 是 KV 真源**；官方 buffer 只是
+`sparse_attn` 的 staging。decode 后仍 `dual_append` 把新 token 写回 pages。
+
+**仍后置**：decode 直接读 packed 页做 FI leaf（不默认）；更细的 SWA/comp
+分池语义与官方 ring 对齐。
 
 ### 8.3 Phase 1 — 自持 decode 内核 + MoE（**非当前主线**）
 

@@ -555,6 +555,7 @@ class EngineLoop:
                     "dual_hit_count",
                     "dual_append_count",
                     "dual_restore_count",
+                    "dual_stage_count",
                     "has_packed_swa",
                     "has_packed_comp",
                     "has_restore_bf16",

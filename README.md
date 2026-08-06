@@ -146,11 +146,11 @@ UniGateway owns cross-backend routing, auth, rate limits, global policy, and agg
 - Prefill-final logits gate (`scripts/v4_logits_compare.py`; soft top5 / CVD near-tie)
 - TP process + standalone SSE acceptance (dedicated CUDA thread)
 
-**Phase 0c (Own KV)** — slices 1–3 landed (PRO6000 dual stats PASS)
+**Phase 0c (Own KV)** — slices 1–4 landed (PRO6000 dual stats PASS)
 
 - Dual-pool packed + bf16 restore pages; Hybrid dual-write / hit fork / append
 - Hit restores ``kv_cache`` from pages; slim CPU snapshot keeps state only
-- Decode still official ``sparse_attn`` (pages not yet attention source)
+- **0c-4 page-primary**: decode stages official buffers from pages; kernel still official
 - Throughput baseline on PRO6000 host: see plan §6.4.1
 - See [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) §8.2
 

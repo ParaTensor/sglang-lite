@@ -546,6 +546,8 @@ class ModelRunner:
                 return
             for b, seq in enumerate(seqs):
                 self._v4_ensure_restored(seq, batch_slot=b)
+                if max_past > 0:
+                    self._v4_stage_pages_before_forward(seq, batch_slot=b)
             logits = self._model_forward_v4(input_ids, start_pos=max_past)
             for b, (seq, i) in enumerate(zip(seqs, idxs)):
                 nlen = new_lens[b]
@@ -622,6 +624,8 @@ class ModelRunner:
         if self._v4_hybrid:
             for b, seq in enumerate(seqs):
                 self._v4_ensure_restored(seq, batch_slot=b)
+                # 0c-4: page-primary → stage official kv_cache from pages first.
+                self._v4_stage_pages_before_forward(seq, batch_slot=b)
             start_pos = seqs[0].cached_len
             logits = self._model_forward_v4(input_ids, start_pos=start_pos)
             for b, (seq, i) in enumerate(zip(seqs, idxs)):
@@ -683,6 +687,8 @@ class ModelRunner:
             if start > 0 and len(new_tokens) > 1:
                 row = None
                 for t_i, tok in enumerate(new_tokens):
+                    if t_i == 0 or getattr(seq, "_v4_page_primary", False):
+                        self._v4_stage_pages_before_forward(seq, batch_slot=0)
                     step_ids = torch.tensor(
                         [[tok]], dtype=torch.long, device=self.device
                     )
@@ -690,6 +696,8 @@ class ModelRunner:
                     row = logits[0]
                 assert row is not None
             else:
+                if start > 0:
+                    self._v4_stage_pages_before_forward(seq, batch_slot=0)
                 logits = self._model_forward_v4(input_ids, start_pos=start)
                 row = logits[0]
             seq.last_logits = row.detach().float().cpu().clone()
@@ -732,10 +740,12 @@ class ModelRunner:
         pos = seq.cached_len
         if self._v4_hybrid:
             self._v4_ensure_restored(seq, batch_slot=0)
+            self._v4_stage_pages_before_forward(seq, batch_slot=0)
             logits = self._model_forward_v4(input_ids, start_pos=pos)
             row = logits[0]
             seq.kv_state = None
             seq.cached_len = pos + 1
+            self._v4_dual_append_decode(seq, batch_slot=0, radix=radix)
             return self._sample(row, seq)
         self._ensure_blocks(seq, radix, pos + 1)
         if seq.block_table:
@@ -836,6 +846,9 @@ class ModelRunner:
                     )
                     if n_dual > 0:
                         seq._v4_dual_restored = True
+                        # 0c-4: after page restore, pages own KV for subsequent decode.
+                        if getattr(entry, "dual_primary", False) or n_dual > 0:
+                            seq._v4_page_primary = True
                 except Exception as e:
                     print(f"[sglang-lite] v4 dual-pool restore skipped: {e}")
                     skip_keys = set()
@@ -870,6 +883,8 @@ class ModelRunner:
         seq._v4_prefix_entry = None
         seq._v4_kv_pending_restore = False
         seq._v4_slot_prepared = False
+        seq._v4_page_primary = False
+        seq._v4_dual_restored = False
 
     def _v4_release_dual_pool(self, seq: Sequence) -> None:
         """Free dual-pool pages forked for this sequence (not the prefix-cache copy)."""
@@ -887,6 +902,41 @@ class ModelRunner:
             seq._v4_dual_radix = None
         seq.swa_block_table = []
         seq.comp_block_table = []
+        seq._v4_page_primary = False
+
+    def _v4_stage_pages_before_forward(
+        self, seq: Sequence, *, batch_slot: int = 0
+    ) -> bool:
+        """Phase 0c-4: if page-primary, re-stage official kv_cache from pages.
+
+        Official ``sparse_attn`` still reads module buffers; pages are the
+        source of truth and staging makes that contract explicit each step.
+        """
+        if not getattr(seq, "_v4_page_primary", False) or self.model is None:
+            return False
+        handle = getattr(seq, "_v4_dual_handle", None)
+        radix = getattr(seq, "_v4_dual_radix", None)
+        if handle is None or radix is None or not handle.swa_blocks:
+            return False
+        if getattr(radix, "restore_bf16_cache", None) is None:
+            return False
+        n = int(handle.n_tokens or seq.cached_len or 0)
+        if n <= 0:
+            return False
+        try:
+            from .v4_dual_pool import stage_official_kv_from_pages
+
+            n_mod, _ = stage_official_kv_from_pages(
+                self.model,
+                radix,
+                handle,
+                batch_slot=batch_slot,
+                n_tokens=n,
+            )
+            return n_mod > 0
+        except Exception as e:
+            print(f"[sglang-lite] v4 page stage skipped: {e}")
+            return False
 
     def v4_attach_dual_pool_from_entry(
         self, seq: Sequence, entry, radix: Optional[RadixCache]
@@ -907,6 +957,9 @@ class ModelRunner:
         seq._v4_dual_radix = radix
         seq.swa_block_table = list(handle.swa_blocks)
         seq.comp_block_table = list(handle.comp_blocks)
+        # dual_primary entries will stage from pages after hit restore.
+        if getattr(entry, "dual_primary", False):
+            seq._v4_page_primary = True
         return True
 
     def _v4_maybe_save_prefix(
@@ -967,6 +1020,8 @@ class ModelRunner:
                     if paged_keys and radix.restore_bf16_cache is not None:
                         buffers = slim_snapshot_buffers(buffers, paged_keys)
                         dual_primary = True
+                        # 0c-4: this sequence's further decode stages from pages.
+                        seq._v4_page_primary = True
             except Exception as e:
                 # Dual-write is best-effort; full CPU snapshot remains restore path.
                 print(f"[sglang-lite] v4 dual-write skipped: {e}")

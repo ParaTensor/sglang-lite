@@ -4,7 +4,10 @@ Hybrid still runs official ``sparse_attn`` with in-module buffers. This module:
 
 1. **Dual-writes** packed uint8 pages (future FI path) + bf16 restore pages.
 2. **Restores** official ``kv_cache`` rows from bf16 pages on prefix hit (0c-3).
-3. Keeps CPU snapshots for ``kv_state`` / ``score_state`` and as fallback.
+3. **Stages** official buffers from pages before decode when page-primary (0c-4):
+   pages are the source of truth; official ``kv_cache`` is a staging area for
+   TileLang ``sparse_attn`` (FI leaf remains opt-in, not default).
+4. Keeps CPU snapshots for ``kv_state`` / ``score_state`` and as fallback.
 
 Ownership: see :class:`~sglang_lite.v4_prefix_cache.V4PrefixCache`.
 """
@@ -393,7 +396,7 @@ def dual_append_from_model(
     return wrote
 
 
-def restore_dual_pool_to_model(
+def _apply_restore_bf16_to_model(
     model: torch.nn.Module,
     radix: RadixCache,
     handle: DualPoolHandle,
@@ -401,10 +404,7 @@ def restore_dual_pool_to_model(
     batch_slot: int = 0,
     n_tokens: Optional[int] = None,
 ) -> Tuple[int, Set[str]]:
-    """Write bf16 restore pages back into model ``kv_cache`` modules.
-
-    Returns ``(n_modules_written, restored_keys)``.
-    """
+    """Copy bf16 restore pages → model ``kv_cache`` rows (no counters)."""
     if radix.restore_bf16_cache is None or not handle.swa_blocks:
         return 0, set()
     n = int(n_tokens if n_tokens is not None else handle.n_tokens)
@@ -417,7 +417,6 @@ def restore_dual_pool_to_model(
         radix.num_layers,
         max(len(handle.layer_keys), 1),
     )
-    # Prefer explicit layer_keys length.
     if handle.layer_keys:
         n_layers = min(len(handle.layer_keys), radix.num_layers)
     for layer_idx in range(n_layers):
@@ -437,8 +436,53 @@ def restore_dual_pool_to_model(
         if _write_module_kv_row(model, key, data, batch_slot=batch_slot):
             restored.add(key)
             written += 1
+    return written, restored
+
+
+def restore_dual_pool_to_model(
+    model: torch.nn.Module,
+    radix: RadixCache,
+    handle: DualPoolHandle,
+    *,
+    batch_slot: int = 0,
+    n_tokens: Optional[int] = None,
+) -> Tuple[int, Set[str]]:
+    """Prefix-hit restore: pages → official buffers (increments ``dual_restore_count``)."""
+    written, restored = _apply_restore_bf16_to_model(
+        model,
+        radix,
+        handle,
+        batch_slot=batch_slot,
+        n_tokens=n_tokens,
+    )
     if written:
         radix.dual_restore_count += 1
+    return written, restored
+
+
+def stage_official_kv_from_pages(
+    model: torch.nn.Module,
+    radix: RadixCache,
+    handle: DualPoolHandle,
+    *,
+    batch_slot: int = 0,
+    n_tokens: Optional[int] = None,
+) -> Tuple[int, Set[str]]:
+    """Phase 0c-4: re-stage official ``kv_cache`` from pages before decode.
+
+    When page-primary, dual-pool bf16 pages are the source of truth; the
+    official module buffers are only a staging area for TileLang
+    ``sparse_attn``. Increments ``dual_stage_count`` (distinct from hit restore).
+    """
+    written, restored = _apply_restore_bf16_to_model(
+        model,
+        radix,
+        handle,
+        batch_slot=batch_slot,
+        n_tokens=n_tokens,
+    )
+    if written:
+        radix.dual_stage_count += 1
     return written, restored
 
 

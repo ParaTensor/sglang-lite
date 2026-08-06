@@ -249,6 +249,8 @@ class RadixCache:
         self.dual_hit_count = 0
         self.dual_append_count = 0
         self.dual_restore_count = 0
+        # Phase 0c-4: pre-forward stage of official buffers from pages.
+        self.dual_stage_count = 0
 
     def match_prefix(
         self, token_ids: List[int]
@@ -707,6 +709,7 @@ class RadixCache:
             "dual_hit_count": self.dual_hit_count,
             "dual_append_count": self.dual_append_count,
             "dual_restore_count": self.dual_restore_count,
+            "dual_stage_count": self.dual_stage_count,
             "has_packed_swa": self.packed_swa_cache is not None
             or self.packed_kv_cache is not None,
             "has_packed_comp": self.packed_comp_cache is not None,
