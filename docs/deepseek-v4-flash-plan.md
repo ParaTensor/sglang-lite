@@ -610,6 +610,25 @@ Phase0 HybridMVP → Phase0b Stabilize → Phase0c OwnKV → Phase1 OwnKernels �
 契约：page-primary 时 **pages 是 KV 真源**；官方 buffer 只是
 `sparse_attn` 的 staging。decode 后仍 `dual_append` 把新 token 写回 pages。
 
+#### 8.2.6 PRO6000 0c-4 真机（2026-08-06，宿主 torch 2.11+cu130）
+
+脚本：`scripts/v4_dual_stats_probe.py`（cold+warm `Hello`，max_new=8，官方核）。
+
+| 指标 | 结果 |
+| --- | --- |
+| cold / warm 文本 | `Hello! How can I help you today` |
+| `warm_cache_hit_tokens` | **5** |
+| `dual_write_count` | 1（5 tokens） |
+| `dual_hit_count` | **1** |
+| `dual_restore_count` | **1** |
+| `dual_stage_count` | **14**（cold 后 7，warm 累计 14） |
+| `dual_append_count` | 14 |
+| 门禁 | **PASS**（write/hit/restore/stage/warm_hit/text 全 true） |
+
+摘要：`~/bench/v4_dual_stats_0c4.json`。退出时 NCCL destroy 仍可能挂
+（与历史 dual probe 相同，**不影响门禁 JSON**）；探针已改为各 rank 对称
+`shutdown`、无结果后 barrier。
+
 **仍后置**：decode 直接读 packed 页做 FI leaf（不默认）；更细的 SWA/comp
 分池语义与官方 ring 对齐。
 
