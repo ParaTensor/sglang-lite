@@ -562,7 +562,24 @@ Phase0 HybridMVP → Phase0b Stabilize → Phase0c OwnKV → Phase1 OwnKernels �
 | slim snapshot | **done** | `dual_primary`：入库时丢掉已 page 化的 `*.kv_cache`，保留 state |
 | 单测 | **done** | `tests/test_v4_dual_pool_restore.py` |
 
-**仍未做（0c-4 / Phase 1）**：decode 直接读 page 做 attention；FI SM120 用 packed 池；PRO6000 真机 dual_restore 数字回填。
+#### 8.2.4 PRO6000 真机 dual stats（2026-08-06，宿主 torch 2.11+cu130）
+
+脚本：`~/bench/v4_dual_stats_probe.py`（cold + warm `Hello`，TP=8）。
+
+| 指标 | cold | warm |
+| --- | --- | --- |
+| 文本 | `Hello! How can I help you today` | 同 |
+| `cache_hit_tokens` | 0 | **5** |
+| `dual_write_count` | 1（5 tokens） | 1 |
+| `dual_hit_count` | 0 | **1** |
+| `dual_restore_count` | 0 | **1** |
+| `dual_append_count` | 7 | 14（decode 追加） |
+| `prefix_dual_primary` | 1 | 1 |
+| 门禁 | — | **PASS**（write/hit/restore/warm_hit 全 true） |
+
+摘要：`~/bench/v4_dual_stats_pro6000.json`。退出时 NCCL destroy SIGABRT 仍有（与 align 相同，**不影响门禁结果**）。
+
+**仍未做（0c-4 / Phase 1）**：decode 直接读 page 做 attention；FI SM120 用 packed 池。
 
 ### 8.3 Phase 1 — 自持 decode 内核 + MoE
 
