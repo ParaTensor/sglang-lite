@@ -87,30 +87,56 @@ curl -s -o /dev/null -w '%{http_code}\n' localhost:9001/readyz
 
 ## 5. 稳定性门禁（上线前）
 
-**Soak（默认 tiny Mixtral fixture，CPU）**
+**Soak 时长策略（`--profile`）**
+
+| profile | 大致时长 | 默认 rounds | concurrency | max_new | 用途 |
+|---------|----------|-------------|-------------|---------|------|
+| `smoke` | 1–2 min | 10 | 4 | 4 | PR / 冒烟 |
+| `short` | 5–10 min | 40 | 8 | 8 | 日常门禁 |
+| `medium` | 20–30 min | 120 | 8 | 8 | 发版前 |
+| `long` | **墙钟 1h**（`--duration-s 3600`） | 上限很大 | 4 | 8 | 稳部署 / 过夜前 |
+
+也可用 `--duration-s N` 按秒截断（与 rounds 取先到者）。
 
 ```bash
-python scripts/soak_stability.py --rounds 30 --concurrency 8 --max-new 4 \
-  --out /tmp/soak.json
+# CPU fixture 短 soak
+python scripts/soak_stability.py --profile short --out /tmp/soak.json
 # overall PASS：errors=0、oom=0、blocks 稳定
 ```
 
-**PRO6000 V4（可选）**
+**PRO6000 V4 Hybrid（真机）**
 
 ```bash
 source scripts/env_lite.sh
+export SGLANG_LITE_DSV4_HF=~/models/DeepSeek-V4-Flash-0731
+export SGLANG_LITE_DSV4_CONVERTED=~/models/ds-v4-mp8
+# 15–30 min 稳部署
 torchrun --nproc-per-node=8 scripts/soak_stability.py \
   --model "$SGLANG_LITE_DSV4_HF" --device cuda \
-  --rounds 10 --concurrency 2 --max-new 8 \
-  --out ~/bench/soak_pro6000.json
+  --profile long --duration-s 1800 --concurrency 2 --max-new 8 \
+  --max-blocks-slack 256 \
+  --out ~/bench/soak_v4_30min.json
 ```
 
+判据：`errors=0`、`oom=0`、`blocks_used` 全程平坦（V4 实测恒为 2）、`dual_stage` 单调增。
 **多 MoE 最小回归**
 
 ```bash
+# CPU tiny Mixtral fixture
 python scripts/moe_regression.py --out /tmp/moe_reg.json
-# 额外模型：
-# python scripts/moe_regression.py --model fixture:/path --model /path/to/qwen-moe
+
+# PRO6000 真实 Qwen1.5-MoE-A2.7B-Chat（已验证 PASS）
+CUDA_VISIBLE_DEVICES=0 python scripts/moe_regression.py \
+  --model ~/models/Qwen1.5-MoE-A2.7B-Chat --device cuda --max-new 16 \
+  --out ~/bench/moe_reg_qwen.json
+```
+
+下载 Qwen-MoE（HF SSL 不稳时用 ModelScope）：
+
+```bash
+pip install modelscope
+python -c "from modelscope import snapshot_download; print(snapshot_download('qwen/Qwen1.5-MoE-A2.7B-Chat', cache_dir='$HOME/models/ms_cache'))"
+# 再复制/软链到 ~/models/Qwen1.5-MoE-A2.7B-Chat
 ```
 
 **V4 dual + 吞吐（已有）**

@@ -781,7 +781,34 @@ UniGateway 仅协议/metrics 联调，不引入业务逻辑进 engine。
 | lite env | **done** | `scripts/env_lite.sh` + `Config.from_env("lite")` 默认 DISABLE_FI |
 | Runbook | **done** | [runbook.md](./runbook.md) 起停 / metrics / drain / 门禁 / 故障 |
 
-CPU 默认 soak/回归应 `overall: PASS`。PRO6000 V4 soak 可选（见 runbook §5）。
+CPU 默认 soak/回归应 `overall: PASS`。
+
+#### 8.4.5 PRO6000 真机 soak + 时长策略（2026-08-06）
+
+| 跑次 | 配置 | 结果 |
+| --- | --- | --- |
+| V4 短 | TP=8，25 round，conc=2，max_new=8 | **PASS**：ok=50 err=0 blocks≡2 stage→350 ~46s |
+| V4 **30 min 墙钟** | `--profile long --duration-s 1800` conc=2 | **PASS**：ok=**3010** err=0 rounds=**1505** blocks≡**2** stage→**21070** elapsed=**1801s**；tok_s_avg≈6.87；ttft_avg≈0.021s |
+
+摘要：`~/bench/soak_v4_30min.json`。结论：page-primary stage 下长稳 **无 page 泄漏**（blocks 全程 2）、零错误。
+
+时长策略见 [runbook.md](./runbook.md) §5 表（smoke/short/medium/long）。
+
+**Qwen-MoE 真机（PRO6000，2026-08-06）**
+
+| 项 | 结果 |
+| --- | --- |
+| 权重 | `~/models/Qwen1.5-MoE-A2.7B-Chat`（ModelScope 拉取，27G，8 shards） |
+| 回归 | **PASS**：load FlashInfer paged hooks 24 层；finish=length；16 tok；~24.7s 含加载 |
+| 摘要 | `~/bench/moe_reg_qwen.json` |
+
+```bash
+# 下载（HF 直连失败时）
+python -c "from modelscope import snapshot_download; print(snapshot_download('qwen/Qwen1.5-MoE-A2.7B-Chat', cache_dir='~/models/ms_cache'))"
+# 回归
+python scripts/moe_regression.py --model ~/models/Qwen1.5-MoE-A2.7B-Chat --device cuda \
+  --max-new 16 --out ~/bench/moe_reg_qwen.json
+```
 
 ### 8.5 明确永远不做
 
