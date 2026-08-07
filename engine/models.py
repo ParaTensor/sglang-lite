@@ -61,7 +61,28 @@ DEEPSEEK_V4 = MoEFamily(
     ),
 )
 
-FAMILIES: List[MoEFamily] = [MIXTRAL, QWEN_MOE, DEEPSEEK_MOE, DEEPSEEK_V4]
+# MiniMax-M2 / M2.5 ~230B total / ~10B active (≤300B gate). M3 (~428B + multimodal)
+# is out of MVP size/modality scope; registry still accepts minimax_m3 for text
+# experiments if weights are local and HF remote code loads.
+MINIMAX_MOE = MoEFamily(
+    name="minimax_moe",
+    model_types=frozenset({"minimax_m2", "minimax_m3", "minimax"}),
+    example_ids=frozenset(
+        {
+            "MiniMaxAI/MiniMax-M2",
+            "MiniMaxAI/MiniMax-M2.5",
+            "MiniMaxAI/MiniMax-M3",
+        }
+    ),
+)
+
+FAMILIES: List[MoEFamily] = [
+    MIXTRAL,
+    QWEN_MOE,
+    DEEPSEEK_MOE,
+    DEEPSEEK_V4,
+    MINIMAX_MOE,
+]
 
 # Only ids that successfully loaded (or were explicitly registered) this process.
 _VERIFIED: Set[str] = set()
@@ -118,10 +139,13 @@ def assert_moe_supported(model_id: str, model_type: Optional[str] = None) -> MoE
         return DEEPSEEK_V4
     if "deepseek" in lower and ("moe" in lower or "v2" in lower or "v3" in lower):
         return DEEPSEEK_MOE
+    if "minimax" in lower:
+        return MINIMAX_MOE
 
     raise ValueError(
         f"model '{model_id}' is not a supported MoE family "
-        f"(mixtral / qwen-moe / deepseek-moe / deepseek_v4). Dense models are out of scope."
+        f"(mixtral / qwen-moe / deepseek-moe / deepseek_v4 / minimax). "
+        "Dense models are out of scope."
     )
 
 

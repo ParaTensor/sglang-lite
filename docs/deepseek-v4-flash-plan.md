@@ -794,21 +794,42 @@ CPU 默认 soak/回归应 `overall: PASS`。
 
 时长策略见 [runbook.md](./runbook.md) §5 表（smoke/short/medium/long）。
 
-**Qwen-MoE 真机（PRO6000，2026-08-06）**
+**多 MoE 真机回归矩阵（PRO6000，≤300B，优先小模型）**
 
-| 项 | 结果 |
-| --- | --- |
-| 权重 | `~/models/Qwen1.5-MoE-A2.7B-Chat`（ModelScope 拉取，27G，8 shards） |
-| 回归 | **PASS**：load FlashInfer paged hooks 24 层；finish=length；16 tok；~24.7s 含加载 |
-| 摘要 | `~/bench/moe_reg_qwen.json` |
+选型原则：总参 ≤300B、文本 MoE、可 `AutoModelForCausalLM` + `trust_remote_code`。
+**MiniMax-M3 ~428B + 多模态** → 超出 300B/MVP 模态门禁，**不拉权重**；同系列用 **M2（~230B/10B act）** 代替。
+
+| 模型 | 规模 | 权重源 | 真机结果 | 备注 |
+| --- | --- | --- | --- | --- |
+| Qwen1.5-MoE-A2.7B-Chat | ~14B / 2.7B act | ModelScope `qwen/...` | **PASS**（08-06 + 08-07 复测 + MLA 改后）：finish=length，load+gen≈9.7–12.5s | 标准 MHA + FI paged |
+| DeepSeek-V2-Lite-Chat | 16B / 2.4B act | ModelScope `deepseek-ai/...` | **PASS**（2026-08-07）：finish=length，16 tok，load+gen≈9.5s | MLA：`use_paged_as_source=False`；`scripts/patch_deepseek_v2_tf5.py` |
+| MiniMax-M2 | ~230B / 10B act FP8 | ModelScope `MiniMax/MiniMax-M2`（≈220G） | **PASS**（2026-08-07）：finish=length，8 tok，load+gen≈64s | 跳过 FI paged（GQA group=6）；`dequantize=true`；TF5 remote patches |
+| MiniMax-M3 | ~428B + VL | — | **SKIP** | 超 300B + 多模态 out of MVP |
+| DeepSeek-V4-Flash | Hybrid TP=8 | 已有 | 见 §8.4 soak / dual | 不在本表 `moe_regression` 路径 |
+
+摘要：`~/bench/moe_reg_multi_summary.json`。
+
+Registry：`engine/models.py` → `MINIMAX_MOE`。  
+Runner：`runner.py` 对 MLA / MiniMax / 非 2^n GQA 跳过标准 FI paged，走 HF `use_cache`。  
+权重侧 TF5 补丁（仅 PRO6000 权重目录，不进 engine）：  
+- `scripts/patch_deepseek_v2_tf5.py`  
+- `scripts/patch_minimax_m2_tf5.py` + `scripts/patch_minimax_m2_rope_init.py`  
+- MiniMax `config.json`：`quantization_config.dequantize=true`（绕过 TF FP8Experts ModuleList 替换失败）
 
 ```bash
-# 下载（HF 直连失败时）
+# 下载（HF 直连失败时用 ModelScope）
 python -c "from modelscope import snapshot_download; print(snapshot_download('qwen/Qwen1.5-MoE-A2.7B-Chat', cache_dir='~/models/ms_cache'))"
-# 回归
-python scripts/moe_regression.py --model ~/models/Qwen1.5-MoE-A2.7B-Chat --device cuda \
-  --max-new 16 --out ~/bench/moe_reg_qwen.json
+python -c "from modelscope import snapshot_download; print(snapshot_download('deepseek-ai/DeepSeek-V2-Lite-Chat', cache_dir='~/models/ms_cache'))"
+python -c "from modelscope import snapshot_download; print(snapshot_download('MiniMax/MiniMax-M2', cache_dir='~/models/ms_cache'))"
+# 多模型回归
+python scripts/moe_regression.py \
+  --model ~/models/Qwen1.5-MoE-A2.7B-Chat \
+  --model ~/models/DeepSeek-V2-Lite-Chat \
+  --model ~/models/MiniMax-M2 \
+  --device cuda --max-new 8 --out ~/bench/moe_reg_multi.json
 ```
+
+Qwen 复测摘要：`~/bench/moe_reg_qwen_20260807_003156.json`（overall=PASS）。
 
 ### 8.5 明确永远不做
 

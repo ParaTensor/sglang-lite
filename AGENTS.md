@@ -126,7 +126,7 @@ sglang-lite 强调高内聚与整洁，**根目录严禁堆放非核心内容**�
 
 ## 模型支持策略
 
-**只支持主流 MoE 模型**（DeepSeek、Qwen-MoE、Mixtral 等）。Dense 模型不在支持范围内。
+**只支持主流 MoE 模型**（DeepSeek、Qwen-MoE、Mixtral、MiniMax-M2 等 ≤300B 文本 MoE）。Dense 模型不在支持范围内。MiniMax-M3（~428B + 多模态）默认不进 MVP 门禁。
 新增模型必须满足：
 1. 通过 tokenization + 短生成测试
 2. 更新 scope.md 中的支持列表

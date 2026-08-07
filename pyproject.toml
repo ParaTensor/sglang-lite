@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang-lite"
-version = "0.2.7"
+version = "0.2.8"
 description = "sglang-lite Python execution core (pure library): Radix KV + MoE-aware continuous batching scheduler + model runner for popular MoE models"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -158,10 +158,40 @@ class ModelRunner:
             self.model.config, "eos_token_id", 2
         )
 
+        # MLA (DeepSeek-V2/V3 style compressed KV) is incompatible with standard
+        # FlashInfer paged MHA hooks. Keep HF DynamicCache path until MLA leaf lands.
+        cfg_obj = self.model.config
+        is_mla = (
+            getattr(cfg_obj, "kv_lora_rank", None) is not None
+            or getattr(cfg_obj, "q_lora_rank", None) is not None
+            or (model_type or "").lower() in ("deepseek_v2", "deepseek_v3")
+        )
+        # FlashInfer paged decode rejects some GQA ratios (e.g. MiniMax 48/8 → 6).
+        n_heads = int(self.model.config.num_attention_heads)
+        n_kv = int(self.num_kv_heads) or n_heads
+        gqa_group = max(1, n_heads // max(n_kv, 1))
+        fi_gqa_ok = gqa_group in (1, 2, 4, 8, 16, 32, 64)
+        mt_lower = (model_type or "").lower()
+        is_minimax = mt_lower.startswith("minimax") or fam.name == "minimax_moe"
+        skip_paged = is_mla or is_minimax or not fi_gqa_ok
         print(f"[sglang-lite] Kernel backend: {self.kernel_backend.name}")
-        if self.kernel_backend.supports_paged_attention:
+        if skip_paged:
+            self.use_paged_as_source = False
+            reason = (
+                "MLA"
+                if is_mla
+                else (
+                    "MiniMax/custom"
+                    if is_minimax
+                    else f"GQA group_size={gqa_group} unsupported by FI paged"
+                )
+            )
+            print(
+                f"[sglang-lite] {reason} — skip standard paged MHA hooks "
+                "(HF use_cache path)"
+            )
+        elif self.kernel_backend.supports_paged_attention:
             sm_scale = self.head_dim**-0.5
-            n_heads = int(self.model.config.num_attention_heads)
             n = self.kernel_backend.attach_to_model(
                 self.model, num_qo_heads=n_heads, head_dim=self.head_dim, sm_scale=sm_scale
             )
@@ -560,8 +590,9 @@ class ModelRunner:
                 self._v4_maybe_save_prefix(seq, batch_slot=b, radix=radix)
             return
 
-        for s in seqs:
-            self._ensure_blocks(s, radix, s.cached_len + max_new)
+        if self.use_paged_as_source:
+            for s in seqs:
+                self._ensure_blocks(s, radix, s.cached_len + max_new)
 
         if self._use_paged_attention():
             outputs = self._model_forward_paged(input_ids, seqs, radix, is_decode=False)
@@ -585,10 +616,13 @@ class ModelRunner:
             logits = outputs.logits[b, nlen - 1, :]
             full_kv = self._split_batch_cache(outputs.past_key_values, b, B)
             start = seq.cached_len
-            write_kv = self._slice_kv_tail(self._to_legacy_kv(full_kv), nlen)
-            self._commit_pages(seq, radix, start, write_kv)
+            if self.use_paged_as_source:
+                write_kv = self._slice_kv_tail(self._to_legacy_kv(full_kv), nlen)
+                self._commit_pages(seq, radix, start, write_kv)
+                seq.kv_state = None
+            else:
+                seq.kv_state = full_kv
             seq.last_logits = logits.detach().float().cpu().clone()
-            seq.kv_state = None if self.use_paged_as_source else full_kv
             seq.cached_len = start + nlen
             seq.prefill_tokens = getattr(seq, "prefill_tokens", 0) + nlen
             results[i] = self._sample(logits, seq)
@@ -637,13 +671,16 @@ class ModelRunner:
                 self._v4_dual_append_decode(seq, batch_slot=b, radix=radix)
             return
 
-        # COW last page before append
-        for s in seqs:
-            pos = s.cached_len
-            self._ensure_blocks(s, radix, pos + 1)
-            page_i = pos // radix.block_size
-            if page_i < len(s.block_table):
-                s.block_table[page_i] = radix.cow_block_if_shared(s.block_table[page_i])
+        # COW last page before append (standard MHA page path only)
+        if self.use_paged_as_source:
+            for s in seqs:
+                pos = s.cached_len
+                self._ensure_blocks(s, radix, pos + 1)
+                page_i = pos // radix.block_size
+                if page_i < len(s.block_table):
+                    s.block_table[page_i] = radix.cow_block_if_shared(
+                        s.block_table[page_i]
+                    )
 
         if self._use_paged_attention():
             outputs = self._model_forward_paged(input_ids, seqs, radix, is_decode=True)
@@ -664,9 +701,12 @@ class ModelRunner:
             logits = outputs.logits[b, -1, :]
             full_kv = self._split_batch_cache(outputs.past_key_values, b, B)
             pos = seq.cached_len
-            write_kv = self._slice_kv_tail(self._to_legacy_kv(full_kv), 1)
-            self._commit_pages(seq, radix, pos, write_kv)
-            seq.kv_state = None if self.use_paged_as_source else full_kv
+            if self.use_paged_as_source:
+                write_kv = self._slice_kv_tail(self._to_legacy_kv(full_kv), 1)
+                self._commit_pages(seq, radix, pos, write_kv)
+                seq.kv_state = None
+            else:
+                seq.kv_state = full_kv
             seq.cached_len = pos + 1
             results[i] = self._sample(logits, seq)
 
@@ -707,7 +747,8 @@ class ModelRunner:
             tok = self._sample(row, seq)
             self._v4_maybe_save_prefix(seq, batch_slot=0, radix=radix)
             return tok
-        self._ensure_blocks(seq, radix, len(prompt))
+        if self.use_paged_as_source:
+            self._ensure_blocks(seq, radix, len(prompt))
         if self._use_paged_attention():
             outputs = self._model_forward_paged(input_ids, [seq], radix, is_decode=False)
             logits = outputs.logits[0, -1, :]
@@ -721,10 +762,14 @@ class ModelRunner:
         outputs = self._model_forward(input_ids, past, attn)
         logits = outputs.logits[0, -1, :]
         new_kv = outputs.past_key_values
-        write_kv = self._slice_kv_tail(self._to_legacy_kv(new_kv), len(new_tokens))
-        self._commit_pages(seq, radix, start, write_kv)
+        if self.use_paged_as_source:
+            write_kv = self._slice_kv_tail(self._to_legacy_kv(new_kv), len(new_tokens))
+            self._commit_pages(seq, radix, start, write_kv)
+            seq.kv_state = None
+        else:
+            # MLA / non-standard KV: keep HF DynamicCache only (no MHA pages).
+            seq.kv_state = new_kv
         seq.last_logits = logits.detach().float().cpu().clone()
-        seq.kv_state = None if self.use_paged_as_source else new_kv
         seq.cached_len = len(prompt)
         seq.prefill_tokens = getattr(seq, "prefill_tokens", 0) + len(new_tokens)
         return self._sample(logits, seq)
@@ -747,11 +792,14 @@ class ModelRunner:
             seq.cached_len = pos + 1
             self._v4_dual_append_decode(seq, batch_slot=0, radix=radix)
             return self._sample(row, seq)
-        self._ensure_blocks(seq, radix, pos + 1)
-        if seq.block_table:
-            page_i = pos // radix.block_size
-            if page_i < len(seq.block_table):
-                seq.block_table[page_i] = radix.cow_block_if_shared(seq.block_table[page_i])
+        if self.use_paged_as_source:
+            self._ensure_blocks(seq, radix, pos + 1)
+            if seq.block_table:
+                page_i = pos // radix.block_size
+                if page_i < len(seq.block_table):
+                    seq.block_table[page_i] = radix.cow_block_if_shared(
+                        seq.block_table[page_i]
+                    )
         if self._use_paged_attention():
             outputs = self._model_forward_paged(input_ids, [seq], radix, is_decode=True)
             logits = outputs.logits[0, -1, :]
@@ -763,14 +811,20 @@ class ModelRunner:
         outputs = self._model_forward(input_ids, past, attn)
         logits = outputs.logits[0, -1, :]
         new_kv = outputs.past_key_values
-        write_kv = self._slice_kv_tail(self._to_legacy_kv(new_kv), 1)
-        self._commit_pages(seq, radix, pos, write_kv)
-        seq.kv_state = None if self.use_paged_as_source else new_kv
+        if self.use_paged_as_source:
+            write_kv = self._slice_kv_tail(self._to_legacy_kv(new_kv), 1)
+            self._commit_pages(seq, radix, pos, write_kv)
+            seq.kv_state = None
+        else:
+            seq.kv_state = new_kv
         seq.cached_len = pos + 1
         return self._sample(logits, seq)
 
     def _use_paged_attention(self) -> bool:
         if self._v4_hybrid:
+            return False
+        # MLA / non-standard KV keeps use_paged_as_source=False and HF cache.
+        if not self.use_paged_as_source:
             return False
         return bool(
             self._is_real
@@ -1231,18 +1285,20 @@ class ModelRunner:
             try:
                 from transformers import DynamicCache
 
+                # TF 4.x
                 if hasattr(DynamicCache, "from_legacy_cache"):
                     return DynamicCache.from_legacy_cache(past)
-            except Exception:
-                pass
-            try:
-                from transformers import DynamicCache
-
+                # TF 5.x: constructor takes ddp_cache_data=Iterable[(k,v), ...]
+                try:
+                    return DynamicCache(ddp_cache_data=list(past))
+                except TypeError:
+                    pass
                 cache = DynamicCache()
                 for layer_idx, (k, v) in enumerate(past):
                     cache.update(k, v, layer_idx)
                 return cache
             except Exception:
+                # Last resort: pass legacy list; some remote codes still accept it.
                 return past
         # Existing Cache object: rebuild if dtype mismatches model
         if hasattr(past, "get_seq_length") or hasattr(past, "layers"):

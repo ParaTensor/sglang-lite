@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 
 from sglang_lite.model_loader import build_tp_shard_plan, default_tp8_plans, find_rank_shard
-from sglang_lite.models import DEEPSEEK_V4, assert_moe_supported, family_for_model_type
+from sglang_lite.models import (
+    DEEPSEEK_V4,
+    MINIMAX_MOE,
+    assert_moe_supported,
+    family_for_model_type,
+)
 
 
 def test_tp8_expert_split_covers_all():
@@ -34,6 +39,16 @@ def test_deepseek_v4_family_registered():
     assert fam.name == "deepseek_v4"
     fam2 = assert_moe_supported("/data/ds-v4-flash")
     assert fam2.name == "deepseek_v4"
+
+
+def test_minimax_family_registered():
+    assert family_for_model_type("minimax_m2") is MINIMAX_MOE
+    fam = assert_moe_supported("MiniMaxAI/MiniMax-M2", "minimax_m2")
+    assert fam.name == "minimax_moe"
+    fam2 = assert_moe_supported("/data/MiniMax-M2.5")
+    assert fam2.name == "minimax_moe"
+    fam3 = assert_moe_supported("MiniMaxAI/MiniMax-M3", "minimax_m3")
+    assert fam3.name == "minimax_moe"
 
 
 def test_find_rank_shard_naming(tmp_path):

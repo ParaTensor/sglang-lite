@@ -125,18 +125,42 @@ torchrun --nproc-per-node=8 scripts/soak_stability.py \
 # CPU tiny Mixtral fixture
 python scripts/moe_regression.py --out /tmp/moe_reg.json
 
-# PRO6000 真实 Qwen1.5-MoE-A2.7B-Chat（已验证 PASS）
+# PRO6000 多 MoE 真机回归（≤300B；2026-08-07 已验 PASS×3）
+# 矩阵：Qwen1.5-MoE-A2.7B + DeepSeek-V2-Lite + MiniMax-M2（~230B）
+# MiniMax-M3 ~428B+多模态 → SKIP
+source ~/venvs/sglang-lite/bin/activate
+cd ~/project/sglang-lite
+export PYTHONPATH=engine:.
+export SGLANG_LITE_V4_DISABLE_FI_SPARSE=1
+
+# 小：Qwen（FI paged）
 CUDA_VISIBLE_DEVICES=0 python scripts/moe_regression.py \
   --model ~/models/Qwen1.5-MoE-A2.7B-Chat --device cuda --max-new 16 \
   --out ~/bench/moe_reg_qwen.json
+
+# 小：DeepSeek-V2-Lite（MLA → HF cache；首次需 TF5 patch）
+python scripts/patch_deepseek_v2_tf5.py ~/models/DeepSeek-V2-Lite-Chat
+CUDA_VISIBLE_DEVICES=0 python scripts/moe_regression.py \
+  --model ~/models/DeepSeek-V2-Lite-Chat --device cuda --max-new 16 \
+  --out ~/bench/moe_reg_ds_v2lite.json
+
+# 中大：MiniMax-M2（GQA=6 跳过 FI paged；FP8 dequantize；多卡 device_map=auto）
+python scripts/patch_minimax_m2_tf5.py ~/models/MiniMax-M2
+python scripts/patch_minimax_m2_rope_init.py ~/models/MiniMax-M2
+# config.quantization_config.dequantize=true（权重目录侧）
+python scripts/moe_regression.py \
+  --model ~/models/MiniMax-M2 --device cuda --max-new 8 \
+  --out ~/bench/moe_reg_minimax_m2.json
 ```
 
-下载 Qwen-MoE（HF SSL 不稳时用 ModelScope）：
+下载权重（HF SSL 不稳时用 ModelScope）：
 
 ```bash
 pip install modelscope
 python -c "from modelscope import snapshot_download; print(snapshot_download('qwen/Qwen1.5-MoE-A2.7B-Chat', cache_dir='$HOME/models/ms_cache'))"
-# 再复制/软链到 ~/models/Qwen1.5-MoE-A2.7B-Chat
+python -c "from modelscope import snapshot_download; print(snapshot_download('deepseek-ai/DeepSeek-V2-Lite-Chat', cache_dir='$HOME/models/ms_cache'))"
+python -c "from modelscope import snapshot_download; print(snapshot_download('MiniMax/MiniMax-M2', cache_dir='$HOME/models/ms_cache'))"
+# 软链到 ~/models/<Name>
 ```
 
 **V4 dual + 吞吐（已有）**
