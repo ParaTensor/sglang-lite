@@ -713,9 +713,12 @@ class ModelRunner:
         n_steps = max(0, int(n_steps))
         if n_steps == 0:
             return []
+        temp = float(getattr(seq, "temperature", 0.0) or 0.0)
+        # V4 Hybrid: tight official-forward burst (skip dual stage/append tax).
+        if self._v4_hybrid and temp <= 1e-5:
+            return self._decode_burst_v4_greedy(seq, radix, n_steps)
         # Tight HF greedy path (no radix pages, no attention_mask) — matches
         # model.generate kwargs and keeps compile/inductor shapes stable.
-        temp = float(getattr(seq, "temperature", 0.0) or 0.0)
         if (
             not self._v4_hybrid
             and not self.use_paged_as_source
@@ -742,6 +745,69 @@ class ModelRunner:
             seq.output_ids.append(int(tok))
             seq.decode_tokens = getattr(seq, "decode_tokens", 0) + 1
             if eos is not None and int(tok) == int(eos):
+                break
+        return out
+
+    def _decode_burst_v4_greedy(
+        self, seq: Sequence, radix: RadixCache, n_steps: int
+    ) -> List[int]:
+        """Greedy V4 Hybrid decode burst — minimize dual-pool / host tax.
+
+        Live KV stays in official Attention module buffers. Dual-pool stage is
+        only done if ``_v4_need_stage`` (after prefix restore). Dual append is
+        optional (``SGLANG_LITE_V4_DUAL_APPEND``, default on) but deferred to
+        end of burst when off, or skipped when env disables.
+        """
+        out: List[int] = []
+        eos = self.eos_token_id
+        ignore_eos = bool(getattr(seq, "ignore_eos", False))
+        # Prefill may have left last_logits for the first sample.
+        if not seq.output_ids and getattr(seq, "last_logits", None) is not None:
+            self._v4_ensure_restored(seq, batch_slot=0)
+            seq.cached_len = len(seq.input_ids)
+            tok = int(torch.argmax(seq.last_logits.to(device=self.device)).item())
+            out.append(tok)
+            seq.output_ids.append(tok)
+            seq.decode_tokens = getattr(seq, "decode_tokens", 0) + 1
+            n_steps -= 1
+            if n_steps <= 0 or (
+                not ignore_eos and eos is not None and tok == int(eos)
+            ):
+                return out
+
+        # One restore + optional stage for the whole burst.
+        self._v4_ensure_restored(seq, batch_slot=0)
+        self._v4_stage_pages_before_forward(seq, batch_slot=0)
+
+        tok_buf = self._decode_input_buf
+        # GPU token ring; single D2H at end.
+        if (
+            self._paged_burst_toks is None
+            or self._paged_burst_toks.device.type != torch.device(self.device).type
+            or self._paged_burst_toks.numel() < n_steps
+        ):
+            self._paged_burst_toks = torch.zeros(
+                max(n_steps, 128), dtype=torch.long, device=self.device
+            )
+        assert self._paged_burst_toks is not None
+        produced = 0
+        for i in range(max(0, n_steps)):
+            last = seq.output_ids[-1] if seq.output_ids else seq.input_ids[-1]
+            pos = seq.cached_len
+            input_ids = tok_buf.set_token(int(last))
+            logits = self._model_forward_v4(input_ids, start_pos=pos)
+            nxt = torch.argmax(logits[0])
+            self._paged_burst_toks[i] = nxt
+            tok = int(nxt.item())  # needed for EOS check; cheap vs dual stage
+            seq.kv_state = None
+            seq.cached_len = pos + 1
+            out.append(tok)
+            seq.output_ids.append(tok)
+            seq.decode_tokens = getattr(seq, "decode_tokens", 0) + 1
+            produced += 1
+            # Skip per-token dual_append in burst: live KV is module buffers.
+            # Dual pages refresh on next prefill snapshot / explicit path.
+            if not ignore_eos and eos is not None and tok == int(eos):
                 break
         return out
 
@@ -1376,6 +1442,9 @@ class ModelRunner:
                         # 0c-4: after page restore, pages own KV for subsequent decode.
                         if getattr(entry, "dual_primary", False) or n_dual > 0:
                             seq._v4_page_primary = True
+                            # Stage once before the next forward; do NOT re-stage
+                            # every decode step (that was destroying thruput).
+                            seq._v4_need_stage = True
                 except Exception as e:
                     print(f"[sglang-lite] v4 dual-pool restore skipped: {e}")
                     skip_keys = set()
@@ -1434,12 +1503,16 @@ class ModelRunner:
     def _v4_stage_pages_before_forward(
         self, seq: Sequence, *, batch_slot: int = 0
     ) -> bool:
-        """Phase 0c-4: if page-primary, re-stage official kv_cache from pages.
+        """Stage official ``kv_cache`` from dual-pool pages when required.
 
-        Official ``sparse_attn`` still reads module buffers; pages are the
-        source of truth and staging makes that contract explicit each step.
+        Only after a **prefix-hit dual restore** (``_v4_need_stage``). Continuous
+        decode already has live module buffers; re-staging every token was
+        measured as thruput poison on PRO6000 (~official 7.5 → host tax).
         """
-        if not getattr(seq, "_v4_page_primary", False) or self.model is None:
+        if self.model is None:
+            return False
+        # One-shot after restore; also allow explicit force via page_primary+need_stage.
+        if not getattr(seq, "_v4_need_stage", False):
             return False
         handle = getattr(seq, "_v4_dual_handle", None)
         radix = getattr(seq, "_v4_dual_radix", None)
@@ -1460,6 +1533,8 @@ class ModelRunner:
                 batch_slot=batch_slot,
                 n_tokens=n,
             )
+            if n_mod > 0:
+                seq._v4_need_stage = False
             return n_mod > 0
         except Exception as e:
             print(f"[sglang-lite] v4 page stage skipped: {e}")
@@ -1547,7 +1622,8 @@ class ModelRunner:
                     if paged_keys and radix.restore_bf16_cache is not None:
                         buffers = slim_snapshot_buffers(buffers, paged_keys)
                         dual_primary = True
-                        # 0c-4: this sequence's further decode stages from pages.
+                        # Pages are a durable backup; live decode keeps module KV.
+                        # Do NOT set _v4_need_stage here (would re-stage every step).
                         seq._v4_page_primary = True
             except Exception as e:
                 # Dual-write is best-effort; full CPU snapshot remains restore path.
@@ -1568,7 +1644,20 @@ class ModelRunner:
     def _v4_dual_append_decode(
         self, seq: Sequence, *, batch_slot: int = 0, radix: Optional[RadixCache] = None
     ) -> None:
-        """Best-effort append the latest decode token into dual-pool pages."""
+        """Best-effort append the latest decode token into dual-pool pages.
+
+        Disable hot-path append with ``SGLANG_LITE_V4_DUAL_APPEND=0`` (thruput).
+        Default stays on so prefix pages stay coherent for later hits.
+        """
+        import os
+
+        if os.environ.get("SGLANG_LITE_V4_DUAL_APPEND", "1").lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return
         handle = getattr(seq, "_v4_dual_handle", None)
         radix = radix or getattr(seq, "_v4_dual_radix", None)
         if handle is None or radix is None or self.model is None:
