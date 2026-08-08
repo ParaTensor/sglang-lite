@@ -867,14 +867,24 @@ CPU 默认 soak/回归应 `overall: PASS`。
    - **根因修复**：FI paged hook 漏了 Qwen3 **`q_norm`/`k_norm`** → 从第 1 个
      token 起崩溃式胡话；补上后 PAGE-eager 文本流畅（~44–52 tok/s）。  
    - 与 HF generate 仍可在 ~14 tok 处分叉（FI vs SDPA 数值，类似 StaticCache 现象）。  
-   - **CUDA graph**：`batched_mm` 下 **可捕获**（plan 图外 / body 图内）；  
-     `SGLANG_LITE_CUDA_GRAPH_DECODE=1` 时 ~40 tok/s，漂移更大，**默认关**。  
+   - **CUDA graph**（plan 图外 / body 图内，`batched_mm`）：  
+     - 旧：跨页重捕获 → ~40 tok/s。  
+     - **现**：固定 max-pages + FI `use_cuda_graph` 后 **单次捕获**  
+       （`active_pages=1, max_pages=256`）贯穿 1×128：  
+       **warm ~78.6 tok/s** / cold ~55（含 capture）；eager paged ~44.6。  
+     - 仍 **默认关**（`SGLANG_LITE_CUDA_GRAPH_DECODE=1` opt-in）；  
+       thruput 默认仍是 HF+compile ~84。  
    - 开关：`SGLANG_LITE_RADIX_NATIVE=1` → 探针侧 `FORCE_HF_CACHE=0`；  
-     thruput 默认仍是 HF+compile ~84。
+     `SGLANG_LITE_PAGED_MAX_PAGES=256`（page_size=16 → 4k tok 容量）。  
+   - 实现要点：  
+     - B=1 独立 `BatchDecodeWithPagedKVCacheWrapper(use_cuda_graph=True,
+       use_tensor_cores=True)`，plan 拷 active indices 入固定 buffer；  
+     - page id 仅在页列表变化时 H2D；  
+     - torch graph 仅在 `buf_gen` 变化或 overflow 时失效。
 
-**下一刀（逼近 SGLang ~155）**：paged 图已可捕获但未加速；需  
-固定 max-pages plan、把 FI plan 纳入可更新 buffer 图，或换  
-**非 HF 包装的 MoE+attn 执行栈**。
+**下一刀（逼近 SGLang ~155）**：radix-native CG ~79 已贴近 StaticCache lab
+与 HF+compile ~84，距 SGLang ~155 仍 ~2×。下一优先是 **非 HF 包装的
+MoE+attn 执行栈**（去掉 HF forward 税），而不是再堆开关。
 
 Registry：`engine/models.py` → `MINIMAX_MOE`。  
 Runner：`runner.py` 对 MLA / MiniMax / 非 2^n GQA 跳过标准 FI paged，走 HF `use_cache`。  

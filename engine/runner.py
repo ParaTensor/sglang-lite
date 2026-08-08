@@ -1533,9 +1533,14 @@ class ModelRunner:
             npages = (total_len + page_size - 1) // page_size
             self.kernel_backend.begin_forward(ctx)
             try:
+                kb = self.kernel_backend
+                max_pages = int(getattr(kb, "decode_static_max_pages", 0) or 0)
+                buf_gen = int(getattr(kb, "decode_static_buf_gen", -1))
                 out = self._paged_decode_cg.maybe_run(
                     model_fn=_body,
                     npages=npages,
+                    max_pages=max_pages,
+                    buf_gen=buf_gen,
                     enabled=True,
                 )
                 if out is None:

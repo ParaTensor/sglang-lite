@@ -1,7 +1,8 @@
 """Conservative decode acceleration helpers (Phase-A thruput).
 
-Full CUDA-graph capture of paged/FI decode is brittle (plan metadata changes
-each step). Phase-A defaults:
+Full CUDA-graph capture of paged/FI decode keeps plan *outside* the graph;
+fixed-capacity page metadata (``SGLANG_LITE_PAGED_MAX_PAGES``) keeps tensor
+addresses stable across page growth. Phase-A defaults:
 
 1. Optional ``torch.compile`` — ``mode=default`` for HF DynamicCache;
    ``reduce-overhead`` is unsafe with DynamicCache / FI paged.
@@ -279,16 +280,21 @@ class PagedDecodeCudaGraph:
     1. First real step(s) run eager until we decide to capture.
     2. Capture re-runs the **same** step (same token, same start) so KV overwrites
        the same slot — safe because append is position-addressed.
-    3. Later steps: ``begin_forward`` (plan + static meta) then ``graph.replay()``.
+    3. Later steps: ``begin_forward`` (plan + fixed-capacity static meta) then
+       ``graph.replay()``.
 
-    Re-capture when page count grows beyond the captured plan size.
+    Fixed max-pages buffers (see ``FlashInferBackend._ensure_decode_static``) keep
+    plan tensor addresses stable, so page count growth within capacity does **not**
+    force re-capture. Invalidate only when static buffer generation changes or
+    active pages exceed the capacity recorded at capture.
     """
 
     def __init__(self, device: str):
         self.device = device
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         self.captured = False
-        self.capture_npages = -1
+        self.capture_max_pages = -1  # capacity at capture (not active npages)
+        self.capture_buf_gen = -1
         self._static_out: Any = None
         self._warmup_done = 0
         self._warmup_need = 2
@@ -297,7 +303,8 @@ class PagedDecodeCudaGraph:
     def reset(self) -> None:
         self.graph = None
         self.captured = False
-        self.capture_npages = -1
+        self.capture_max_pages = -1
+        self.capture_buf_gen = -1
         self._static_out = None
         self._warmup_done = 0
         # keep _disabled
@@ -307,13 +314,17 @@ class PagedDecodeCudaGraph:
         *,
         model_fn,
         npages: int,
+        max_pages: int = -1,
+        buf_gen: int = -1,
         force_eager: bool = False,
         enabled: Optional[bool] = None,
     ) -> Optional[Any]:
         """Run model_fn under CUDA graph when ready; else return None (caller eager).
 
         ``enabled``: override env. When None, uses ``SGLANG_LITE_CUDA_GRAPH_DECODE``.
-        Re-captures when page count grows (plan footprint changed).
+        ``max_pages`` / ``buf_gen``: fixed static buffer capacity & generation from
+        the kernel backend. Growth of *active* ``npages`` within capacity is fine;
+        re-capture only when capacity/gen changes or active pages exceed capacity.
         """
         if force_eager or self._disabled:
             return None
@@ -326,9 +337,25 @@ class PagedDecodeCudaGraph:
         if not torch.cuda.is_available():
             return None
 
-        # Need re-capture if page footprint grew.
-        if self.captured and npages != self.capture_npages:
-            self.reset()
+        cap = int(max_pages) if max_pages > 0 else int(npages)
+        gen = int(buf_gen)
+
+        # Invalidate only when buffer addresses/capacity changed, not on every
+        # page-boundary (npages += 1) within a fixed-capacity plan.
+        if self.captured:
+            overflow = npages > self.capture_max_pages > 0
+            gen_mismatch = (
+                gen >= 0
+                and self.capture_buf_gen >= 0
+                and gen != self.capture_buf_gen
+            )
+            cap_grew = (
+                max_pages > 0
+                and self.capture_max_pages > 0
+                and max_pages != self.capture_max_pages
+            )
+            if overflow or gen_mismatch or cap_grew:
+                self.reset()
 
         if not self.captured:
             # Warmup identical step (overwrites same KV slot).
@@ -343,10 +370,11 @@ class PagedDecodeCudaGraph:
                     self._static_out = model_fn()
                 self.graph = g
                 self.captured = True
-                self.capture_npages = int(npages)
+                self.capture_max_pages = cap
+                self.capture_buf_gen = gen
                 print(
                     f"[sglang-lite] paged decode CUDA graph captured "
-                    f"(npages={npages})"
+                    f"(active_pages={npages}, max_pages={cap}, buf_gen={gen})"
                 )
                 return self._static_out
             except Exception as e:
