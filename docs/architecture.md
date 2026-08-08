@@ -145,10 +145,20 @@ V4 Hybrid (Phase 0 / 0b)          Phase 0c Own KV              Phase 1 Own Kerne
 official Attention buffer   →     Radix dual pool              KernelBackend decode
   kv_cache / kv_state /             compressed MLA pages         FI SM120 sparse MLA
   score_state                       + SWA / dsv4_packed(584)     (else official fallback)
-CPU snapshot prefix hit     →     page restore / COW / evict   MoE: B12x / sgl-kernel
-clear_v4_kv_slot on final   →     release pages on finish      optional CUDA graph
-LiteEngine CB + TP SSE      →     same scheduler contract      throughput ≥ official warm
+CPU snapshot prefix hit     →     page restore / COW / evict   MoE GEMM: DeepGEMM SM120
+clear_v4_kv_slot on final   →     release pages on finish      (MXFP4 e8m0); B12x 布局不兼容
+LiteEngine CB + TP SSE      →     same scheduler contract      optional CUDA graph / grouped MoE
 ```
+
+**MoE / FP4 GEMM（Hybrid，2026-08-08）**
+
+| 组件 | 路径 | 说明 |
+|------|------|------|
+| DeepGEMM SM120 | `engine/v4_deep_gemm.py` + `vendor/deep_gemm_sm120` | 默认开启；替换 `kernel.fp4_gemm`；官方 MXFP4 e8m0 **1×32** |
+| MoE 调度快路径 | `engine/v4_moe_fast.py` | 仅激活专家 + gate/up 共用 act_quant |
+| B12x | `engine/v4_b12x.py` | 默认关：需 NVFP4 e4m3/sf16 + 无 EP；Hybrid 为 MXFP4 + TP/EP |
+
+验收与开关见 [v4-flash-only.md](./v4-flash-only.md) §9–10。
 
 **Phase 0c slices 1–3 (landed):**
 

@@ -516,6 +516,20 @@ class ModelRunner:
             attach_v4_moe_fast(self.model)
         except Exception as e:
             print(f"[sglang-lite] v4 MoE fast skipped: {e}")
+        # FP4 GEMM: DeepGEMM SM120 (official MXFP4 e8m0 1x32) — main thruput lever.
+        try:
+            from .v4_deep_gemm import attach_v4_deep_gemm
+
+            attach_v4_deep_gemm(self.model)
+        except Exception as e:
+            print(f"[sglang-lite] v4 DeepGEMM skipped: {e}")
+        # B12x: probe only by default (NVFP4 layout + no EP; not Hybrid-compatible).
+        try:
+            from .v4_b12x import attach_v4_b12x
+
+            attach_v4_b12x(self.model, world_size=int(plan.world_size))
+        except Exception as e:
+            print(f"[sglang-lite] v4 B12x skipped: {e}")
         print(
             f"[sglang-lite] deepseek_v4 Hybrid rank={plan.rank}/{plan.world_size} "
             f"arch={kb.arch_family.value} sparse_mla={kb.sparse_mla_backend.value} "

@@ -36,10 +36,13 @@ engine/
   kv / dual-pool        自持 Radix 双池（V4 SWA + compressed）
   v4_runner/            ★ 唯一热路径：权加载、forward、graph、采样
   vendor/
-    sglang_v4/          从 SGLang 拷贝的 V4 相关层（改 import 为相对路径）
-    vllm_v4/            从 vLLM 拷贝的 V4/MLA/MoE 相关层（同上）
-    deepseek_infer/     官方 inference/ 必要子集（或符号链接构建期拷贝）
-  kernels/              薄封装：调用已 vendor 的 CUDA/FI 叶子，禁止再包一层「通用 KernelBackend 全家桶」
+    deepseek_infer/     官方 inference/ 必要子集（live graph）
+    deep_gemm_sm120/    vLLM third_party DeepGEMM SM120（FP8×FP4，live）
+    sglang_v4/          从 SGLang 拷贝的 V4 参考层（reference）
+    vllm_v4/            从 vLLM 拷贝的 V4 参考骨架
+  v4_deep_gemm.py       替换 kernel.fp4_gemm → DeepGEMM
+  v4_moe_fast.py        激活专家 + fused act_quant
+  v4_b12x.py            B12x 探针（默认不 attach）
 ```
 
 **原则**：
@@ -152,13 +155,17 @@ engine/
 |------|------|
 | 只跑 top-k **激活**专家（不扫 32 个 local idle） | 调度税↓ |
 | SwiGLU **gate/up 共用一次 act_quant** | GEMM 前 quant 减半 |
-| e2e 1×128 warm | **~9.13**（与 TileLang 基线 ~9.3 同量级，方差内） |
-| e2e 4×96 warm | **~26.9**（略优于 ~26.5） |
-| `deep_gemm` bf16 | **SM120 Unsupported architecture**（不可用） |
-| FI `b12x_fused_moe` / cutlass MoE | API 存在；权布局转换未焊进 Hybrid（下一步） |
+| **DeepGEMM SM120** `fp8_fp4_gemm_nt`（`engine/v4_deep_gemm.py` + `vendor/deep_gemm_sm120`） | 官方 MXFP4 e8m0 **1×32** 布局已通；替换 `kernel.fp4_gemm`；**vs TileLang 单核 ~2.3–2.5×**，数值对齐（max err 0） |
+| 纯 decode e2e（TP8，96 tok） | TileLang **~9.16** tok/s → DeepGEMM **~9.40** tok/s（~+3%）；每 token **~72.5** 次 `fp4_gemm` launch，GEMM 本体只占墙钟一小部分 |
+| FI **B12x** MoE | 探针在 `v4_b12x.py`；**默认不开**（要 NVFP4 e4m3/sf16 + 无 EP；Hybrid 是 MXFP4 + TP/EP） |
+| pip `deep_gemm` 0.1.4 bf16 | **SM120 Unsupported**（不可用；用 vendor SM120 版） |
 
-开关：`SGLANG_LITE_V4_MOE_FAST=0` 关闭。  
-下一步：把 **FP4 专家权**接到 FlashInfer **B12x / SM120 cutlass fused MoE**（分组 GEMM），才能吃掉 MoE 52%。
+开关：
+- `SGLANG_LITE_V4_MOE_FAST=0` 关闭激活专家调度
+- `SGLANG_LITE_V4_DEEP_GEMM=0` 回退 TileLang `fp4_gemm`
+- `SGLANG_LITE_V4_B12X=1` 仅尝试 B12x（当前仍因布局/EP 拒绝 attach）
+
+下一步：`m_grouped_fp8_fp4_gemm_nt_contiguous` 合并专家 launch（72→个位数/层）；CUDA graph decode；B12x 需离线 NVFP4 重打包 + 非 EP。
 
 ---
 

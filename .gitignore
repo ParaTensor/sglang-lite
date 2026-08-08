@@ -8,6 +8,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+# Vendored DeepGEMM SM120 extension (Linux; required for PRO6000 Hybrid FP4)
+!engine/vendor/deep_gemm_sm120/_C*.so
 .Python
 build/
 develop-eggs/

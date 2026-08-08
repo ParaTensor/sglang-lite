@@ -3,7 +3,7 @@
 This tree holds **copied** code from upstream projects. Runtime must **not**
 `import sglang` or `import vllm` as packages.
 
-In-tree layout: `engine/vendor/{deepseek_infer,sglang_v4,vllm_v4}/`.
+In-tree layout: `engine/vendor/{deepseek_infer,sglang_v4,vllm_v4,deep_gemm_sm120}/`.
 Helper: `python scripts/vendor_v4_slice.py ...`.
 
 | Path | Upstream | Pin (commit / tag) | License | Notes |
@@ -11,6 +11,7 @@ Helper: `python scripts/vendor_v4_slice.py ...`.
 | `engine/vendor/deepseek_infer/` | [deepseek-ai/DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) `inference/` + `encoding/` | **`hf@60d8d70770c6776ff598c94bb586a859a38244f1`** | Apache-2.0 / model terms | **Live graph**: `model.py`, `kernel.py`, `encoding_dsv4.py`, convert/generate |
 | `engine/vendor/sglang_v4/` | [sgl-project/sglang](https://github.com/sgl-project/sglang) | **`e732c0a9dc071ca06026dba93887e8d77e631d04`** | Apache-2.0 | **REFERENCE ONLY** under `reference/` (full srt deps; not imported) |
 | `engine/vendor/vllm_v4/` | [vllm-project/vllm](https://github.com/vllm-project/vllm) | _empty skeleton_ | Apache-2.0 | Optional if faster leaf for SM120 |
+| `engine/vendor/deep_gemm_sm120/` | vLLM image `vllm/vllm-openai:v0.25.0` → `vllm/third_party/deep_gemm` | **v0.25.0 third_party** (`deep_gemm` 2.5.0, py3.10–3.14 `.so`) | MIT / Apache-2.0 (upstream DeepGEMM) | **Live** SM120 `fp8_fp4_gemm_nt`; loaded as `deep_gemm_sm120` (no `import vllm`) |
 
 See also `engine/vendor/NOTICE_VENDOR.md` and each tree’s `VENDOR_PIN.txt`.
 
@@ -28,6 +29,7 @@ See also `engine/vendor/NOTICE_VENDOR.md` and each tree’s `VENDOR_PIN.txt`.
 | Tree | Runtime? | How loaded |
 |------|----------|------------|
 | `deepseek_infer/` | **Yes** | `sys.path` insert → `import model` / `import kernel` (matches upstream) |
+| `deep_gemm_sm120/` | **Yes** (SM120) | `engine/v4_deep_gemm.py` inserts `vendor/` and `import deep_gemm_sm120` |
 | `sglang_v4/reference/` | **No** | Read for porting CUDA-graph / dsv4 leaf ops into `v4_runner` |
 | `vllm_v4/` | **No** until filled | — |
 
@@ -49,3 +51,4 @@ python scripts/vendor_v4_slice.py deepseek-infer \
 
 - `deepseek-infer` pin=`hf:deepseek-ai/DeepSeek-V4-Flash@60d8d70770c6776ff598c94bb586a859a38244f1` files=[model.py, kernel.py, config.json, convert.py, generate.py, requirements.txt, encoding_dsv4.py, test_encoding_dsv4.py]
 - `sglang-v4` pin=`sgl-project/sglang@e732c0a9dc071ca06026dba93887e8d77e631d04` reference tree: deepseek_v4.py, decode_cuda_graph_runner.py, dsv4 ops, configs, DeepSeek-V4.mdx
+- `deep_gemm_sm120` pin=`vllm/vllm-openai:v0.25.0:/usr/local/lib/python3.12/dist-packages/vllm/third_party/deep_gemm` ver=2.5.0 — SM120 FP8×FP4 GEMM for Hybrid MoE/Linear

@@ -25,6 +25,9 @@ export SGLANG_LITE_MODEL="$SGLANG_LITE_DSV4_HF"
 | `SGLANG_LITE_V4_ONLY` | `1` | 拒绝非 V4-Flash 模型 |
 | `SGLANG_LITE_DSV4_INFER` | `engine/vendor/deepseek_infer` | 官方/vendor 图路径 |
 | `SGLANG_LITE_V4_DISABLE_FI_SPARSE` | `1` | 官方 `sparse_attn` 主路径 |
+| `SGLANG_LITE_V4_DEEP_GEMM` | `1` | SM120 `vendor/deep_gemm_sm120` 替换 `fp4_gemm`；`0` 回退 TileLang |
+| `SGLANG_LITE_V4_MOE_FAST` | `1` | 仅激活专家 + fused act_quant |
+| `SGLANG_LITE_V4_B12X` | `0` | 实验：B12x（布局/EP 不兼容 Hybrid，默认不 attach） |
 | `SGLANG_LITE_V4_CUDA_GRAPH` | 关 | 固定 start_pos 微基准 CUDA graph |
 | `SGLANG_LITE_DECODE_BURST` | `64` | 单请求 decode 连打步数（thruput 可 `128`） |
 | `SGLANG_LITE_V4_DUAL_APPEND` | `1` | decode 写 dual-pool；thruput 可 `0` |
@@ -62,15 +65,30 @@ python engine/vendor/deepseek_infer/convert.py \
 sglang-lite-serving --engine-url http://127.0.0.1:9001 --port 8000
 ```
 
-## 2.1 KPI：对打 SGLang
+## 2.1 KPI：对打 SGLang / vLLM
 
-同机同权重 warm decode tok/s（见 v4-flash-only §5）：
+同机同权重 warm decode tok/s（见 v4-flash-only §5 / §10）：
 
 ```bash
 bash scripts/v4_vs_sglang_bench.sh --mp 8 --max-new 128
+# vLLM 0.25 baseline 客户端：scripts/vllm_v4_bench_client.py
 ```
 
-记录 lite 与 SGLang 的 warm tok/s；主 KPI 要求 **lite > SGLang**。
+记录 lite 与 SGLang / vLLM 的 warm tok/s；主 KPI 要求 **lite > SGLang**。
+
+## 2.2 DeepGEMM FP4 微基准（PRO6000 SM120）
+
+```bash
+# 需已 convert 的 mp8 分片 + 空闲 8×GPU
+export SGLANG_LITE_DSV4_HF=~/models/ds-v4-flash
+export SGLANG_LITE_DSV4_CONVERTED=~/models/ds-v4-mp8
+torchrun --nproc-per-node=8 scripts/v4_deep_gemm_thruput.py --max-new 96 --deep-gemm 1
+torchrun --nproc-per-node=8 scripts/v4_deep_gemm_thruput.py --max-new 96 --deep-gemm 0
+```
+
+期望：attach 日志含 `v4 DeepGEMM armed`；单核 GEMM 相对 TileLang ~2.3×；纯 decode e2e 目前仅小幅提升（launch 税，见 v4-flash-only §9）。
+
+**Vendor 刷新**（`.so` 从 vLLM 镜像拷）：见 [vendor/SOURCES.md](./vendor/SOURCES.md) `deep_gemm_sm120`。
 
 ## 3. 健康与指标
 

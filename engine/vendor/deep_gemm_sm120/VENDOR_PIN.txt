@@ -1,0 +1,8 @@
+source: vllm/vllm-openai:v0.25.0
+path_in_image: /usr/local/lib/python3.12/dist-packages/vllm/third_party/deep_gemm
+package_name_at_runtime: deep_gemm_sm120  (directory renamed; no import vllm)
+deep_gemm_version: 2.5.0
+purpose: SM120 fp8_fp4_gemm_nt / m_grouped_fp8_fp4_* for official Hybrid MXFP4
+layout: act FP8 1x128 scale f32; weight packed FP4 int8 1x32 scale f32 (from e8m0)
+recipe: (1,1,128) recipe_a=(1,128) recipe_b=(1,32)
+copied: 2026-08-08 PRO6000 host extract

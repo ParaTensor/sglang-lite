@@ -76,7 +76,9 @@ See scope.md "不做" list. If a feature is desired by many users, the correct a
 - Issues / milestones will mirror the phases.
 - Every merged PR should update this file or link the changed scope.
 
-Current status: **Phase 1 in progress — MoE-only scope** (reassessed 2026-06-28)
+Current status: **Phase 0b/0c Hybrid V4-Flash**（产品赌注：仅 DeepSeek-V4-Flash）。  
+2026-08-08：vendor **DeepGEMM SM120** 已接官方 MXFP4；e2e 下一步 **grouped MoE GEMM** + CUDA graph。  
+权威：`docs/v4-flash-only.md`、`docs/deepseek-v4-flash-plan.md` §8。
 
 **Phase 0 complete** — v0.1.0
 

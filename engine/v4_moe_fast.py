@@ -6,8 +6,9 @@ experts are idle — we only walk **activated** expert ids.
 
 Also fuses act_quant for expert SwiGLU gate/up (same input × two FP4 GEMMs).
 
-Does not import sglang/vllm. Optional deep_gemm / B12x hooks can plug into
-``linear_fast`` later.
+FP4 GEMM itself is replaced by DeepGEMM SM120 when ``attach_v4_deep_gemm``
+has patched ``kernel.fp4_gemm`` (see ``v4_deep_gemm``). This module only
+fixes dispatch + fused quant; it does not import sglang/vllm.
 """
 
 from __future__ import annotations
@@ -27,6 +28,18 @@ def moe_fast_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def _is_fp4_weight(w: torch.Tensor) -> bool:
+    if w.dtype == torch.float4_e2m1fn_x2:
+        return True
+    # HF/int8-packed FP4: int8 with companion .scale shaped [N, K//32]
+    if w.dtype == torch.int8 and getattr(w, "scale", None) is not None:
+        try:
+            return int(w.scale.shape[-1]) == (int(w.shape[-1]) * 2) // 32
+        except Exception:
+            return False
+    return False
+
+
 def _expert_forward_fused(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None):
     """Expert SwiGLU with single act_quant for FP4 w1/w3."""
     dtype = x.dtype
@@ -40,7 +53,8 @@ def _expert_forward_fused(self, x: torch.Tensor, weights: Optional[torch.Tensor]
     scale_fmt = getattr(M, "scale_fmt", None)
     scale_dtype = getattr(M, "scale_dtype", torch.float32)
     # FP4 experts: quantize activation once for both gate and up projections.
-    if w1.dtype == torch.float4_e2m1fn_x2:
+    # K.fp4_gemm is DeepGEMM when attach_v4_deep_gemm has run.
+    if _is_fp4_weight(w1):
         xq, s = K.act_quant(x, block, scale_fmt, scale_dtype)
         gate = K.fp4_gemm(xq, s, w1, w1.scale, scale_dtype).float()
         up = K.fp4_gemm(xq, s, w3, w3.scale, scale_dtype).float()

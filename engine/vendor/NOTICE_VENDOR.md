@@ -11,6 +11,7 @@ sglang-lite V4-Flash-only product. Runtime must **not** `import sglang` or
 | `deepseek_infer/` | DeepSeek official `inference/` + `encoding/` (HF) | Apache-2.0 / model terms | **Pinned** `60d8d707…` — live graph |
 | `sglang_v4/` | [sgl-project/sglang](https://github.com/sgl-project/sglang) | Apache-2.0 | **Pinned** `e732c0a9…` — reference only |
 | `vllm_v4/` | [vllm-project/vllm](https://github.com/vllm-project/vllm) | Apache-2.0 | Skeleton |
+| `deep_gemm_sm120/` | vLLM `third_party/deep_gemm` (DeepSeek DeepGEMM SM120) | MIT / Apache-2.0 (upstream) | **Live** FP8×FP4 GEMM on sm_120; no `import vllm` |
 
 Exact commit SHAs live in `docs/vendor/SOURCES.md` when files are added.
 

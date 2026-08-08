@@ -274,16 +274,23 @@ def probe_kernel_capabilities(
         except Exception:
             has_sgl = False
 
-        # DeepGEMM SM120: only true after a successful tiny gemm probe.
-        # Default False — deep_gemm 0.1.4 fails on sm_120.
+        # DeepGEMM SM120: vendor deep_gemm_sm120 (vLLM third_party) or site package.
+        # Public deep_gemm 0.1.4 fails on sm_120; probe the SM120 pin when present.
         has_dg = False
-        if arch != ArchFamily.SM120:
-            try:
-                import deep_gemm  # noqa: F401
+        try:
+            from .v4_deep_gemm import probe_deep_gemm_sm120
 
-                has_dg = True
-            except Exception:
-                has_dg = False
+            if arch == ArchFamily.SM120:
+                has_dg = bool(probe_deep_gemm_sm120(device=device if device.startswith("cuda") else "cuda").get("ok"))
+            else:
+                try:
+                    import deep_gemm  # noqa: F401
+
+                    has_dg = True
+                except Exception:
+                    has_dg = False
+        except Exception:
+            has_dg = False
 
         if numerical_probe and arch == ArchFamily.SM120 and has_sm120_sparse:
             num = probe_sm120_sparse_numerical(

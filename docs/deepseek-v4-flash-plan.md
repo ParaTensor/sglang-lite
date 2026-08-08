@@ -79,7 +79,7 @@ torch `2.11.0+cu130`、CUDA 13.0、GPU RTX 5090（sm_120 / capability 12.0）。
 | --- | --- | --- | --- | --- |
 | `flashinfer-python` | **0.6.12** | paged prefill/decode、`BatchMLAPagedAttentionWrapper`、`append_paged_kv_cache`；SM100：`trtllm_batch_decode_sparse_mla_dsv4`；SM120 叶子：`B12xMoEWrapper` / `Sm120B12xBlockScaledDenseGemmKernel` | KernelBackend（paged 已接入；MLA/sparse 按 arch 路由） | **标准 MLA/paged：可用**；**SM100 sparse MLA 在 sm_120 必挂**；须改走 SM120 专用 sparse MLA（见 3.0.3） |
 | `sgl-kernel` | **0.4.4** | `topk_softmax` / MoE 辅助、`fp8_*_mm`、`dsv4_fused_*`、`cutlass_mla_decode`、norm/rope | KernelBackend（MoE/量化，S2+） | **可安装可 import**；topk 路由 id 与 torch 一致；**无 CSA/HCA 公开符号**，有 dsv4 融合算子 |
-| `deep-gemm` | **0.1.4** | DeepSeek FP8/FP4 grouped GEMM API 面齐全 | **暂不接入**（见下） | **本版本 sm_120 不支持**；需 SM120 内核版（vLLM 路线）或回退 B12x/sgl-kernel |
+| `deep-gemm` / vendor | **2.5.0 SM120**（`engine/vendor/deep_gemm_sm120`，源自 vLLM 0.25 third_party） | `fp8_fp4_gemm_nt` / grouped FP4 | **已接入** Hybrid `kernel.fp4_gemm`（`v4_deep_gemm.py`） | pip `0.1.4` 仍 **sm_120 Unsupported**；运行时用 vendor，不 `import vllm` |
 | DeepSeek 官方 `inference/` / transformers remote code | 本机有 `ds-v4-flash`；**无 V2-Lite 权重** | V4 模型图含 Indexer/Compressor/`sparse_attn`/HC(Sinkhorn) | ModelLoader / vendor（Hybrid） | V4 图可对照；**V2-Lite greedy/paged 验收 BLOCKED（缺权重）** |
 
 **待实测确认（已实测 + 对照 vLLM SM120 路径后修正）**：
@@ -107,17 +107,16 @@ torch `2.11.0+cu130`、CUDA 13.0、GPU RTX 5090（sm_120 / capability 12.0）。
     （bf16 512 会通过 Python 校验但内核仍要求 584）。复现：
     `FI_PREFIX=/tmp/fi1616 python scripts/try_flashinfer_016_sparse.py`。
   - sgl-kernel 提供 `dsv4_fused_*` 与 MLA 辅助，无 CSA/HCA 命名完整入口。
-- deep-gemm 与 5090（sm_120）：**当前 `deep_gemm==0.1.4` 不支持**（bf16 入口即
-  `Unsupported architecture`）。vLLM 侧通过更新 `support_deep_gemm` + 带
-  SM120 内核的 DeepGEMM（或社区 fork）启用；我们在拿到 SM120 版之前
-  **回退** `sgl-kernel` FP8 / FlashInfer B12x GEMM / cuBLASLt（本机
-  `Sm120B12xBlockScaledDenseGemmKernel` 可 import/construct）。
-- **B12xMoEWrapper**：小配置 construct + `run` 在 sm_120 **已通**（FP4 packed
-  `[E,2I,H//2]` / `[E,H,I//2]` + 6D MMA scale）；与 bf16 SiLU MoE 的相对误差
-  **尚未闭环**（`w1_alpha` / `fc2_input_scale` 约定未对齐，随机/错 scale 时
-  输出有限但 rel ≫ 1）。数值对齐留待 S2 MoE 接入时做。
-- **因此暂不把 `sgl-kernel` / `deep-gemm` 写入 `pyproject.toml` 可选依赖**
-  （待 KernelBackend arch 路由落地与 fused_moe 数值对齐闭环后再加）。
+- deep-gemm 与 sm_120：pip **`deep_gemm==0.1.4` 仍 Unsupported**。  
+  **已 vendor** vLLM 0.25 `third_party/deep_gemm` → `engine/vendor/deep_gemm_sm120`
+ （2.5.0，含 py3.10–3.14 `_C*.so`）。Hybrid 默认
+  `attach_v4_deep_gemm`：官方 MXFP4 **e8m0 1×32** →
+  `fp8_fp4_gemm_nt(recipe_a=(1,128), recipe_b=(1,32))`；单核 vs TileLang
+  **~2.3–2.5×**，e2e 仍受 ~72 `fp4_gemm`/tok launch 税限制。
+- **B12xMoEWrapper**：construct 在 sm_120 可用，但 Hybrid 权是 **MXFP4 e8m0/sf32**
+  且 TP+EP；B12x 要 **NVFP4 e4m3/sf16 + 无 EP** → `v4_b12x.py` **默认不 attach**。
+  离线 repack + 非 EP 前不得焊进主路径。
+- **不**把 pip `deep-gemm` 写入 `pyproject.toml`（用 vendor 树）；`sgl-kernel` 仍按需。
 
 #### 3.0.1 叶子组件实测计划（GPU 环境，逐项验收）
 
@@ -248,8 +247,9 @@ capability 探测 + 内核路由**，不引入 vLLM 调度/内存管理框架。
 2. Attention：新增 `FLASHINFER_MLA_SPARSE_SM120`；DeepSeek-V4 sparse MLA 在
    SM12x **强制**走 SM120 专用内核，**禁止** SM100 TRTLLM；prefill/decode
    分治并缩小 workspace（适配 32GB）。
-3. MoE/GEMM：启用带 SM120 内核的 DeepGEMM；FlashInfer B12x / CUTLASS SM120
-   跑 NVFP4/MXFP4 MoE（tile 限制在 ~99KB SMEM）；失败再 fallback Marlin/Triton。
+3. MoE/GEMM：**DeepGEMM SM120 vendor 已接**（单核 OK）；下一步
+   `m_grouped_fp8_fp4_gemm_nt_contiguous` 降 launch 税。B12x 仅在 NVFP4
+   repack + 非 EP 后可选。
 4. 大 PR 参考：上游 `#43477`（DeepSeek V4 + SM120 基础）；社区更完整分支如
    jasl `#41834`（含更多 V4-Flash 细节）。**DSpark 投机解码仍为 sglang-lite
    scope 外**。
@@ -263,7 +263,7 @@ capability 探测 + 内核路由**，不引入 vLLM 调度/内存管理框架。
   `flashinfer.mla._sparse_mla_sm120`；公开
   `trtllm_batch_decode_sparse_mla_dsv4` **自动路由 SM120**；packed uint8 584
   + `swa_topk_lens` / `extra_sparse_*` 冒烟 **OK**（shape `(B,q,H,512)`，finite）。
-- DeepGEMM `0.1.4`：`bf16_gemm_nt` → `Unsupported architecture`（维持回退）。
+- DeepGEMM：**vendor 2.5.0 SM120** 已通；pip `0.1.4` 仍 FAIL（勿用）。
 
 **sglang-lite KernelBackend 必须遵守的规则**
 
@@ -273,15 +273,15 @@ capability 探测 + 内核路由**，不引入 vLLM 调度/内存管理框架。
 2. SM120 上 V4 sparse MLA：必须确认走 **SM120 后端**（FI≥0.6.16 的公开
    dsv4 可接受，因其内部 dispatch 到 `_…_sm120`）；在仅有 0.6.12 时**禁止**
    调用会落到 SM100 TRTLLM 的 dsv4，应改官方 `sparse_attn` 或升 FI。
-3. MoE：SM120 优先 FlashInfer B12x / sgl-kernel FP8；DeepGEMM 仅在
-   `support_deep_gemm(sm120)` 探测通过后启用。
+3. MoE：SM120 **优先 vendor DeepGEMM**（`has_deep_gemm_sm120` probe）；B12x
+   仅布局/EP 匹配时；否则 TileLang `fp4_gemm`。
 4. 复用边界不变：只借叶子 kernel 与路由表，不借 vLLM ModelRunner/Scheduler。
 
 **S5 前增量验收（补测）**
 
 - [x] SM120 sparse MLA 入口可 import + 随机 KV 冒烟（FI 0.6.16.post1 隔离前缀；atol 另定）
-- [~] `B12xMoEWrapper` 小配置：`run` 已通 / vs HF MoE rel-err **未闭环**（scale 约定）
-- [x] DeepGEMM SM120 版：无（0.1.4 FAIL）→ 维持 B12x/sgl-kernel 回退
+- [~] `B12xMoEWrapper`：API 可 construct；**官方 Hybrid 布局不兼容**（见 `v4_b12x.py`）
+- [x] DeepGEMM SM120 vendor：`fp8_fp4` 真实专家权 + e2e attach（2026-08-08 PRO6000）
 - [x] KernelBackend 单测：伪造 sm100/sm120 capability 时路由表断言（`tests/test_capability_routing.py`）
 
 ### 3.1 硬件后端隔离（非 NVIDIA 卡的前置设计）
