@@ -105,15 +105,23 @@ engine/
 
 ### PRO6000 验收（2026-08-08，宿主 torch 2.11+cu130，vendor `deepseek_infer`）
 
-| Case | warm tok/s | 基线 warm（§6.4.1） | 说明 |
-|------|------------|---------------------|------|
-| 1×128 | **7.44** | 7.59 | 与基线同量级；sample 前缀 `Hello! How can I help you today?` |
-| 4×96 | **16.48** | 16.74 | 同上 |
-| 1×256 | **7.48** | 7.51 | 同上 |
-| load_s | ~8–11 | ~8 | graph source=`vendor` |
+| Case | warm tok/s（vendor 初验） | warm **burst 后** (`6a287d9`) | 旧基线 §6.4.1 |
+|------|---------------------------|-------------------------------|---------------|
+| 1×128 | 7.44 | **9.06** | 7.59 |
+| 4×96 | 16.48 | **26.54** | 16.74 |
+| 1×256 | 7.48 | **9.08** | 7.51 |
+| load_s | ~8–11 | ~7.6 | ~8 |
 
-日志：`~/bench/v4_thru_vendor_summary.json`（host）。  
-修过 prefill：`V4DecodeAccelerator` 不得把 `seq_len>1` reshape 成 `[B,1]`（`42e0ea0`）。
+日志：`~/bench/v4_thru_burst_summary.json`（host）。  
+
+**热路径修复（`6a287d9`）**：
+
+1. 禁止 decode 每步 dual-pool **re-stage**（只在 prefix restore 后 `_v4_need_stage` 一次）  
+2. V4 **decode burst**（`SGLANG_LITE_DECODE_BURST=128`）绕开逐 token 调度税  
+3. thruput 可关 dual append：`SGLANG_LITE_V4_DUAL_APPEND=0`  
+
+仍绑官方 TileLang `sparse_attn`；要再翻倍需换 SM120 叶子核（SGLang dsv4 / FI）。  
+SGLang blackwell 镜像在本机 sm_120 仍 blocked（`flash_mla` 架构不支持）。
 
 ### Phase V2 — 焊核 + 满图
 

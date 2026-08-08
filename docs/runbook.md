@@ -26,6 +26,8 @@ export SGLANG_LITE_MODEL="$SGLANG_LITE_DSV4_HF"
 | `SGLANG_LITE_DSV4_INFER` | `engine/vendor/deepseek_infer` | 官方/vendor 图路径 |
 | `SGLANG_LITE_V4_DISABLE_FI_SPARSE` | `1` | 官方 `sparse_attn` 主路径 |
 | `SGLANG_LITE_V4_CUDA_GRAPH` | 关 | 固定 start_pos 微基准 CUDA graph |
+| `SGLANG_LITE_DECODE_BURST` | `64` | 单请求 decode 连打步数（thruput 可 `128`） |
+| `SGLANG_LITE_V4_DUAL_APPEND` | `1` | decode 写 dual-pool；thruput 可 `0` |
 | `SGLANG_LITE_LOG_JSON` | `1` | `sglang_lite.req` JSON 行日志 |
 | `SGLANG_LITE_MAX_BATCH_SIZE` | `4` | continuous batch 上限 |
 | `SGLANG_LITE_REQUEST_TIMEOUT` | `300` | 单请求超时秒 |
