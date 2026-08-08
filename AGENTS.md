@@ -6,23 +6,23 @@
 
 ## 核心理念（不可违背）
 
-sglang-lite 是一个**极致高内聚的 Token Factory（令牌工厂）**。
+sglang-lite 是 **DeepSeek-V4-Flash 专用**、极致高内聚的 Token Factory（性能优先于通用性）。
 
+- **唯一一等公民模型**：DeepSeek-V4-Flash。其它模型面为 legacy，不进 P0。
 - 最核心且必须深度耦合的三个组件：
-  1. KVCacheManager（默认使用 RadixAttention 前缀树）
-  2. Scheduler（continuous batching 连续批处理）
-  3. ModelRunner（重度使用 CUDA graph 的 decode 执行）
+  1. KVCacheManager（V4 双池 Radix / page 为源）
+  2. Scheduler（continuous batching；可按 V4 批形态简化）
+  3. **V4 ModelRunner**（CUDA graph 满图 decode；从 vLLM/SGLang/**官方 inference 搬代码**进 `vendor/`，禁止 runtime `import sglang` / `import vllm`）
 - **Rust 层是对外的控制点**（OpenAI 协议适配层）。所有请求验证、早期拒绝、streaming 控制、错误处理都必须在这里完成。
-- 一切业务逻辑（agent loop、structured output、多模态、tool calling 执行等）和高级网关能力（多后端 routing、auth、全局 rate limit、策略编排）**必须上移**到 unigateway / gateway 层。`engine/` 保持纯引擎库；仓库可提供独立运行所必需的极薄 control/serving 层。
-- KV cache management、continuous scheduling、model execution 是 SGLang 与 vLLM 共有的三类引擎能力；RadixKVCache、BatchingScheduler、MoEModelRunner 只是 sglang-lite 的具体实现名称。
-- FlashInfer 是 kernel/backend library，不代表 vLLM 的完整引擎能力；不得以“接入 FlashInfer”为由扩大 sglang-lite scope 或宣称覆盖 vLLM 全部场景。
-- sglang-lite 与 vLLM 是同层级的 `local-inference` backend。sglang-lite 必须能够独立运行，UniGateway 只是可选上游。兼容目标是 OpenAI-compatible 协议、capability、request id 和 prefix-cache metrics，不追求 vLLM 功能面或内部实现兼容。
-- 遇到不确定时，**优先缩小 scope**，宁可删减功能，也不要增加复杂度。
+- 一切业务逻辑与高级网关能力 **必须上移** UniGateway。`engine/` 保持引擎库。
+- KPI：**同机同权重相对 SGLang 的 warm tok/s**，不是「支持多少模型」。
+- 遇到不确定时，**优先缩小 scope**；为 V4 性能可牺牲抽象与通用性。
 
 变更前必须阅读的文档：
-- [docs/scope.md](docs/scope.md) —— 权威的 Feature 取舍表
-- [docs/architecture.md](docs/architecture.md) —— 架构边界
-- [README.md](README.md) —— 项目使命与目标 workload
+- [docs/v4-flash-only.md](docs/v4-flash-only.md) —— **V4 专用产品宪章（已采纳）**
+- [docs/scope.md](docs/scope.md) —— Feature 取舍表
+- [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) —— V4 技术细节
+- [docs/architecture.md](docs/architecture.md) —— 分层边界
 
 ## 严格禁止或需特别审查的变更
 
@@ -126,32 +126,27 @@ sglang-lite 强调高内聚与整洁，**根目录严禁堆放非核心内容**�
 
 ## 模型支持策略
 
-**只支持主流 MoE 模型**（DeepSeek、Qwen-MoE、Mixtral、MiniMax-M2 等 ≤300B 文本 MoE）。Dense 模型不在支持范围内。MiniMax-M3（~428B + 多模态）默认不进 MVP 门禁。
-新增模型必须满足：
-1. 通过 tokenization + 短生成测试
-2. 更新 scope.md 中的支持列表
-3. 只支持 MoE 模型，不支持 dense 模型。MoE 支持以路由 + 高效 batching 为主，不引入过度复杂的专家并行。
+**只支持 DeepSeek-V4-Flash**（见 [docs/v4-flash-only.md](docs/v4-flash-only.md)）。
+
+- 禁止再扩展 Qwen-MoE / Mixtral / MiniMax 等通用热路径。
+- 允许 **vendor** 上游（vLLM / SGLang / 官方 inference）中与 V4 相关的代码与核，保留许可证头。
+- 禁止为「多模型 registry」增加抽象。
 
 ## 推荐工作流程
 
-1. 先阅读 scope.md 确认该功能是否属于核心
-2. 小步提交，聚焦单一需求
-3. 更新相应文档
-4. 确保 Rust + Python 的集成测试能跑通
+1. 先阅读 **v4-flash-only.md** + scope.md  
+2. 变更是否服务 **V4 性能 KPI**？否则默认不做  
+3. 搬代码 → `vendor/` + SOURCES 钉 commit；热路径进 `v4_runner`  
+4. 小步提交；PRO6000 对照 SGLang thruput  
 
 ## 当前阶段
 
-当前处于 **Phase 0c 完成 + Phase 2 切片 1–4（稳部署门禁）**：
-metrics / TTFT·tok/s / drain / request-id 日志 / **soak + MoE 回归 + Runbook**。
-主路径仍官方核；FI 非默认。运维见 [docs/runbook.md](docs/runbook.md)。
+**产品赌注已切换为 V4-Flash 专用**（2026-08-08）。
 
-**产品策略（已定）**：
-
-- **主路径**：官方 TileLang `sparse_attn`（Hybrid 生产默认）。
-- **FI SM120 sparse**：**非默认**；仅 `FORCE` / 显式实验。
-- 0c-4：`_v4_page_primary` 时 pages 为 KV SoT；官方 buffer 仅 staging。
-- 部署门禁：`scripts/soak_stability.py`、`scripts/moe_regression.py`、`scripts/env_lite.sh`。
-- FI 只作 `KernelBackend` leaf；禁止泄漏进 Scheduler / control。
+- 文档：`docs/v4-flash-only.md` 为宪章；通用 MoE thruput（Qwen FORCE_HF 等）**退出 P0**。  
+- 代码现状：Hybrid + dual-pool 仍在；下一实现 **Phase V1**：vendor 子集 + 专用 runner，默认 `V4_ONLY`。  
+- 技术细节与 SM120 路由仍见 [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md)。  
+- 运维入口见 [docs/runbook.md](docs/runbook.md)（将逐步改为 V4 对照命令）。
 
 阶段定义与验收见 [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) **§8**。
 

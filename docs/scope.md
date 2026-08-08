@@ -4,27 +4,27 @@ This is the authoritative reference for what belongs in core vs. what gets pushe
 
 ## One-sentence Mission
 
-> An extremely cohesive production token generator primarily for MoE models. Everything not required to reliably turn requests into token streams at high throughput stays outside.
+> **DeepSeek-V4-Flash 专用**、极致高内聚的 Token Factory。性能（相对同配置 SGLang）优先于通用性；一切与 V4-Flash 热路径无关的模型面与协议面默认不做。
 
-The engine focuses exclusively on popular MoE architectures (Mixtral-style, DeepSeek-style, Qwen-MoE, etc.). Dense models are out of scope. MoE support is first-class.
+**权威专用路线**：[v4-flash-only.md](./v4-flash-only.md)（2026-08-08 采纳）。
 
-**MoE families** (see `engine/models.py`): Mixtral-style, Qwen-MoE, DeepSeek-MoE,
-DeepSeek-V4, MiniMax-MoE（M2/M2.5 ≤300B 真机优先；M3 ~428B + 多模态默认不纳入 MVP 门禁）。
-Only the model successfully loaded in the current process is advertised on `GET /v1/models`.
-Local CI uses `fixture:<path>` tiny Mixtral weights. Dense models are rejected. V4 uses Hybrid
-official `inference/` + leaf kernels (FlashInfer/sgl-kernel); see `docs/deepseek-v4-flash-plan.md`.
+**唯一一等公民模型**：DeepSeek-V4-Flash（含 0731 权重形态）。  
+其它 MoE（Mixtral / Qwen-MoE / MiniMax 等）与 Qwen thruput/FORCE_HF 栈降为 **legacy**（可删、不进默认门禁、不占用 P0）。  
+Dense 端侧模型 **不在本产品线**。
 
-**Execution status**（区分 MVP Hybrid 与 Owned 目标态）:
+执行原则：
+
+1. **焊死 V4-Flash**：load 拒绝非 V4 配置；热路径只有 `v4_runner`（目标态）。  
+2. **搬代码不引大包**：从 vLLM / SGLang / 官方 `inference/` **vendor 进仓**（改 import），禁止 runtime `import sglang` / `import vllm`。  
+3. **KPI**：同机同权重 vs SGLang 的 warm decode tok/s（及约定 TTFT），见 v4-flash-only §5。  
+4. 调度 + Radix 双池仍自持；OpenAI 面仍在 Rust `control/`，业务上移 UniGateway。
+
+**Execution status**（V4 专用后）:
 
 | 路径 | 当前阶段 | KV / prefix | Decode 内核 | 备注 |
 |------|----------|-------------|-------------|------|
-| Mixtral / Qwen-MoE 等 | Phase 0 已验 | Radix paged K/V + `last_logits`；CUDA 上 FlashInfer paged 为 sole attention 源 | HF / FlashInfer paged；MoE 叶子仍 P1 | CPU 仍可从 page 重建 HF attn |
-| DeepSeek-V4-Flash | **0c done + P2 metrics** | dual-pool 双写/生命周期/page restore/stage；PRO6000 dual+吞吐 PASS | **主路径官方 `sparse_attn`**；FI 仅 FORCE | plan §8.2 / §6.4 / §8.4.1 |
-| 目标态（健全引擎） | Phase 2 → 可选 1 | Owned Radix 双池为源；生产 metrics/drain | KernelBackend leaf 可选；官方核默认 | §8；不扩大 vLLM 功能面 |
-
-Scheduler groups requests; the runner issues **tensor-batched** forwards when sequences share
-the same `cached_len` (and prefill new-length). V4 下一实现重点是 Phase **0c**（自持 KV），
-不是再堆宽协议面。
+| **DeepSeek-V4-Flash** | Hybrid 已落地；转向 **专用 runner + vendor 核** | dual-pool；Owned 页为源 | 官方 sparse / vendor SGLang·vLLM 子集；满图 | **唯一 P0** |
+| legacy 多 MoE | 冻结 | 历史 Radix paged | HF/FI | 不优化、不门禁 |
 
 The `engine/` core is a **pure library** exposing three further-decomposed building blocks (RadixKVCache, BatchingScheduler, MoEModelRunner). The sglang-lite product also ships a thin standalone control/serving shell so it can serve users without SGLang, vLLM, or UniGateway.
 
