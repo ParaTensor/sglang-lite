@@ -438,8 +438,11 @@ class FlashInferBackend(KernelBackend):
                 )
             self._ensure_decode_static(max(npages, len(bt)))
             assert self._st_page_indices is not None
-            for i in range(npages):
-                self._st_page_indices[i] = int(bt[i])
+            # Bulk-fill page ids (avoid per-element host→device in the hot path).
+            pages = bt[:npages]
+            page_t = torch.as_tensor(pages, dtype=torch.int32, device=self.device)
+            self._st_page_indices[:npages].copy_(page_t)
+            self._st_kv_indices[:npages].copy_(page_t)
             self._st_page_indptr[0] = 0
             self._st_page_indptr[1] = npages
             last = slen % page_size
@@ -447,9 +450,6 @@ class FlashInferBackend(KernelBackend):
             # Append metadata for writing the new token at `start`.
             self._st_positions[0] = start
             self._st_batch_indices[0] = 0
-            # pages needed after writing token at `start` (= npages for decode).
-            for i in range(npages):
-                self._st_kv_indices[i] = int(bt[i])
             self._st_kv_indptr[0] = 0
             self._st_kv_indptr[1] = npages
             self._st_kv_last[0] = start % page_size if start > 0 else 0
@@ -583,8 +583,16 @@ class FlashInferBackend(KernelBackend):
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, attn_module.head_dim)
 
-            query_states = attn_module.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-            key_states = attn_module.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            # Match HF attention: Qwen3 applies RMSNorm on Q/K after projection
+            # (q_norm / k_norm). Skipping them breaks greedy decode from token 1.
+            q = attn_module.q_proj(hidden_states).view(hidden_shape)
+            k = attn_module.k_proj(hidden_states).view(hidden_shape)
+            if hasattr(attn_module, "q_norm") and attn_module.q_norm is not None:
+                q = attn_module.q_norm(q)
+            if hasattr(attn_module, "k_norm") and attn_module.k_norm is not None:
+                k = attn_module.k_norm(k)
+            query_states = q.transpose(1, 2)
+            key_states = k.transpose(1, 2)
             value_states = attn_module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
             if position_embeddings is None:

@@ -116,8 +116,17 @@ class DecodeInputBuffer:
 
 
 def cuda_graph_decode_enabled(default: str = "0") -> bool:
-    # default arg lets HF batched_mm path opt-in with default="1".
+    # default arg lets callers opt-in (e.g. paged radix-native default="1").
     return os.environ.get("SGLANG_LITE_CUDA_GRAPH_DECODE", default).lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def radix_native_enabled() -> bool:
+    """Prefer FI paged + CUDA-graph decode over FORCE_HF thruput path."""
+    return os.environ.get("SGLANG_LITE_RADIX_NATIVE", "").lower() in (
         "1",
         "true",
         "yes",
@@ -299,9 +308,18 @@ class PagedDecodeCudaGraph:
         model_fn,
         npages: int,
         force_eager: bool = False,
+        enabled: Optional[bool] = None,
     ) -> Optional[Any]:
-        """Run model_fn under CUDA graph when ready; else return None (caller eager)."""
-        if force_eager or self._disabled or not cuda_graph_decode_enabled():
+        """Run model_fn under CUDA graph when ready; else return None (caller eager).
+
+        ``enabled``: override env. When None, uses ``SGLANG_LITE_CUDA_GRAPH_DECODE``.
+        Re-captures when page count grows (plan footprint changed).
+        """
+        if force_eager or self._disabled:
+            return None
+        if enabled is None:
+            enabled = cuda_graph_decode_enabled(default="0")
+        if not enabled:
             return None
         if not str(self.device).startswith("cuda"):
             return None

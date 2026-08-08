@@ -863,9 +863,18 @@ CPU 默认 soak/回归应 `overall: PASS`。
 
 脚本：`scripts/moe_thruput_probe.py`、`scripts/sglang_thru_docker.sh`。
 
-**下一刀（逼近 SGLang ~155）**：HF+inductor 天花板 ~85；需  
-**radix-native paged decode 图** 或 **真 FP4/B12x 量化 MoE 权重 + 图捕获**，  
-而不是再叠 HF expert 替换。
+8. **Radix-native paged path（2026-08-08）**  
+   - **根因修复**：FI paged hook 漏了 Qwen3 **`q_norm`/`k_norm`** → 从第 1 个
+     token 起崩溃式胡话；补上后 PAGE-eager 文本流畅（~44–52 tok/s）。  
+   - 与 HF generate 仍可在 ~14 tok 处分叉（FI vs SDPA 数值，类似 StaticCache 现象）。  
+   - **CUDA graph**：`batched_mm` 下 **可捕获**（plan 图外 / body 图内）；  
+     `SGLANG_LITE_CUDA_GRAPH_DECODE=1` 时 ~40 tok/s，漂移更大，**默认关**。  
+   - 开关：`SGLANG_LITE_RADIX_NATIVE=1` → 探针侧 `FORCE_HF_CACHE=0`；  
+     thruput 默认仍是 HF+compile ~84。
+
+**下一刀（逼近 SGLang ~155）**：paged 图已可捕获但未加速；需  
+固定 max-pages plan、把 FI plan 纳入可更新 buffer 图，或换  
+**非 HF 包装的 MoE+attn 执行栈**。
 
 Registry：`engine/models.py` → `MINIMAX_MOE`。  
 Runner：`runner.py` 对 MLA / MiniMax / 非 2^n GQA 跳过标准 FI paged，走 HF `use_cache`。  

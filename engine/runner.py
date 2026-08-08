@@ -1514,13 +1514,18 @@ class ModelRunner:
                 attention_mask=attn,
             )
 
-        # Phase-A: optional CUDA graph for single-token decode (plan outside graph).
+        # Radix-native CUDA graph: plan outside, capture/replay model body.
+        # Opt-in only (SGLANG_LITE_CUDA_GRAPH_DECODE=1). Captures on Qwen3+batched_mm
+        # but may accumulate more FI/SDPA drift than eager paged — validate before default-on.
+        from .cuda_graph import cuda_graph_decode_enabled
+
         use_cg = (
             is_decode
             and B == 1
             and q_len == 1
             and str(self.device).startswith("cuda")
             and not self._v4_hybrid
+            and cuda_graph_decode_enabled(default="0")
         )
         if use_cg:
             page_size = radix.block_size
@@ -1529,7 +1534,9 @@ class ModelRunner:
             self.kernel_backend.begin_forward(ctx)
             try:
                 out = self._paged_decode_cg.maybe_run(
-                    model_fn=_body, npages=npages
+                    model_fn=_body,
+                    npages=npages,
+                    enabled=True,
                 )
                 if out is None:
                     out = _body()
