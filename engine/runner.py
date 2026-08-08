@@ -7,7 +7,13 @@ from typing import Dict, List, Optional
 
 import torch
 
-from .cuda_graph import DecodeInputBuffer, PagedDecodeCudaGraph, maybe_compile_model
+from .cuda_graph import (
+    DecodeInputBuffer,
+    HfStaticDecodeCudaGraph,
+    PagedDecodeCudaGraph,
+    experts_implementation_from_env,
+    maybe_compile_model,
+)
 from .kernel_backend import PagedAttnContext, create_kernel_backend
 from .kv_cache import PastKV, RadixCache
 from .models import assert_moe_supported, is_fixture_model, register_verified
@@ -55,6 +61,8 @@ class ModelRunner:
         self._swa_layout = None
         self._decode_input_buf = DecodeInputBuffer(device)
         self._paged_decode_cg = PagedDecodeCudaGraph(device)
+        self._hf_static_cg: Optional[HfStaticDecodeCudaGraph] = None
+        self._experts_impl: Optional[str] = None
         # Must match model compute dtype; fp16 pages + bf16 activations promote to fp32 in SDPA.
         self.torch_dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
         self.kernel_backend = create_kernel_backend(self.device)
@@ -130,6 +138,21 @@ class ModelRunner:
             "trust_remote_code": True,
             "low_cpu_mem_usage": True,
         }
+        # MoE expert backend: batched_mm is ~2× grouped_mm and CUDA-graph safe.
+        # Prefer env; when FORCE_HF_CACHE thruput path, default to batched_mm.
+        import os as _os_exp
+
+        exp_impl = experts_implementation_from_env()
+        force_hf_early = _os_exp.environ.get("SGLANG_LITE_FORCE_HF_CACHE", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if exp_impl is None and force_hf_early:
+            exp_impl = "batched_mm"
+        if exp_impl:
+            load_kwargs["experts_implementation"] = exp_impl
+            self._experts_impl = exp_impl
         use_device_map = False
         if self.device != "cpu":
             try:
@@ -139,11 +162,26 @@ class ModelRunner:
                 use_device_map = True
             except ImportError:
                 use_device_map = False
-        self.model = AutoModelForCausalLM.from_pretrained(load_id, **load_kwargs)
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(load_id, **load_kwargs)
+        except (TypeError, ValueError) as e:
+            # Older TF or unsupported impl — retry without experts_implementation.
+            if "experts_implementation" in load_kwargs:
+                print(
+                    f"[sglang-lite] experts_implementation={exp_impl!r} rejected "
+                    f"({e}); falling back to library default"
+                )
+                load_kwargs.pop("experts_implementation", None)
+                self._experts_impl = None
+                self.model = AutoModelForCausalLM.from_pretrained(load_id, **load_kwargs)
+            else:
+                raise
         if not use_device_map:
             self.model = self.model.to(self.device)
         self.model.eval()
         self._is_real = True
+        if self._experts_impl:
+            print(f"[sglang-lite] MoE experts_implementation={self._experts_impl}")
         self.vocab_size = int(self.model.config.vocab_size)
         self.num_layers = int(self.model.config.num_hidden_layers)
         self.num_kv_heads = int(
@@ -194,6 +232,26 @@ class ModelRunner:
                 "[sglang-lite] SGLANG_LITE_FORCE_HF_CACHE=1 — HF use_cache path "
                 "(no FlashInfer paged hooks)"
             )
+            # Experimental: StaticCache + CUDA graph. Qwen3-MoE StaticCache drifts
+            # vs DynamicCache after ~14 tokens — off by default. batched_mm alone
+            # already matches generate (~46 tok/s). Enable only for research:
+            #   SGLANG_LITE_HF_STATIC_GRAPH=1
+            if (
+                str(self.device).startswith("cuda")
+                and self._experts_impl == "batched_mm"
+                and _os.environ.get("SGLANG_LITE_HF_STATIC_GRAPH", "").lower()
+                in ("1", "true", "yes")
+            ):
+                max_len = int(
+                    _os.environ.get("SGLANG_LITE_STATIC_CACHE_LEN", "4096")
+                )
+                self._hf_static_cg = HfStaticDecodeCudaGraph(
+                    self.device, max_cache_len=max_len
+                )
+                print(
+                    f"[sglang-lite] HF StaticCache CUDA-graph decode armed "
+                    f"(experimental, max_cache_len={max_len})"
+                )
         elif skip_paged:
             self.use_paged_as_source = False
             reason = (
@@ -851,6 +909,31 @@ class ModelRunner:
             seq.cached_len = len(prompt)
             seq.prefill_tokens = getattr(seq, "prefill_tokens", 0) + len(new_tokens)
             return self._sample(logits, seq)
+        # HF thruput path: prefill into StaticCache so decode can CUDA-graph.
+        if self._hf_static_cg is not None and not self.use_paged_as_source:
+            cache = self._hf_static_cg.alloc_cache(self.model)
+            n_new = len(new_tokens)
+            position_ids = torch.arange(
+                start, start + n_new, device=self.device, dtype=torch.long
+            ).unsqueeze(0)
+            kwargs = {
+                "input_ids": input_ids,
+                "past_key_values": cache,
+                "use_cache": True,
+                "position_ids": position_ids,
+                "cache_position": position_ids.reshape(-1),
+            }
+            if self._supports_logits_to_keep():
+                kwargs["logits_to_keep"] = 1
+            self.model_forward_count += 1
+            outputs = self.model(**kwargs)
+            logits = outputs.logits[0, -1, :]
+            seq.kv_state = outputs.past_key_values
+            seq.last_logits = logits.detach()
+            seq.cached_len = len(prompt)
+            seq.prefill_tokens = getattr(seq, "prefill_tokens", 0) + len(new_tokens)
+            return self._sample(logits, seq)
+
         past = self._past_for_seq(seq, radix)
         attn = self._attention_mask(input_ids, past, past_len_hint=start)
         n_new = len(new_tokens)
@@ -908,6 +991,26 @@ class ModelRunner:
             seq.kv_state = None
             seq.cached_len = pos + 1
             return self._sample(logits, seq)
+        # HF StaticCache CUDA-graph decode (batched_mm thruput path).
+        if (
+            self._hf_static_cg is not None
+            and not self.use_paged_as_source
+            and seq.kv_state is not None
+        ):
+            if pos >= self._hf_static_cg.max_cache_len - 1:
+                # Fall back to eager DynamicCache-style when static capacity exceeded.
+                pass
+            else:
+                outputs = self._hf_static_cg.run_decode_step(
+                    token_id=int(last_token),
+                    pos=int(pos),
+                    past=seq.kv_state,
+                )
+                self.model_forward_count += 1
+                logits = outputs.logits[0, -1, :]
+                seq.kv_state = outputs.past_key_values
+                seq.cached_len = pos + 1
+                return self._sample(logits, seq)
         past = self._past_for_seq(seq, radix)
         attn = self._attention_mask(input_ids, past, past_len_hint=pos)
         position_ids = self._decode_input_buf.set_position(pos)

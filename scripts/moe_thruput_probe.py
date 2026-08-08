@@ -68,8 +68,10 @@ def main() -> int:
     # Single-stream thruput: HF SDPA cache often beats FI paged (plan/append tax).
     os.environ.setdefault("SGLANG_LITE_FORCE_HF_CACHE", "1")
     os.environ.setdefault("SGLANG_LITE_DECODE_BURST", "32")
-    # mode=default (not reduce-overhead) — DynamicCache-safe; ~1.5× on Qwen3-MoE.
-    os.environ.setdefault("SGLANG_LITE_TORCH_COMPILE", "1")
+    # batched_mm: ~2× default grouped_mm on Qwen3-MoE; matches model.generate tok/s.
+    os.environ.setdefault("SGLANG_LITE_EXPERTS_IMPL", "batched_mm")
+    # StaticCache CUDA-graph drifts on Qwen3 — keep off; batched_mm is the win.
+    os.environ.setdefault("SGLANG_LITE_TORCH_COMPILE", "0")
 
     from sglang_lite import LiteEngine
 

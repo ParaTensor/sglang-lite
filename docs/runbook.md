@@ -140,13 +140,13 @@ CUDA_VISIBLE_DEVICES=0 python scripts/moe_regression.py \
 
 # Phase-A 吞吐探针（加载后 tok/s；非 vLLM/SGLang 对照）
 # 注意：Qwen3.5-27B 是 Dense+多模态，**不在 scope**；用 Qwen3-30B-A3B（文本 MoE）。
-# 探针默认：FORCE_HF_CACHE=1、DECODE_BURST、TORCH_COMPILE=1（mode=default）。
-# 冷启动含 torch.compile ~1–3min；看 warm tok/s。当前 PRO6000 约 ~39 tok/s warm。
+# 探针默认：FORCE_HF_CACHE=1、EXPERTS_IMPL=batched_mm、DECODE_BURST。
+# PRO6000 当前 warm ≈ 46 tok/s（对齐 HF generate；SGLang ≈155 → ~3.4×）。
 CUDA_VISIBLE_DEVICES=0 python scripts/moe_thruput_probe.py \
   --model ~/models/Qwen3-30B-A3B-Instruct --device cuda \
   --cases 1x64,1x128 --out ~/bench/thru_qwen3_30b_a3b.json
-# 关 compile / 走 FI paged：
-#   SGLANG_LITE_TORCH_COMPILE=0 SGLANG_LITE_FORCE_HF_CACHE=0 python scripts/moe_thruput_probe.py ...
+# 走 FI paged / 默认 experts：
+#   SGLANG_LITE_FORCE_HF_CACHE=0 SGLANG_LITE_EXPERTS_IMPL=grouped_mm python scripts/moe_thruput_probe.py ...
 
 # 小：DeepSeek-V2-Lite（MLA → HF cache；首次需 TF5 patch）
 python scripts/patch_deepseek_v2_tf5.py ~/models/DeepSeek-V2-Lite-Chat

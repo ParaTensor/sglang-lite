@@ -3,17 +3,21 @@
 Full CUDA-graph capture of paged/FI decode is brittle (plan metadata changes
 each step). Phase-A defaults:
 
-1. Optional ``torch.compile(mode=\"reduce-overhead\")`` — uses CUDA graphs under
-   the hood for static decode shapes when the model cooperates.
+1. Optional ``torch.compile`` — ``mode=default`` for HF DynamicCache;
+   ``reduce-overhead`` is unsafe with DynamicCache / FI paged.
 2. Reusable ``[1, 1]`` token buffer to avoid per-step host→device alloc.
+3. **HF StaticCache + CUDA graph** when experts are CUDA-graph safe
+   (``experts_implementation=batched_mm``). Qwen3-MoE PRO6000: ~77 tok/s.
 
 Enable compile with env ``SGLANG_LITE_TORCH_COMPILE=1`` (or ``true``/``yes``).
+Enable HF graph decode with ``SGLANG_LITE_CUDA_GRAPH_DECODE=1`` (default on
+when experts_impl is batched_mm — see runner).
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -24,6 +28,18 @@ def compile_enabled() -> bool:
         "true",
         "yes",
     )
+
+
+def experts_implementation_from_env() -> Optional[str]:
+    """HF MoE expert backend. Empty → caller default.
+
+    ``batched_mm``: ~2× faster than default ``grouped_mm`` on Qwen3-MoE and
+    CUDA-graph safe. ``grouped_mm`` (TF default) does CPU↔CUDA in capture.
+    """
+    raw = os.environ.get("SGLANG_LITE_EXPERTS_IMPL", "").strip().lower()
+    if not raw or raw in ("auto", "default", "0", "none"):
+        return None
+    return raw
 
 
 def maybe_compile_model(
@@ -91,13 +107,152 @@ class DecodeInputBuffer:
         return self._pos
 
 
-def cuda_graph_decode_enabled() -> bool:
-    # Default off until validated on each model family; enable with =1.
-    return os.environ.get("SGLANG_LITE_CUDA_GRAPH_DECODE", "0").lower() in (
+def cuda_graph_decode_enabled(default: str = "0") -> bool:
+    # default arg lets HF batched_mm path opt-in with default="1".
+    return os.environ.get("SGLANG_LITE_CUDA_GRAPH_DECODE", default).lower() in (
         "1",
         "true",
         "yes",
     )
+
+
+class HfStaticDecodeCudaGraph:
+    """Batch=1 HF decode under CUDA graph with StaticCache + static buffers.
+
+    Requires a CUDA-graph-safe MoE path (``experts_implementation=batched_mm``).
+    Protocol:
+      1. Prefill into StaticCache (eager).
+      2. Warm a few decode steps; capture one step with fixed tok/pos buffers.
+      3. Replay: write next token + position into buffers, ``graph.replay()``,
+         read logits from the static output tensor.
+    """
+
+    def __init__(self, device: str, max_cache_len: int = 4096):
+        self.device = device
+        self.max_cache_len = int(max_cache_len)
+        self.graph: Optional[torch.cuda.CUDAGraph] = None
+        self.captured = False
+        self._disabled = False
+        self._warmup_done = 0
+        self._warmup_need = 2
+        self._static_out: Any = None
+        self._tok_buf: Optional[torch.Tensor] = None
+        self._pos_buf: Optional[torch.Tensor] = None
+        self._cache: Any = None
+        self._model: Any = None
+        self._logits_to_keep = True
+
+    def reset(self) -> None:
+        self.graph = None
+        self.captured = False
+        self._static_out = None
+        self._warmup_done = 0
+        self._cache = None
+        # keep _disabled and buffers
+
+    def ensure_buffers(self) -> None:
+        dev = torch.device(self.device)
+        if self._tok_buf is None or self._tok_buf.device != dev:
+            self._tok_buf = torch.zeros((1, 1), dtype=torch.long, device=dev)
+            self._pos_buf = torch.zeros((1, 1), dtype=torch.long, device=dev)
+
+    def alloc_cache(self, model: Any) -> Any:
+        """Allocate a fresh StaticCache bound to model config."""
+        from transformers import StaticCache
+
+        self.ensure_buffers()
+        self._model = model
+        self._cache = StaticCache(
+            config=model.config, max_cache_len=self.max_cache_len
+        )
+        self.reset_capture_only()
+        return self._cache
+
+    def reset_capture_only(self) -> None:
+        self.graph = None
+        self.captured = False
+        self._static_out = None
+        self._warmup_done = 0
+
+    @property
+    def cache(self) -> Any:
+        return self._cache
+
+    def _forward_decode(self, past: Any) -> Any:
+        assert self._tok_buf is not None and self._pos_buf is not None
+        assert self._model is not None
+        kwargs = {
+            "input_ids": self._tok_buf,
+            "past_key_values": past,
+            "use_cache": True,
+            "position_ids": self._pos_buf,
+            "cache_position": self._pos_buf.reshape(-1),
+        }
+        if self._logits_to_keep:
+            kwargs["logits_to_keep"] = 1
+        return self._model(**kwargs)
+
+    def run_decode_step(
+        self,
+        *,
+        token_id: int,
+        pos: int,
+        past: Any,
+        force_eager: bool = False,
+    ) -> Any:
+        """One decode step; may capture or replay CUDA graph.
+
+        Returns model outputs (logits on ``outputs.logits``).
+        """
+        if self._disabled or not str(self.device).startswith("cuda"):
+            return self._eager(token_id, pos, past)
+        if not torch.cuda.is_available():
+            return self._eager(token_id, pos, past)
+        if force_eager or not cuda_graph_decode_enabled(default="1"):
+            return self._eager(token_id, pos, past)
+
+        self.ensure_buffers()
+        assert self._tok_buf is not None and self._pos_buf is not None
+        self._tok_buf[0, 0] = int(token_id)
+        self._pos_buf[0, 0] = int(pos)
+
+        if not self.captured:
+            if self._warmup_done < self._warmup_need:
+                self._warmup_done += 1
+                out = self._forward_decode(past)
+                return out
+            # Capture: re-run same token/pos (StaticCache overwrites slot).
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            try:
+                with torch.cuda.graph(g):
+                    self._static_out = self._forward_decode(past)
+                self.graph = g
+                self.captured = True
+                print(
+                    f"[sglang-lite] HF StaticCache decode CUDA graph captured "
+                    f"(pos={pos}, max_cache_len={self.max_cache_len})"
+                )
+                return self._static_out
+            except Exception as e:
+                print(
+                    f"[sglang-lite] HF CUDA graph capture failed, "
+                    f"disable for session: {e}"
+                )
+                self._disabled = True
+                self.reset_capture_only()
+                return self._forward_decode(past)
+
+        assert self.graph is not None
+        self.graph.replay()
+        return self._static_out
+
+    def _eager(self, token_id: int, pos: int, past: Any) -> Any:
+        self.ensure_buffers()
+        assert self._tok_buf is not None and self._pos_buf is not None
+        self._tok_buf[0, 0] = int(token_id)
+        self._pos_buf[0, 0] = int(pos)
+        return self._forward_decode(past)
 
 
 class PagedDecodeCudaGraph:
