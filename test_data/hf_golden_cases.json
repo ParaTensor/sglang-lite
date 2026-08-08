@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "description": "Committed HF golden-gate cases for MoE thruput paths (PegaInfer-style). Keep short: accuracy gate, not thruput.",
+  "notes": [
+    "Greedy only (temperature=0).",
+    "ignore_eos=true keeps fixed max_new for token-length compare.",
+    "FORCE_HF path should aim all_token_text_exact; radix_native may first-diff (FI/fused numerical)."
+  ],
+  "cases": [
+    {
+      "id": "hello_16",
+      "prompt": "Hello",
+      "max_new": 16,
+      "ignore_eos": true
+    },
+    {
+      "id": "hello_32",
+      "prompt": "Hello",
+      "max_new": 32,
+      "ignore_eos": true
+    },
+    {
+      "id": "capital_16",
+      "prompt": "The capital of France is",
+      "max_new": 16,
+      "ignore_eos": true
+    }
+  ]
+}

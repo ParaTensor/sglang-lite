@@ -125,12 +125,24 @@ class LiteEngine:
         text_parts: List[str] = []
         finish = "stop"
         usage = None
+        output_ids: List[int] = []
         while True:
             item = sub.delta_queue.get(timeout=300.0)
             if item.get("error"):
                 raise RuntimeError(item["error"])
             if item.get("text"):
                 text_parts.append(item["text"])
+            # Prefer authoritative completion ids on the final frame.
+            if item.get("output_ids") is not None:
+                try:
+                    output_ids = [int(t) for t in item["output_ids"]]
+                except Exception:
+                    pass
+            elif item.get("token") is not None:
+                try:
+                    output_ids.append(int(item["token"]))
+                except Exception:
+                    pass
             if item.get("finish_reason") is not None:
                 finish = item["finish_reason"]
                 usage = item.get("usage")
@@ -138,13 +150,14 @@ class LiteEngine:
         return {
             "request_id": request_id,
             "text": "".join(text_parts),
+            "output_ids": output_ids,
             "finish_reason": finish,
             "finished": True,
             "usage": usage
             or {
                 "prompt_tokens": len(input_ids),
-                "completion_tokens": 0,
-                "total_tokens": len(input_ids),
+                "completion_tokens": len(output_ids),
+                "total_tokens": len(input_ids) + len(output_ids),
                 "cache_hit_tokens": 0,
             },
         }
@@ -182,12 +195,23 @@ class LiteEngine:
             text_parts: List[str] = []
             finish = "stop"
             usage = None
+            output_ids: List[int] = []
             while True:
                 item = sub.delta_queue.get(timeout=timeout_s)
                 if item.get("error"):
                     raise RuntimeError(item["error"])
                 if item.get("text"):
                     text_parts.append(item["text"])
+                if item.get("output_ids") is not None:
+                    try:
+                        output_ids = [int(t) for t in item["output_ids"]]
+                    except Exception:
+                        pass
+                elif item.get("token") is not None:
+                    try:
+                        output_ids.append(int(item["token"]))
+                    except Exception:
+                        pass
                 if item.get("finish_reason") is not None:
                     finish = item["finish_reason"]
                     usage = item.get("usage")
@@ -197,13 +221,14 @@ class LiteEngine:
                 {
                     "request_id": str(req["request_id"]),
                     "text": "".join(text_parts),
+                    "output_ids": output_ids,
                     "finish_reason": finish,
                     "finished": True,
                     "usage": usage
                     or {
                         "prompt_tokens": len(ids),
-                        "completion_tokens": 0,
-                        "total_tokens": len(ids),
+                        "completion_tokens": len(output_ids),
+                        "total_tokens": len(ids) + len(output_ids),
                         "cache_hit_tokens": 0,
                     },
                 }

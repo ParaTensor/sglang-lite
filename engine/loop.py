@@ -581,6 +581,9 @@ class EngineLoop:
                     "usage": self._usage(seq) if finished else None,
                     "error": None,
                 }
+                # Golden-gate / accuracy: full completion ids on the final frame.
+                if finished:
+                    payload["output_ids"] = list(seq.output_ids)
                 self._emit(seq.request_id, payload, final=finished)
 
             self.scheduler.running = [s for s in self.scheduler.running if not s.finished]
@@ -672,17 +675,16 @@ class EngineLoop:
                 if skip_text:
                     acc_text = self.runner.detokenize(seq.output_ids)
                     self._prev_text[seq.request_id] = acc_text
-            self._emit(
-                seq.request_id,
-                {
-                    "text": acc_text,
-                    "token": last_emit,
-                    "finish_reason": seq.finish_reason if finished else None,
-                    "usage": self._usage(seq) if finished else None,
-                    "error": None,
-                },
-                final=finished,
-            )
+            fin_payload = {
+                "text": acc_text,
+                "token": last_emit,
+                "finish_reason": seq.finish_reason if finished else None,
+                "usage": self._usage(seq) if finished else None,
+                "error": None,
+            }
+            if finished:
+                fin_payload["output_ids"] = list(seq.output_ids)
+            self._emit(seq.request_id, fin_payload, final=finished)
             self.scheduler.running = [
                 s for s in self.scheduler.running if not s.finished
             ]
@@ -743,6 +745,8 @@ class EngineLoop:
                 "usage": self._usage(seq) if finished else None,
                 "error": None,
             }
+            if finished:
+                payload["output_ids"] = list(seq.output_ids)
             self._emit(seq.request_id, payload, final=finished)
 
         self.scheduler.running = [s for s in self.scheduler.running if not s.finished]

@@ -77,12 +77,20 @@ cache 对实际 prefill 计算的减少。
 - PyO3 直接嵌入
 
 ## 推荐的下一步优先级
-1. 一个真实 MoE 模型的 reference correctness。
+1. 一个真实 MoE 模型的 reference correctness（**HF golden gate**，见下）。
 2. 真实 per-layer paged KV、prefix skip、回收与 OOM。
-3. sglang-lite engine process 内的中央 async continuous batching loop。
+3. sglang-lite engine process 内的中央 async continuous batching loop（单所有者）。
 4. Rust ↔ Python 真实 TokenDelta streaming、cancel 和 backpressure。
 5. 官方 standalone CLI、readiness、metrics、错误与 graceful drain。
-6. CUDA graph、量化/TP、模型矩阵、benchmark 和 soak test。
+6. CUDA graph 图内零分配审计、量化/TP、模型矩阵、benchmark 和 soak test。
+
+### PegaInfer 借鉴（2026-08-08）
+
+见 **[pega-lessons.md](./pega-lessons.md)**：热路径与门禁标杆，**不**跟纯 Rust 重写 engine。
+
+- 脚本：`scripts/hf_golden_gate.py` + `test_data/hf_golden_cases.json`
+- FORCE_HF 路径目标 token-exact；radix_native 报告 first-diff
+- 延后：Green Contexts、KV offload、per-model 拆引擎
 
 完整退出标准见
 [`standalone-inference-service-roadmap.md`](./standalone-inference-service-roadmap.md)。

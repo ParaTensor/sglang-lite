@@ -151,6 +151,14 @@ CUDA_VISIBLE_DEVICES=0 python scripts/moe_thruput_probe.py \
 #   SGLANG_LITE_RADIX_NATIVE=1 python scripts/moe_thruput_probe.py ...
 #   探针默认：CUDA_GRAPH=1 + FUSED_MOE=1 + NATIVE_DECODE=1（FORCE_HF=0）
 #   SGLANG_LITE_PAGED_MAX_PAGES=256  # decode metadata 容量（page_size=16 → 4k tok）
+#
+# HF golden gate（PegaInfer 风格；见 docs/pega-lessons.md）：
+#   python scripts/hf_golden_gate.py dump-hf --model ~/models/Qwen3-30B-A3B-Instruct \
+#     --cases test_data/hf_golden_cases.json --out /tmp/golden/hf.json
+#   python scripts/hf_golden_gate.py run-lite --model ~/models/Qwen3-30B-A3B-Instruct \
+#     --path force_hf --out /tmp/golden/lite_hf.json
+#   python scripts/hf_golden_gate.py compare --hf /tmp/golden/hf.json \
+#     --lite /tmp/golden/lite_hf.json --out /tmp/golden/cmp.json --require-exact
 
 # 小：DeepSeek-V2-Lite（MLA → HF cache；首次需 TF5 patch）
 python scripts/patch_deepseek_v2_tf5.py ~/models/DeepSeek-V2-Lite-Chat
