@@ -105,23 +105,30 @@ engine/
 
 ### PRO6000 验收（2026-08-08，宿主 torch 2.11+cu130，vendor `deepseek_infer`）
 
-| Case | warm tok/s（vendor 初验） | warm **burst 后** (`6a287d9`) | 旧基线 §6.4.1 |
-|------|---------------------------|-------------------------------|---------------|
-| 1×128 | 7.44 | **9.06** | 7.59 |
+| Case | warm tok/s（vendor 初验） | warm **burst** | 旧基线 §6.4.1 |
+|------|---------------------------|----------------|---------------|
+| 1×128 | 7.44 | **9.34** (`7f6a99d`) | 7.59 |
 | 4×96 | 16.48 | **26.54** | 16.74 |
 | 1×256 | 7.48 | **9.08** | 7.51 |
-| load_s | ~8–11 | ~7.6 | ~8 |
 
-日志：`~/bench/v4_thru_burst_summary.json`（host）。  
+**官方 ignore_eos 天花板**（同机同权，`scripts/v4_official_timed_ceiling.py`）：  
+1×128 warm **≈9.08 tok/s**。Lite Hybrid **9.34** ≈ 官方天花板（host 税已吃光）。
 
-**热路径修复（`6a287d9`）**：
+| 路径 | 1×128 warm tok/s |
+|------|------------------|
+| 官方 vendor generate ignore_eos | 9.08 |
+| Lite Hybrid burst + no dual re-stage | **9.34** |
 
-1. 禁止 decode 每步 dual-pool **re-stage**（只在 prefix restore 后 `_v4_need_stage` 一次）  
-2. V4 **decode burst**（`SGLANG_LITE_DECODE_BURST=128`）绕开逐 token 调度税  
-3. thruput 可关 dual append：`SGLANG_LITE_V4_DUAL_APPEND=0`  
+日志：`~/bench/v4_official_ceiling.log`、`~/bench/v4_thru_nosync.log`。
 
-仍绑官方 TileLang `sparse_attn`；要再翻倍需换 SM120 叶子核（SGLang dsv4 / FI）。  
-SGLang blackwell 镜像在本机 sm_120 仍 blocked（`flash_mla` 架构不支持）。
+**热路径修复**：
+
+1. 禁止 decode 每步 dual-pool **re-stage**（只 prefix restore 后一次）  
+2. V4 decode burst + `ignore_eos` 全程 GPU token（无逐步 `.item()`）  
+3. thruput：`SGLANG_LITE_DECODE_BURST=128`、`SGLANG_LITE_V4_DUAL_APPEND=0`  
+
+**结论**：再涨吞吐必须换 **TileLang sparse 叶子核**（dsv4 / FI SM120 / deep_gemm 等）；Python 调度已非主因。  
+宿主：`deep_gemm` 可用；`sgl_kernel` 未加载；SGLang blackwell 镜像 sm_120 仍 blocked。
 
 ### Phase V2 — 焊核 + 满图
 
