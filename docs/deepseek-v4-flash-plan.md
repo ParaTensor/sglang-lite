@@ -838,8 +838,9 @@ CPU 默认 soak/回归应 `overall: PASS`。
 | lab: StaticCache CUDA graph | — | — | ~77 | KV 一致但 attn 在 ~14 tok 漂移；默认关 |
 | **SGLang 0.5.16 Docker** | 65.1 | **152.2** | **155.3** | 完整 CUDA graph capture |
 
-比值（当前最优 warm）：**SGLang / lite ≈ 1.87×**（155/83.2）。  
-相对首测 **+302%**（20.7→83.2）。已越过 HF.generate 与 0.5× SGLang 门槛（~77.5）。
+比值（当前最优 warm）：**SGLang / lite ≈ 1.53×**（155/101，radix native+CG+fused）；  
+FORCE_HF+compile 仍 ~84（≈1.87×）。相对首测 **+388%**（20.7→101）。  
+已越过 HF.generate 与 0.5× SGLang 门槛（~77.5）。
 
 **根因与开关（2026-08-07 → 08-08）**
 
@@ -867,24 +868,24 @@ CPU 默认 soak/回归应 `overall: PASS`。
    - **根因修复**：FI paged hook 漏了 Qwen3 **`q_norm`/`k_norm`** → 从第 1 个
      token 起崩溃式胡话；补上后 PAGE-eager 文本流畅（~44–52 tok/s）。  
    - 与 HF generate 仍可在 ~14 tok 处分叉（FI vs SDPA 数值，类似 StaticCache 现象）。  
-   - **CUDA graph**（plan 图外 / body 图内，`batched_mm`）：  
-     - 旧：跨页重捕获 → ~40 tok/s。  
-     - **现**：固定 max-pages + FI `use_cuda_graph` 后 **单次捕获**  
-       （`active_pages=1, max_pages=256`）贯穿 1×128：  
-       **warm ~78.6 tok/s** / cold ~55（含 capture）；eager paged ~44.6。  
-     - 仍 **默认关**（`SGLANG_LITE_CUDA_GRAPH_DECODE=1` opt-in）；  
-       thruput 默认仍是 HF+compile ~84。  
-   - 开关：`SGLANG_LITE_RADIX_NATIVE=1` → 探针侧 `FORCE_HF_CACHE=0`；  
-     `SGLANG_LITE_PAGED_MAX_PAGES=256`（page_size=16 → 4k tok 容量）。  
-   - 实现要点：  
-     - B=1 独立 `BatchDecodeWithPagedKVCacheWrapper(use_cuda_graph=True,
-       use_tensor_cores=True)`，plan 拷 active indices 入固定 buffer；  
-     - page id 仅在页列表变化时 H2D；  
-     - torch graph 仅在 `buf_gen` 变化或 overflow 时失效。
+   - **固定 max-pages + FI `use_cuda_graph`**：单次捕获贯穿 1×128。  
+   - **Native layer loop**（`engine/native_decode.py`）：跳过 HF CausalLM.forward
+     / `create_causal_mask` / DynamicCache；仍用 HF 权重与 FI attn hooks。  
+   - **PRO6000 Qwen3-30B 1×128 warm**（同日）：  
+     | 栈 | warm tok/s |  
+     |----|------------|  
+     | paged eager | ~45 |  
+     | paged + CG + batched_mm | ~79 |  
+     | **paged + native + CG + cutlass fused MoE** | **~101** |  
+     | FORCE_HF + compile（探针默认 thruput） | ~84 |  
+     | SGLang 0.5.16 | ~155 |  
+   - 探针 `SGLANG_LITE_RADIX_NATIVE=1` 默认：`FORCE_HF=0`、`CUDA_GRAPH=1`、
+     `FUSED_MOE=1`、`NATIVE_DECODE=1`。产品 thruput 默认仍可 FORCE_HF+compile。  
+   - `SGLANG_LITE_PAGED_MAX_PAGES=256`（page_size=16 → 4k tok）。
 
-**下一刀（逼近 SGLang ~155）**：radix-native CG ~79 已贴近 StaticCache lab
-与 HF+compile ~84，距 SGLang ~155 仍 ~2×。下一优先是 **非 HF 包装的
-MoE+attn 执行栈**（去掉 HF forward 税），而不是再堆开关。
+**下一刀（逼近 SGLang ~155）**：radix 栈 **~101**（SGLang / lite ≈ 1.53×）。
+余量主要在 **更深的 kernel 融合 / 量化执行**（非再剥 HF Python）。可选：
+sgl-kernel MoE、FP8 权重路径、或更短的 attn+MLP capture 体；避免扩协议面。
 
 Registry：`engine/models.py` → `MINIMAX_MOE`。  
 Runner：`runner.py` 对 MLA / MiniMax / 非 2^n GQA 跳过标准 FI paged，走 HF `use_cache`。  

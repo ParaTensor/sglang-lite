@@ -147,10 +147,10 @@ CUDA_VISIBLE_DEVICES=0 python scripts/moe_thruput_probe.py \
   --cases 1x64,1x128 --out ~/bench/thru_qwen3_30b_a3b.json
 # bit-exact eager（~47 tok/s）：SGLANG_LITE_TORCH_COMPILE=0 ...
 # 实验 cutlass fused MoE（e2e ~44，默认关）：SGLANG_LITE_FUSED_MOE=1 SGLANG_LITE_TORCH_COMPILE=0 ...
-# Radix-native FI paged（q_norm 已修；eager ~45；CG ~79 tok/s warm on PRO6000）：
+# Radix-native（PRO6000 Qwen3-30B ~101 tok/s warm）：
 #   SGLANG_LITE_RADIX_NATIVE=1 python scripts/moe_thruput_probe.py ...
-#   SGLANG_LITE_CUDA_GRAPH_DECODE=1  # 单次捕获（固定 max-pages + FI use_cuda_graph）
-#   SGLANG_LITE_PAGED_MAX_PAGES=256  # 默认；解码 metadata 容量（page_size=16 → 4k tok）
+#   探针默认：CUDA_GRAPH=1 + FUSED_MOE=1 + NATIVE_DECODE=1（FORCE_HF=0）
+#   SGLANG_LITE_PAGED_MAX_PAGES=256  # decode metadata 容量（page_size=16 → 4k tok）
 
 # 小：DeepSeek-V2-Lite（MLA → HF cache；首次需 TF5 patch）
 python scripts/patch_deepseek_v2_tf5.py ~/models/DeepSeek-V2-Lite-Chat

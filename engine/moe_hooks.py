@@ -165,16 +165,35 @@ def attach_cutlass_moe(model: Any) -> int:
 
 
 def maybe_attach_fused_moe(model: Any, *, force_hf_cache: bool = False) -> int:
-    """Attach fused MoE when explicitly enabled.
+    """Attach fused MoE when enabled or auto-selected.
 
-    PRO6000 e2e (Qwen3-30B): cutlass fused alone ~44 tok/s vs batched_mm ~47
-    and torch.compile ~84. Keep **opt-in only** (``SGLANG_LITE_FUSED_MOE=1``);
-    do not auto-enable on FORCE_HF — inductor path remains the thruput default.
+    PRO6000 Qwen3-30B (2026-08-08):
+      - fused alone ~44; batched_mm ~47; torch.compile ~84 (FORCE_HF default).
+      - **paged + CUDA graph + fused + native** ~**101** tok/s warm.
+
+    Policy:
+      - ``SGLANG_LITE_FUSED_MOE=1/0`` forces on/off.
+      - Auto-on when **not** FORCE_HF and ``SGLANG_LITE_CUDA_GRAPH_DECODE=1``
+        (radix-native CG stack). Never auto on FORCE_HF thruput path.
     """
     flag = fused_moe_env()
-    if flag is not True:
+    if flag is False:
         return 0
     if not cutlass_fused_moe_available():
-        print("[sglang-lite] SGLANG_LITE_FUSED_MOE=1 but cutlass_fused_moe missing")
+        if flag is True:
+            print("[sglang-lite] SGLANG_LITE_FUSED_MOE=1 but cutlass_fused_moe missing")
         return 0
-    return attach_cutlass_moe(model)
+    if flag is True:
+        return attach_cutlass_moe(model)
+    # Auto: radix-native / paged CG path only.
+    if force_hf_cache:
+        return 0
+    from .cuda_graph import cuda_graph_decode_enabled
+
+    if cuda_graph_decode_enabled(default="0"):
+        print(
+            "[sglang-lite] auto cutlass fused MoE "
+            "(paged + SGLANG_LITE_CUDA_GRAPH_DECODE)"
+        )
+        return attach_cutlass_moe(model)
+    return 0

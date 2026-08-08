@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from types import SimpleNamespace
 from typing import Dict, List, Optional
 
 import torch
@@ -18,6 +19,7 @@ from .kernel_backend import PagedAttnContext, create_kernel_backend
 from .kv_cache import PastKV, RadixCache
 from .models import assert_moe_supported, is_fixture_model, register_verified
 from .moe_hooks import maybe_attach_fused_moe
+from .native_decode import native_decode_enabled, try_build_paged_native
 from .sampling import make_generator, sample_logits
 from .scheduler import Sequence
 
@@ -63,6 +65,7 @@ class ModelRunner:
         self._decode_input_buf = DecodeInputBuffer(device)
         self._paged_decode_cg = PagedDecodeCudaGraph(device)
         self._hf_static_cg: Optional[HfStaticDecodeCudaGraph] = None
+        self._paged_native = None  # lean decode body (no HF CausalLM.forward)
         self._experts_impl: Optional[str] = None
         # Must match model compute dtype; fp16 pages + bf16 activations promote to fp32 in SDPA.
         self.torch_dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
@@ -312,6 +315,20 @@ class ModelRunner:
         self._compile_preferred = compiled is not self.model
         self.model = compiled
         self._decode_input_buf = DecodeInputBuffer(self.device)
+        # Lean paged decode: walk HF layers without CausalLM.forward / causal mask.
+        # Build after hooks + compile so we reference the live modules.
+        self._paged_native = None
+        if (
+            self.use_paged_as_source
+            and paged_hooks
+            and native_decode_enabled(default="1")
+        ):
+            self._paged_native = try_build_paged_native(self.model)
+            if self._paged_native is not None:
+                print(
+                    "[sglang-lite] paged native decode enabled "
+                    "(layer loop, no HF CausalLM.forward)"
+                )
         # Growable ones-mask for HF path (avoid per-step host alloc of new tensors).
         self._attn_mask_buf: Optional[torch.Tensor] = None
         # Throughput: allow TF32 tensor cores on Ampere+ (safe for thruput probes).
@@ -684,6 +701,13 @@ class ModelRunner:
             and seq.kv_state is not None
         ):
             return self._decode_burst_hf_greedy(seq, n_steps)
+        # Tight paged greedy: fewer host branches than per-step _decode_one.
+        if (
+            not self._v4_hybrid
+            and self._use_paged_attention()
+            and temp <= 1e-5
+        ):
+            return self._decode_burst_paged_greedy(seq, radix, n_steps)
 
         out: List[int] = []
         eos = self.eos_token_id
@@ -737,6 +761,50 @@ class ModelRunner:
             outputs = self.model(**kwargs)
             past = outputs.past_key_values
             seq.kv_state = past
+            seq.cached_len = pos + 1
+            tok = int(outputs.logits[0, -1].argmax().item())
+            out.append(tok)
+            seq.output_ids.append(tok)
+            seq.decode_tokens = getattr(seq, "decode_tokens", 0) + 1
+            if not ignore_eos and eos is not None and tok == int(eos):
+                break
+        return out
+
+    def _decode_burst_paged_greedy(
+        self, seq: Sequence, radix: RadixCache, n_steps: int
+    ) -> List[int]:
+        """Greedy paged decode burst (native/FI body + argmax, minimal host tax)."""
+        out: List[int] = []
+        eos = self.eos_token_id
+        ignore_eos = bool(getattr(seq, "ignore_eos", False))
+        if not seq.output_ids and getattr(seq, "last_logits", None) is not None:
+            seq.cached_len = len(seq.input_ids)
+            tok = int(torch.argmax(seq.last_logits.to(device=self.device)).item())
+            out.append(tok)
+            seq.output_ids.append(tok)
+            seq.decode_tokens = getattr(seq, "decode_tokens", 0) + 1
+            n_steps -= 1
+            if n_steps <= 0 or (
+                not ignore_eos and eos is not None and tok == int(eos)
+            ):
+                return out
+
+        tok_buf = self._decode_input_buf
+        for _ in range(max(0, n_steps)):
+            last = seq.output_ids[-1] if seq.output_ids else seq.input_ids[-1]
+            pos = seq.cached_len
+            self._ensure_blocks(seq, radix, pos + 1)
+            if seq.block_table:
+                page_i = pos // radix.block_size
+                if page_i < len(seq.block_table):
+                    seq.block_table[page_i] = radix.cow_block_if_shared(
+                        seq.block_table[page_i]
+                    )
+            input_ids = tok_buf.set_token(int(last))
+            outputs = self._model_forward_paged(
+                input_ids, [seq], radix, is_decode=True
+            )
+            seq.kv_state = None
             seq.cached_len = pos + 1
             tok = int(outputs.logits[0, -1].argmax().item())
             out.append(tok)
@@ -1505,7 +1573,17 @@ class ModelRunner:
             sm_scale=sm_scale,
         )
 
+        use_native = (
+            is_decode
+            and B == 1
+            and q_len == 1
+            and self._paged_native is not None
+        )
+
         def _body():
+            if use_native:
+                # Tensor logits — wrap after capture/replay for .logits API.
+                return self._paged_native.forward_logits(input_ids, position_ids)
             return self.model(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -1513,6 +1591,11 @@ class ModelRunner:
                 use_cache=False,
                 attention_mask=attn,
             )
+
+        def _as_outputs(raw):
+            if torch.is_tensor(raw):
+                return SimpleNamespace(logits=raw)
+            return raw
 
         # Radix-native CUDA graph: plan outside, capture/replay model body.
         # Opt-in only (SGLANG_LITE_CUDA_GRAPH_DECODE=1). Captures on Qwen3+batched_mm
@@ -1545,13 +1628,13 @@ class ModelRunner:
                 )
                 if out is None:
                     out = _body()
-                return out
+                return _as_outputs(out)
             finally:
                 self.kernel_backend.end_forward()
 
         self.kernel_backend.begin_forward(ctx)
         try:
-            return _body()
+            return _as_outputs(_body())
         finally:
             self.kernel_backend.end_forward()
 

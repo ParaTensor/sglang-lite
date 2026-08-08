@@ -66,21 +66,23 @@ def main() -> int:
     os.environ.setdefault("SGLANG_LITE_V4_DISABLE_FI_SPARSE", "1")
     os.environ.setdefault("SGLANG_LITE_LOG_JSON", "0")
     # Default thruput path: HF cache + batched_mm + torch.compile (~84 tok/s).
-    # Radix-native paged (after q_norm fix): set SGLANG_LITE_FORCE_HF_CACHE=0
-    # (and optionally SGLANG_LITE_CUDA_GRAPH_DECODE=1 — captures, more FI drift).
+    # Radix-native stack (PRO6000 Qwen3-30B ~101 warm): paged + native layer loop
+    # + CUDA graph + cutlass fused MoE.
     if os.environ.get("SGLANG_LITE_RADIX_NATIVE", "").lower() in ("1", "true", "yes"):
         os.environ.setdefault("SGLANG_LITE_FORCE_HF_CACHE", "0")
         os.environ.setdefault("SGLANG_LITE_TORCH_COMPILE", "0")
-        os.environ.setdefault("SGLANG_LITE_CUDA_GRAPH_DECODE", "0")
+        os.environ.setdefault("SGLANG_LITE_CUDA_GRAPH_DECODE", "1")
+        os.environ.setdefault("SGLANG_LITE_FUSED_MOE", "1")
+        os.environ.setdefault("SGLANG_LITE_NATIVE_DECODE", "1")
     else:
         os.environ.setdefault("SGLANG_LITE_FORCE_HF_CACHE", "1")
         os.environ.setdefault("SGLANG_LITE_TORCH_COMPILE", "1")
+        # cutlass fused slower than compile on FORCE_HF path (~44 vs ~84).
+        os.environ.setdefault("SGLANG_LITE_FUSED_MOE", "0")
     # Large burst: fewer scheduler hops; runner warms compile at load.
     os.environ.setdefault("SGLANG_LITE_DECODE_BURST", "128")
     # batched_mm: ~2× default grouped_mm; + torch.compile(mode=default) ~84 tok/s.
     os.environ.setdefault("SGLANG_LITE_EXPERTS_IMPL", "batched_mm")
-    # cutlass fused MoE opt-in only (e2e ~44 < compile ~84 on PRO6000).
-    os.environ.setdefault("SGLANG_LITE_FUSED_MOE", "0")
 
     from sglang_lite import LiteEngine
 
