@@ -32,19 +32,22 @@ def _expert_forward_fused(self, x: torch.Tensor, weights: Optional[torch.Tensor]
     dtype = x.dtype
     w1 = self.w1.weight
     w3 = self.w3.weight
+    # Globals live on vendor ``model`` (set in Transformer.__init__), not kernel.
+    import model as M  # type: ignore
+    import kernel as K  # type: ignore
+
+    block = int(getattr(M, "block_size", 128))
+    scale_fmt = getattr(M, "scale_fmt", None)
+    scale_dtype = getattr(M, "scale_dtype", torch.float32)
     # FP4 experts: quantize activation once for both gate and up projections.
     if w1.dtype == torch.float4_e2m1fn_x2:
-        import kernel as K  # type: ignore  # vendor on sys.path
-
-        xq, s = K.act_quant(x, K.block_size, K.scale_fmt, K.scale_dtype)
-        gate = K.fp4_gemm(xq, s, w1, w1.scale, K.scale_dtype).float()
-        up = K.fp4_gemm(xq, s, w3, w3.scale, K.scale_dtype).float()
+        xq, s = K.act_quant(x, block, scale_fmt, scale_dtype)
+        gate = K.fp4_gemm(xq, s, w1, w1.scale, scale_dtype).float()
+        up = K.fp4_gemm(xq, s, w3, w3.scale, scale_dtype).float()
     elif w1.dtype == torch.float8_e4m3fn:
-        import kernel as K  # type: ignore
-
-        xq, s = K.act_quant(x, K.block_size, K.scale_fmt, K.scale_dtype)
-        gate = K.fp8_gemm(xq, s, w1, w1.scale, K.scale_dtype).float()
-        up = K.fp8_gemm(xq, s, w3, w3.scale, K.scale_dtype).float()
+        xq, s = K.act_quant(x, block, scale_fmt, scale_dtype)
+        gate = K.fp8_gemm(xq, s, w1, w1.scale, scale_dtype).float()
+        up = K.fp8_gemm(xq, s, w3, w3.scale, scale_dtype).float()
     else:
         gate = self.w1(x).float()
         up = self.w3(x).float()
