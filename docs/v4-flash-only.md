@@ -160,6 +160,25 @@ engine/
 开关：`SGLANG_LITE_V4_MOE_FAST=0` 关闭。  
 下一步：把 **FP4 专家权**接到 FlashInfer **B12x / SM120 cutlass fused MoE**（分组 GEMM），才能吃掉 MoE 52%。
 
+---
+
+## 10. 同机对标 vLLM（PRO6000，2026-08-08）
+
+**配置**：8× RTX PRO 6000，`DeepSeek-V4-Flash-0731`，vLLM **0.25.0** 官方 recipe  
+（`vllm/vllm-openai:v0.25.0` + FI 0.6.14、`--tensor-parallel-size 8 --enable-expert-parallel --kv-cache-dtype fp8`）。
+
+| Case（ignore_eos） | **vLLM warm tok/s** | **sglang-lite Hybrid warm** | 差距 |
+|--------------------|---------------------|-----------------------------|------|
+| 1×128 | **~72.3** | **~9.1–9.3** | **~7.8×** |
+| 1×256 | **~72.4** | **~9.3** | **~7.8×** |
+| 4 并发 ×96（合计） | **~256 agg** | **~27**（lite batch 内） | 数量级差距 |
+
+- 启动：`scripts/vllm_v4_pro6000_start.sh`  
+- 客户端：`scripts/vllm_v4_bench_client.py`  
+- 日志：`~/bench/vllm_v4_kpi.json`（host）  
+- vLLM 日志可见：`DeepGemmFP4Experts` + `sparse_mla_sm120_decode_dsv4`（完整生产核栈）。  
+- lite 仍绑官方 TileLang expert loop + TileLang sparse → **对标已建立，差距主要在 MoE/核栈，不是 Python 调度零头。**
+
 ### Phase V2 — 焊核 + 满图
 
 - [x] SGLang V4 切片 **reference** pin（`sglang@e732c0a9…`）— 不 runtime import  
