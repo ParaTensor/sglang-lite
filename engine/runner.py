@@ -290,6 +290,7 @@ class ModelRunner:
             and self._experts_impl == "batched_mm"
             and str(self.device).startswith("cuda")
         )
+        self._compile_preferred = prefer_compile and not multi_gpu_shard
         if not multi_gpu_shard:
             self.model = maybe_compile_model(
                 self.model,
@@ -317,8 +318,51 @@ class ModelRunner:
             except Exception:
                 pass
 
+        # Torch.compile pays on first unique shapes — warm decode shapes at load
+        # so the first user request is not a 100s+ cold compile (thruput path).
+        if self._compile_preferred and str(self.device).startswith("cuda"):
+            self._warmup_hf_compile_decode()
+
         register_verified(model_name)
         print(f"[sglang-lite] MoE model '{model_name}' ready on {self.device}")
+
+    @torch.inference_mode()
+    def _warmup_hf_compile_decode(self) -> None:
+        """Run a few static-shape decode steps to trigger inductor kernels."""
+        try:
+            dev = self.device
+            ids = torch.zeros((1, 1), dtype=torch.long, device=dev)
+            # Use a non-pad token when available.
+            if self.eos_token_id is not None:
+                ids[0, 0] = int(self.eos_token_id) % max(self.vocab_size, 1)
+            kwargs: Dict = {"input_ids": ids, "use_cache": True}
+            if self._supports_logits_to_keep():
+                kwargs["logits_to_keep"] = 1
+            out = self.model(**kwargs)
+            past = out.past_key_values
+            pos = 1
+            tok_buf = torch.zeros((1, 1), dtype=torch.long, device=dev)
+            pos_buf = torch.zeros((1, 1), dtype=torch.long, device=dev)
+            for _ in range(6):
+                tok_buf[0, 0] = out.logits[0, -1].argmax()
+                pos_buf[0, 0] = pos
+                kw = {
+                    "input_ids": tok_buf,
+                    "past_key_values": past,
+                    "use_cache": True,
+                    "position_ids": pos_buf,
+                    "cache_position": pos_buf.reshape(-1),
+                }
+                if self._supports_logits_to_keep():
+                    kw["logits_to_keep"] = 1
+                out = self.model(**kw)
+                past = out.past_key_values
+                pos += 1
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print("[sglang-lite] torch.compile decode warmup done")
+        except Exception as e:
+            print(f"[sglang-lite] torch.compile warmup skipped: {e}")
 
     def _load_deepseek_v4_hybrid(self, model_name: str, load_id: str, config) -> None:
         """Hybrid: official inference Transformer + TP shard from convert.py."""
@@ -617,9 +661,24 @@ class ModelRunner:
         Must run under inference_mode: without it, DynamicCache updates build an
         autograd graph each step (~3× slower on Qwen3-30B-A3B decode).
         """
+        n_steps = max(0, int(n_steps))
+        if n_steps == 0:
+            return []
+        # Tight HF greedy path (no radix pages, no attention_mask) — matches
+        # model.generate kwargs and keeps compile/inductor shapes stable.
+        temp = float(getattr(seq, "temperature", 0.0) or 0.0)
+        if (
+            not self._v4_hybrid
+            and not self.use_paged_as_source
+            and not self._use_paged_attention()
+            and temp <= 1e-5
+            and seq.kv_state is not None
+        ):
+            return self._decode_burst_hf_greedy(seq, n_steps)
+
         out: List[int] = []
         eos = self.eos_token_id
-        for _ in range(max(0, int(n_steps))):
+        for _ in range(n_steps):
             if seq.finished:
                 break
             tok = self._decode_one(seq, radix)
@@ -627,6 +686,54 @@ class ModelRunner:
             seq.output_ids.append(int(tok))
             seq.decode_tokens = getattr(seq, "decode_tokens", 0) + 1
             if eos is not None and int(tok) == int(eos):
+                break
+        return out
+
+    def _decode_burst_hf_greedy(self, seq: Sequence, n_steps: int) -> List[int]:
+        """Greedy DynamicCache decode with minimal host/Python tax."""
+        out: List[int] = []
+        eos = self.eos_token_id
+        ignore_eos = bool(getattr(seq, "ignore_eos", False))
+        # First token may already sit in last_logits (prefill sampled later).
+        if not seq.output_ids and getattr(seq, "last_logits", None) is not None:
+            seq.cached_len = len(seq.input_ids)
+            tok = int(torch.argmax(seq.last_logits.to(device=self.device)).item())
+            out.append(tok)
+            seq.output_ids.append(tok)
+            seq.decode_tokens = getattr(seq, "decode_tokens", 0) + 1
+            n_steps -= 1
+            if n_steps <= 0 or (
+                not ignore_eos and eos is not None and tok == int(eos)
+            ):
+                return out
+
+        tok_buf = self._decode_input_buf
+        past = seq.kv_state
+        use_l2k = self._supports_logits_to_keep()
+        for _ in range(max(0, n_steps)):
+            last = seq.output_ids[-1] if seq.output_ids else seq.input_ids[-1]
+            pos = seq.cached_len
+            input_ids = tok_buf.set_token(int(last))
+            position_ids = tok_buf.set_position(int(pos))
+            kwargs = {
+                "input_ids": input_ids,
+                "past_key_values": past,
+                "use_cache": True,
+                "position_ids": position_ids,
+                "cache_position": position_ids.reshape(-1),
+            }
+            if use_l2k:
+                kwargs["logits_to_keep"] = 1
+            self.model_forward_count += 1
+            outputs = self.model(**kwargs)
+            past = outputs.past_key_values
+            seq.kv_state = past
+            seq.cached_len = pos + 1
+            tok = int(outputs.logits[0, -1].argmax().item())
+            out.append(tok)
+            seq.output_ids.append(tok)
+            seq.decode_tokens = getattr(seq, "decode_tokens", 0) + 1
+            if not ignore_eos and eos is not None and tok == int(eos):
                 break
         return out
 
@@ -1434,8 +1541,23 @@ class ModelRunner:
             "input_ids": input_ids,
             "past_key_values": self._as_model_cache(past),
             "use_cache": True,
-            "attention_mask": attention_mask,
         }
+        # Match HF generate(): skip pure-ones decode masks (extra work each step).
+        if attention_mask is not None:
+            skip_ones = False
+            try:
+                if (
+                    past is not None
+                    and input_ids.shape[-1] == 1
+                    and input_ids.shape[0] == 1
+                    and attention_mask.numel() > 0
+                    and bool(torch.all(attention_mask == 1).item())
+                ):
+                    skip_ones = True
+            except Exception:
+                skip_ones = False
+            if not skip_ones:
+                kwargs["attention_mask"] = attention_mask
         if position_ids is not None:
             kwargs["position_ids"] = position_ids
             # TF5 / Qwen3: cache_position aligns rope + cache updates.

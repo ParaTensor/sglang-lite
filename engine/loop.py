@@ -614,7 +614,8 @@ class EngineLoop:
             return True
 
         # Single-seq decode burst: many tokens per pump without re-scheduling.
-        burst_env = int(os.environ.get("SGLANG_LITE_DECODE_BURST", "16"))
+        # Default 64: thruput probes set 128; streaming clients can lower via env.
+        burst_env = int(os.environ.get("SGLANG_LITE_DECODE_BURST", "64"))
         can_burst = (
             burst_env > 1
             and len(batch) == 1

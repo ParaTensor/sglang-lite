@@ -141,7 +141,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/moe_regression.py \
 # Phase-A 吞吐探针（加载后 tok/s；非 vLLM/SGLang 对照）
 # 注意：Qwen3.5-27B 是 Dense+多模态，**不在 scope**；用 Qwen3-30B-A3B（文本 MoE）。
 # 探针默认：FORCE_HF_CACHE=1、EXPERTS_IMPL=batched_mm、TORCH_COMPILE=1。
-# PRO6000 warm ≈ 80–81 tok/s（SGLang ≈155 → ~1.9×）。首 case 含 compile 冷启动。
+# PRO6000 warm ≈ 83–85 tok/s（SGLang ≈155 → ~1.85×）。load 含 compile warmup ~110s。
 CUDA_VISIBLE_DEVICES=0 python scripts/moe_thruput_probe.py \
   --model ~/models/Qwen3-30B-A3B-Instruct --device cuda \
   --cases 1x64,1x128 --out ~/bench/thru_qwen3_30b_a3b.json

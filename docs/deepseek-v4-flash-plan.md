@@ -833,7 +833,7 @@ CPU 默认 soak/回归应 `overall: PASS`。
 | sglang-lite HF + inference_mode burst | ~14 | 21.6 | 21.9 | 修 burst 缺 `@torch.inference_mode` |
 | sglang-lite HF + torch.compile(default) | ~14 | 38.7 | 38.8 | inductor；冷启动 ~150s |
 | sglang-lite HF + experts=batched_mm eager | ~14 | **~46.6** | **~47.1** | bit-match `model.generate` |
-| sglang-lite **batched_mm + torch.compile(default)** | 16.3 | **84.7** | **83.2** | `thru_qwen3_30b_compile_bmm.json`；越过 generate |
+| sglang-lite **batched_mm + torch.compile(default)** | 16.3→**111**† | **84.7** | **83.5** | `thru_qwen3_30b_warm_burst.json`；†load 含 compile warmup |
 | HF `model.generate` 同权重 | — | ~45–46 | ~45–46 | eager 上限 |
 | lab: StaticCache CUDA graph | — | — | ~77 | KV 一致但 attn 在 ~14 tok 漂移；默认关 |
 | **SGLang 0.5.16 Docker** | 65.1 | **152.2** | **155.3** | 完整 CUDA graph capture |
@@ -846,17 +846,21 @@ CPU 默认 soak/回归应 `overall: PASS`。
 1. **`run_decode_burst` 必须 `@torch.inference_mode()`**
 2. **`SGLANG_LITE_FORCE_HF_CACHE=1`** + **`SGLANG_LITE_EXPERTS_IMPL=batched_mm`**  
    `grouped_mm` ~21；`batched_mm` ~47 且 bit-match generate。
-3. **`torch.compile(mode=default)`**（FORCE_HF+batched_mm 时 prefer；探针 `TORCH_COMPILE=1`）  
-   暖路径 ~81 tok/s。greedy 与 eager 在 ~11 tok 后可分叉（inductor 数值），文本仍连贯。  
-   `SGLANG_LITE_TORCH_COMPILE=0` 可强制关。多卡 device_map 分片跳过 compile。
-4. **StaticCache + CUDA graph**（`SGLANG_LITE_HF_STATIC_GRAPH=1`）  
-   lab ~77 但 pad slot attention 泄漏 → 默认关。KV 与 Dynamic 逐位一致。
-5. **`logits_to_keep=1`**。
+3. **`torch.compile(mode=default)`**（FORCE_HF+batched_mm prefer；探针 `TORCH_COMPILE=1`）  
+   暖路径 **~83–85 tok/s**。load 末 `_warmup_hf_compile_decode` 预热 decode 形，  
+   把 inductor 冷启动并进 load_s（~110s），1×128 cold 可达 ~80。  
+   greedy 与 eager 可在 ~11 tok 后分叉（fluent）；`TORCH_COMPILE=0` 关。
+4. **紧凑 HF greedy burst**（`_decode_burst_hf_greedy`）：无 ones-mask、直连  
+   `model()` + buffer；`DECODE_BURST` 默认 64（探针 128）。
+5. **StaticCache + CUDA graph** 仍默认关：即使 `create_causal_mask` 4D 全长 mask，  
+   仍在 ~14 tok 漂移；`reduce-overhead` 与 DynamicCache 仍 CUDAGraph 冲突。
+6. **`logits_to_keep=1`**。FI 有 `fused_moe`/`b12x_fused_moe`，**未接线**（下一刀）。
 
 脚本：`scripts/moe_thruput_probe.py`、`scripts/sglang_thru_docker.sh`。
 
-**下一刀（逼近 SGLang 全图）**：radix-native paged decode 图 / sgl-kernel fused MoE；
-或修复 StaticCache mask 以启用手写 CUDA graph（~77+ 且可图化）。
+**下一刀（逼近 SGLang ~155）**：HF 包装已近天花板（~85）；需  
+**FlashInfer fused MoE（sm120 b12x）换核** 或 **radix-native paged decode 图**，  
+不再依赖 HF DynamicCache + inductor。
 
 Registry：`engine/models.py` → `MINIMAX_MOE`。  
 Runner：`runner.py` 对 MLA / MiniMax / 非 2^n GQA 跳过标准 FI paged，走 HF `use_cache`。  
