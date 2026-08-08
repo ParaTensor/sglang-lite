@@ -123,21 +123,22 @@ def sparse_mla_decode_from_official_tensors(
 
 
 def _sparse_backend_preference() -> str:
-    """``auto`` | ``torch`` | ``fi`` | ``official``.
+    """``official`` | ``torch`` | ``fi`` | ``auto``.
 
-    Default **auto**: prefer torch sparse (no pack tax) on SM120; FI only when
-    ``SGLANG_LITE_V4_FORCE_FI_SPARSE=1``.
+    PRO6000 (2026-08-08): TileLang sparse is fastest end-to-end (~9.3 tok/s).
+    Torch gather is correct but slower (~8.1). FI SM120 works but pack tax
+    hurts e2e (~7.2). Default **official**; set env to experiment.
     """
     import os
 
-    raw = os.environ.get("SGLANG_LITE_V4_SPARSE", "auto").strip().lower()
+    raw = os.environ.get("SGLANG_LITE_V4_SPARSE", "official").strip().lower()
     if raw in ("torch", "fi", "flashinfer", "official", "tilelang", "auto"):
         if raw in ("flashinfer",):
             return "fi"
         if raw in ("tilelang",):
             return "official"
         return raw
-    return "auto"
+    return "official"
 
 
 def attach_v4_sparse_mla(backend: Any, *, window_size: int = 128) -> bool:

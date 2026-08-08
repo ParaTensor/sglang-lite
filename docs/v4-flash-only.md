@@ -127,8 +127,19 @@ engine/
 2. V4 decode burst + `ignore_eos` 全程 GPU token（无逐步 `.item()`）  
 3. thruput：`SGLANG_LITE_DECODE_BURST=128`、`SGLANG_LITE_V4_DUAL_APPEND=0`  
 
-**结论**：再涨吞吐必须换 **TileLang sparse 叶子核**（dsv4 / FI SM120 / deep_gemm 等）；Python 调度已非主因。  
-宿主：`deep_gemm` 可用；`sgl_kernel` 未加载；SGLang blackwell 镜像 sm_120 仍 blocked。
+**结论（PRO6000 换核实验 2026-08-08）**：
+
+| Decode sparse 后端 | 1×128 warm | 说明 |
+|--------------------|------------|------|
+| **TileLang official** | **~9.3** | 默认；单 op ~0.07ms |
+| Torch gather（自研） | ~8.1 | 数值 maxdiff≈0.002；**更慢** |
+| FI SM120（0.6.16） | ~7.2 | 数值可通，**pack 税**拖慢 e2e |
+
+`SGLANG_LITE_V4_SPARSE=official|torch|fi`。默认 **official**。  
+
+**时间占比（PRO6000，32 decode step profile）**：`sparse_attn` 仅占 wall **~2.5%**  
+（~95ms / ~3744ms）。再抠 sparse 最多 +3%；真正大头是 **MoE / 其它 GEMM**。  
+宿主：`deep_gemm` 有；`sgl_kernel` 未加载。
 
 ### Phase V2 — 焊核 + 满图
 
