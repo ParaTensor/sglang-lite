@@ -509,6 +509,13 @@ class ModelRunner:
             )
         except Exception as e:
             print(f"[sglang-lite] v4 sparse MLA hook skipped: {e}")
+        # MoE: activated-expert dispatch + fused FP4 act_quant (decode thruput).
+        try:
+            from .v4_moe_fast import attach_v4_moe_fast
+
+            attach_v4_moe_fast(self.model)
+        except Exception as e:
+            print(f"[sglang-lite] v4 MoE fast skipped: {e}")
         print(
             f"[sglang-lite] deepseek_v4 Hybrid rank={plan.rank}/{plan.world_size} "
             f"arch={kb.arch_family.value} sparse_mla={kb.sparse_mla_backend.value} "
