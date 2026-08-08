@@ -1,29 +1,35 @@
 {
-  "version": 1,
-  "description": "Committed HF golden-gate cases for MoE thruput paths (PegaInfer-style). Keep short: accuracy gate, not thruput.",
+  "version": 2,
+  "description": "Committed HF golden-gate cases for MoE paths (PegaInfer-style). Accuracy gate, not thruput.",
   "notes": [
     "Greedy only (temperature=0).",
     "ignore_eos=true keeps fixed max_new for token-length compare.",
-    "FORCE_HF path should aim all_token_text_exact; radix_native may first-diff (FI/fused numerical)."
+    "require_exact=true: --require-exact fails the gate if this case mismatches.",
+    "FORCE_HF must be all_token_text_exact for require_exact cases.",
+    "radix_native is report-only by default (FI/fused may first_diff).",
+    "dump-hf must load single-device + experts_implementation=batched_mm (match lite)."
   ],
   "cases": [
     {
       "id": "hello_16",
       "prompt": "Hello",
       "max_new": 16,
-      "ignore_eos": true
+      "ignore_eos": true,
+      "require_exact": true
     },
     {
       "id": "hello_32",
       "prompt": "Hello",
       "max_new": 32,
-      "ignore_eos": true
+      "ignore_eos": true,
+      "require_exact": true
     },
     {
       "id": "capital_16",
       "prompt": "The capital of France is",
       "max_new": 16,
-      "ignore_eos": true
+      "ignore_eos": true,
+      "require_exact": true
     }
   ]
 }

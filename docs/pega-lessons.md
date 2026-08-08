@@ -120,37 +120,36 @@ PRO6000 Qwen3-30B-A3B 1×128 warm（见 [deepseek-v4-flash-plan.md](./deepseek-v
 运行 golden gate：
 
 ```bash
-# 1) HF 真值（同机同权重）
+# 一键（FORCE_HF：默认 --require-exact）
+python scripts/hf_golden_gate.py gate \
+  --model ~/models/Qwen3-30B-A3B-Instruct \
+  --path force_hf --out-dir /tmp/golden
+
+# 分步
 python scripts/hf_golden_gate.py dump-hf \
   --model ~/models/Qwen3-30B-A3B-Instruct \
-  --cases test_data/hf_golden_cases.json \
   --out /tmp/golden/hf.json
-
-# 2) lite FORCE_HF 路径（期望 exact）
 python scripts/hf_golden_gate.py run-lite \
   --model ~/models/Qwen3-30B-A3B-Instruct \
-  --cases test_data/hf_golden_cases.json \
-  --path force_hf \
-  --out /tmp/golden/lite_hf.json
-
-# 3) 对比（FORCE_HF 建议 --require-exact）
+  --path force_hf --out /tmp/golden/lite_force_hf.json
 python scripts/hf_golden_gate.py compare \
-  --hf /tmp/golden/hf.json \
-  --lite /tmp/golden/lite_hf.json \
-  --out /tmp/golden/compare_hf.json \
-  --require-exact
+  --hf /tmp/golden/hf.json --lite /tmp/golden/lite_force_hf.json \
+  --out /tmp/golden/compare_force_hf.json --require-exact
 
-# 4) radix-native 栈（报告 first-diff，默认不强制 exact）
-SGLANG_LITE_RADIX_NATIVE=1 python scripts/hf_golden_gate.py run-lite \
+# radix-native：报告 first-diff，默认不 require-exact
+python scripts/hf_golden_gate.py gate \
   --model ~/models/Qwen3-30B-A3B-Instruct \
-  --cases test_data/hf_golden_cases.json \
-  --path radix_native \
-  --out /tmp/golden/lite_radix.json
-python scripts/hf_golden_gate.py compare \
-  --hf /tmp/golden/hf.json \
-  --lite /tmp/golden/lite_radix.json \
-  --out /tmp/golden/compare_radix.json
+  --path radix_native --out-dir /tmp/golden --no-require-exact
 ```
+
+**门禁纪律（2026-08-08 PRO6000 实测）**
+
+- Oracle：`dump-hf` 必须 **单卡** + `experts_implementation=batched_mm`，
+  **禁止** `device_map=auto`（多卡分片曾导致 hello_32 @18 假分叉；lite 与同权重
+  `model.generate` 始终 exact）。
+- **FORCE_HF**：`hello_16` / `hello_32` / `capital_16` → **all_token_text_exact** PASS。
+- **radix_native**（CG+fused+native，报告-only）：first_diff
+  `hello_16@3`、`hello_32@11`、`capital_16@1`；不作为发版 exact 门槛。
 
 ---
 

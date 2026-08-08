@@ -88,8 +88,9 @@ cache 对实际 prefill 计算的减少。
 
 见 **[pega-lessons.md](./pega-lessons.md)**：热路径与门禁标杆，**不**跟纯 Rust 重写 engine。
 
-- 脚本：`scripts/hf_golden_gate.py` + `test_data/hf_golden_cases.json`
-- FORCE_HF 路径目标 token-exact；radix_native 报告 first-diff
+- 脚本：`scripts/hf_golden_gate.py gate` + `test_data/hf_golden_cases.json`
+- FORCE_HF：`hello_16/32` + `capital_16` 目标 token-exact（oracle 单卡加载）
+- radix_native：报告 first-diff，默认不 `--require-exact`
 - 延后：Green Contexts、KV offload、per-model 拆引擎
 
 完整退出标准见
