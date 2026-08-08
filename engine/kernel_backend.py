@@ -622,18 +622,66 @@ class FlashInferBackend(KernelBackend):
 
     def attach_to_model(self, model: Any, num_qo_heads: int, head_dim: int, sm_scale: float) -> int:
         """Monkeypatch HF attention modules so forward uses FlashInfer paged KV."""
+        import os
+
+        fuse_qkv = os.environ.get("SGLANG_LITE_FUSE_QKV", "1").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         patched = 0
+        fused = 0
         for module in model.modules():
             if not self._is_attention_module(module):
                 continue
             if getattr(module, "_sglang_lite_paged", False):
                 continue
+            if fuse_qkv and self._try_fuse_qkv(module):
+                fused += 1
             module._sglang_lite_orig_forward = module.forward
             module.forward = self._make_attention_forward(module)
             module._sglang_lite_paged = True
             self._patched_modules.append(module)
             patched += 1
+        if fused:
+            print(
+                f"[sglang-lite] fused QKV weights for paged attention: {fused} modules"
+            )
         return patched
+
+    @staticmethod
+    def _try_fuse_qkv(attn_module: Any) -> bool:
+        """Pack Q/K/V into one matmul (3 GEMMs → 1) for the paged hook only."""
+        try:
+            wq = attn_module.q_proj.weight
+            wk = attn_module.k_proj.weight
+            wv = attn_module.v_proj.weight
+            if wq.dim() != 2 or wk.shape[1] != wq.shape[1] or wv.shape[1] != wq.shape[1]:
+                return False
+            fused_w = torch.cat([wq.data, wk.data, wv.data], dim=0).contiguous()
+            bq = getattr(attn_module.q_proj, "bias", None)
+            bk = getattr(attn_module.k_proj, "bias", None)
+            bv = getattr(attn_module.v_proj, "bias", None)
+            fused_b = None
+            if bq is not None or bk is not None or bv is not None:
+                parts = []
+                for b, w in ((bq, wq), (bk, wk), (bv, wv)):
+                    if b is None:
+                        parts.append(
+                            torch.zeros(w.shape[0], device=w.device, dtype=w.dtype)
+                        )
+                    else:
+                        parts.append(b.data)
+                fused_b = torch.cat(parts, dim=0).contiguous()
+            attn_module._sglang_lite_qkv_w = fused_w
+            attn_module._sglang_lite_qkv_b = fused_b
+            attn_module._sglang_lite_q_out = int(wq.shape[0])
+            attn_module._sglang_lite_k_out = int(wk.shape[0])
+            attn_module._sglang_lite_v_out = int(wv.shape[0])
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def _is_attention_module(module: Any) -> bool:
@@ -678,15 +726,33 @@ class FlashInferBackend(KernelBackend):
 
             # Match HF attention: Qwen3 applies RMSNorm on Q/K after projection
             # (q_norm / k_norm). Skipping them breaks greedy decode from token 1.
-            q = attn_module.q_proj(hidden_states).view(hidden_shape)
-            k = attn_module.k_proj(hidden_states).view(hidden_shape)
+            fused_w = getattr(attn_module, "_sglang_lite_qkv_w", None)
+            if fused_w is not None:
+                import torch.nn.functional as F
+
+                qkv = F.linear(
+                    hidden_states,
+                    fused_w,
+                    getattr(attn_module, "_sglang_lite_qkv_b", None),
+                )
+                q_out = int(attn_module._sglang_lite_q_out)
+                k_out = int(attn_module._sglang_lite_k_out)
+                v_out = int(attn_module._sglang_lite_v_out)
+                q, k, v = qkv.split((q_out, k_out, v_out), dim=-1)
+                q = q.view(hidden_shape)
+                k = k.view(hidden_shape)
+                v = v.view(hidden_shape)
+            else:
+                q = attn_module.q_proj(hidden_states).view(hidden_shape)
+                k = attn_module.k_proj(hidden_states).view(hidden_shape)
+                v = attn_module.v_proj(hidden_states).view(hidden_shape)
             if hasattr(attn_module, "q_norm") and attn_module.q_norm is not None:
                 q = attn_module.q_norm(q)
             if hasattr(attn_module, "k_norm") and attn_module.k_norm is not None:
                 k = attn_module.k_norm(k)
             query_states = q.transpose(1, 2)
             key_states = k.transpose(1, 2)
-            value_states = attn_module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            value_states = v.transpose(1, 2)
 
             if position_embeddings is None:
                 raise RuntimeError("paged attention requires position_embeddings")

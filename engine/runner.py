@@ -66,6 +66,7 @@ class ModelRunner:
         self._paged_decode_cg = PagedDecodeCudaGraph(device)
         self._hf_static_cg: Optional[HfStaticDecodeCudaGraph] = None
         self._paged_native = None  # lean decode body (no HF CausalLM.forward)
+        self._paged_burst_toks: Optional[torch.Tensor] = None  # GPU token ring for thruput
         self._experts_impl: Optional[str] = None
         # Must match model compute dtype; fp16 pages + bf16 activations promote to fp32 in SDPA.
         self.torch_dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
@@ -773,7 +774,14 @@ class ModelRunner:
     def _decode_burst_paged_greedy(
         self, seq: Sequence, radix: RadixCache, n_steps: int
     ) -> List[int]:
-        """Greedy paged decode burst (native/FI body + argmax, minimal host tax)."""
+        """Greedy paged decode burst — minimize host sync for thruput.
+
+        Hot path (``ignore_eos`` thruput probes):
+          * keep next-token on GPU (no per-step ``.item()``)
+          * feed next input via device write into static token buffer
+          * allocate / COW pages only on page boundaries
+          * single host sync of the token ring at the end
+        """
         out: List[int] = []
         eos = self.eos_token_id
         ignore_eos = bool(getattr(seq, "ignore_eos", False))
@@ -789,29 +797,68 @@ class ModelRunner:
             ):
                 return out
 
+        n_steps = max(0, int(n_steps))
+        if n_steps == 0:
+            return out
+
         tok_buf = self._decode_input_buf
-        for _ in range(max(0, n_steps)):
-            last = seq.output_ids[-1] if seq.output_ids else seq.input_ids[-1]
+        # Seed input buffer once from host (last emitted / prompt tail).
+        last = seq.output_ids[-1] if seq.output_ids else seq.input_ids[-1]
+        tok_buf.set_token(int(last))
+
+        # GPU ring for completion tokens (one D2H at end when ignore_eos).
+        if (
+            self._paged_burst_toks is None
+            or self._paged_burst_toks.device.type != torch.device(self.device).type
+            or self._paged_burst_toks.numel() < n_steps
+        ):
+            self._paged_burst_toks = torch.zeros(
+                max(n_steps, 128), dtype=torch.long, device=self.device
+            )
+        assert self._paged_burst_toks is not None
+        page_size = int(radix.block_size)
+        produced = 0
+
+        for i in range(n_steps):
             pos = seq.cached_len
-            self._ensure_blocks(seq, radix, pos + 1)
-            if seq.block_table:
-                page_i = pos // radix.block_size
+            # Page alloc + COW only when entering a new page slot.
+            if (pos % page_size) == 0 or not seq.block_table:
+                self._ensure_blocks(seq, radix, pos + 1)
+                page_i = pos // page_size
                 if page_i < len(seq.block_table):
                     seq.block_table[page_i] = radix.cow_block_if_shared(
                         seq.block_table[page_i]
                     )
-            input_ids = tok_buf.set_token(int(last))
+            # Static [1,1] buffers — no per-step host tensor alloc.
+            input_ids = tok_buf.token_buf
+            tok_buf.set_position(pos)
             outputs = self._model_forward_paged(
                 input_ids, [seq], radix, is_decode=True
             )
             seq.kv_state = None
             seq.cached_len = pos + 1
-            tok = int(outputs.logits[0, -1].argmax().item())
-            out.append(tok)
-            seq.output_ids.append(tok)
-            seq.decode_tokens = getattr(seq, "decode_tokens", 0) + 1
-            if not ignore_eos and eos is not None and tok == int(eos):
-                break
+            # On-device greedy. Native body may already have written next token into
+            # the static input buffer; re-argmax is cheap and keeps paths consistent.
+            nxt = outputs.logits[0, -1].argmax()
+            self._paged_burst_toks[i] = nxt
+            tok_buf.set_token_tensor(nxt)
+            produced += 1
+
+            if not ignore_eos:
+                # Need host value for EOS / streaming clients.
+                tok = int(nxt.item())
+                out.append(tok)
+                seq.output_ids.append(tok)
+                seq.decode_tokens = getattr(seq, "decode_tokens", 0) + 1
+                if eos is not None and tok == int(eos):
+                    return out
+
+        if ignore_eos and produced > 0:
+            # One D2H for the whole burst (probe thruput path).
+            host = self._paged_burst_toks[:produced].tolist()
+            out.extend(host)
+            seq.output_ids.extend(host)
+            seq.decode_tokens = getattr(seq, "decode_tokens", 0) + produced
         return out
 
     @torch.inference_mode()
@@ -1569,9 +1616,15 @@ class ModelRunner:
             )
         n_heads = int(self.model.config.num_attention_heads)
         sm_scale = float(self.head_dim**-0.5)
+        # Decode thruput: pass block_table refs (no per-step list copy of page ids).
+        # Prefill still snapshots to avoid concurrent mutation surprises.
+        if is_decode and B == 1:
+            btables = [seqs[0].block_table]
+        else:
+            btables = [list(s.block_table) for s in seqs]
         ctx = PagedAttnContext(
             radix=radix,
-            block_tables=[list(s.block_table) for s in seqs],
+            block_tables=btables,
             cached_lens=cached_lens,
             q_lens=q_lens,
             is_decode=is_decode,
@@ -1588,10 +1641,23 @@ class ModelRunner:
             and self._paged_native is not None
         )
 
+        # When True, decode body writes next greedy token into the static
+        # input buffer (device-side) so the next step needs no host token int.
+        write_next = bool(
+            use_native
+            and is_decode
+            and B == 1
+            and q_len == 1
+            and getattr(self, "_paged_write_next_token", True)
+        )
+
         def _body():
             if use_native:
-                # Tensor logits — wrap after capture/replay for .logits API.
-                return self._paged_native.forward_logits(input_ids, position_ids)
+                logits = self._paged_native.forward_logits(input_ids, position_ids)
+                if write_next:
+                    # Graph-friendly: next input token stays on device.
+                    input_ids[0, 0] = logits[0, -1].argmax()
+                return logits
             return self.model(
                 input_ids=input_ids,
                 position_ids=position_ids,

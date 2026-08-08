@@ -103,15 +103,40 @@ class DecodeInputBuffer:
         self._buf: Optional[torch.Tensor] = None
         self._pos: Optional[torch.Tensor] = None
 
+    def _ensure(self) -> None:
+        dev = torch.device(self.device)
+        if self._buf is None or self._buf.device != dev:
+            self._buf = torch.zeros((1, 1), dtype=torch.long, device=dev)
+            self._pos = torch.zeros((1, 1), dtype=torch.long, device=dev)
+
+    @property
+    def token_buf(self) -> torch.Tensor:
+        self._ensure()
+        assert self._buf is not None
+        return self._buf
+
+    @property
+    def pos_buf(self) -> torch.Tensor:
+        self._ensure()
+        assert self._pos is not None
+        return self._pos
+
     def set_token(self, token_id: int) -> torch.Tensor:
-        if self._buf is None or self._buf.device.type != torch.device(self.device).type:
-            self._buf = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        self._ensure()
+        assert self._buf is not None
         self._buf[0, 0] = int(token_id)
         return self._buf
 
+    def set_token_tensor(self, token: torch.Tensor) -> torch.Tensor:
+        """Device-side write (no host int) for burst thruput paths."""
+        self._ensure()
+        assert self._buf is not None
+        self._buf[0, 0] = token.reshape(())
+        return self._buf
+
     def set_position(self, pos: int) -> torch.Tensor:
-        if self._pos is None or self._pos.device.type != torch.device(self.device).type:
-            self._pos = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        self._ensure()
+        assert self._pos is not None
         self._pos[0, 0] = int(pos)
         return self._pos
 

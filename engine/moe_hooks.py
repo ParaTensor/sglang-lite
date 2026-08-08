@@ -82,10 +82,18 @@ class CutlassExpertsFn(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
+        # Avoid redundant copies when tensors already match kernel dtype/layout.
+        h = hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
+        idx = top_k_index
+        if idx.dtype != torch.int32 or not idx.is_contiguous():
+            idx = idx.to(dtype=torch.int32).contiguous()
+        scales = top_k_weights
+        if scales.dtype != torch.float32 or not scales.is_contiguous():
+            scales = scales.to(dtype=torch.float32).contiguous()
         out = self._fm.cutlass_fused_moe(
-            hidden_states.contiguous(),
-            top_k_index.to(dtype=torch.int32).contiguous(),
-            top_k_weights.to(dtype=torch.float32).contiguous(),
+            h,
+            idx,
+            scales,
             self.fc1,
             self.fc2,
             hidden_states.dtype,

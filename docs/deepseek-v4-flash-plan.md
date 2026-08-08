@@ -883,9 +883,24 @@ FORCE_HF+compile 仍 ~84（≈1.87×）。相对首测 **+388%**（20.7→101）
      `FUSED_MOE=1`、`NATIVE_DECODE=1`。产品 thruput 默认仍可 FORCE_HF+compile。  
    - `SGLANG_LITE_PAGED_MAX_PAGES=256`（page_size=16 → 4k tok）。
 
-**下一刀（逼近 SGLang ~155）**：radix 栈 **~101**（SGLang / lite ≈ 1.53×）。
-余量主要在 **更深的 kernel 融合 / 量化执行**（非再剥 HF Python）。可选：
-sgl-kernel MoE、FP8 权重路径、或更短的 attn+MLP capture 体；避免扩协议面。
+**性能天花板（2026-08-08 续）**
+
+| 栈 | warm tok/s | 备注 |
+|----|------------|------|
+| radix native+CG+fused+QKV fuse | **~102–103** | plan ~0.11ms / body ~9.5ms |
+| body-only 理论 | ~106 | plan 占比 <2% |
+| SGLang 0.5.16 | **~155** | body 约需 ~6.5ms/tok |
+| FORCE_HF+compile | ~84 | 默认 thruput |
+
+结论：**宿主税已基本吃干**（burst 无 per-step `.item()`、page-boundary COW、
+fused QKV、FI plan 可忽略）。与 SGLang 的 **~1.5×** 差在 **GPU body**
+（MoE GEMM + attn + lm_head），不是再抠 Python。要超过 SGLang 需要：
+
+1. **更强 MoE leaf**（sgl-kernel / TRT-LLM bf16 MoE / FP8 权重）  
+2. 或 **更短 capture 体**（手写 fused residual+norm+proj）  
+3. 多请求饱和吞吐（另一套指标，不是单流 B=1 TPOT）
+
+当前 B=1 单流：**~103 vs SGLang ~155，尚未超过**。
 
 Registry：`engine/models.py` → `MINIMAX_MOE`。  
 Runner：`runner.py` 对 MLA / MiniMax / 非 2^n GQA 跳过标准 FI paged，走 HF `use_cache`。  
