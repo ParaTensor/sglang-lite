@@ -948,7 +948,8 @@ class ModelRunner:
             outputs = self._model_forward_paged(input_ids, seqs, radix, is_decode=False)
             for b, (seq, i) in enumerate(zip(seqs, idxs)):
                 nlen = new_lens[b]
-                logits = outputs.logits[b, nlen - 1, :]
+                # logits_to_keep=1 → time dim is 1; always take last.
+                logits = outputs.logits[b, -1, :]
                 start = seq.cached_len
                 seq.last_logits = logits.detach().float().cpu().clone()
                 seq.kv_state = None
@@ -960,10 +961,17 @@ class ModelRunner:
         pasts = [self._past_for_seq(s, radix) for s in seqs]
         batched_past = self._batch_caches(pasts) if past_lens[0] > 0 else None
         attn = torch.ones((B, max_past + max_new), dtype=torch.long, device=self.device)
-        outputs = self._model_forward(input_ids, batched_past, attn)
+        # Explicit position_ids for multi-token prefill (HF may omit when past=None).
+        position_ids = torch.arange(
+            max_past, max_past + max_new, device=self.device, dtype=torch.long
+        ).unsqueeze(0).expand(B, -1)
+        outputs = self._model_forward(
+            input_ids, batched_past, attn, position_ids=position_ids
+        )
         for b, (seq, i) in enumerate(zip(seqs, idxs)):
             nlen = new_lens[b]
-            logits = outputs.logits[b, nlen - 1, :]
+            # logits_to_keep=1 → time dim is 1; always take last.
+            logits = outputs.logits[b, -1, :]
             full_kv = self._split_batch_cache(outputs.past_key_values, b, B)
             start = seq.cached_len
             if self.use_paged_as_source:
