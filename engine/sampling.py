@@ -20,11 +20,35 @@ def sample_logits(
 
     temperature <= 0 or ~0 → greedy (argmax).
     """
+    return int(
+        sample_logits_tensor(
+            logits,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            generator=generator,
+        ).item()
+    )
+
+
+def sample_logits_tensor(
+    logits: torch.Tensor,
+    *,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: Optional[int] = None,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Like ``sample_logits`` but returns a 0-dim (or 1-element) CUDA/CPU tensor.
+
+    Keeps greedy argmax on-device so thruput decode can write into a token
+    buffer without an immediate host sync.
+    """
     if logits.dim() > 1:
         logits = logits.view(-1)
 
     if temperature is None or temperature <= 1e-5:
-        return int(torch.argmax(logits).item())
+        return torch.argmax(logits)
 
     logits = logits / temperature
 
@@ -51,7 +75,7 @@ def sample_logits(
         idx = torch.multinomial(probs, num_samples=1, generator=generator)
     else:
         idx = torch.multinomial(probs, num_samples=1)
-    return int(idx.item())
+    return idx.view(())
 
 
 def make_generator(device: str, seed: Optional[int]) -> Optional[torch.Generator]:

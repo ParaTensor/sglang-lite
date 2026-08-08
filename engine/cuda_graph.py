@@ -47,14 +47,22 @@ def maybe_compile_model(
     device: str,
     *,
     paged_hooks: bool = False,
+    prefer_compile: bool = False,
 ) -> Any:
     """Wrap model with torch.compile when requested and CUDA is available.
 
     FlashInfer paged hooks are **not** CUDA-graph safe under
     ``mode=reduce-overhead`` (overwritten workspace tensors). When paged hooks
     are attached we either skip compile or use plain ``default`` mode.
+
+    ``prefer_compile``: treat as enabled when env is unset (used for HF
+    ``batched_mm`` thruput path — ~80 tok/s vs ~47 eager on Qwen3-MoE PRO6000).
+    Explicit ``SGLANG_LITE_TORCH_COMPILE=0`` still disables.
     """
-    if not compile_enabled():
+    env = os.environ.get("SGLANG_LITE_TORCH_COMPILE", "").lower()
+    if env in ("0", "false", "no", "off"):
+        return model
+    if env not in ("1", "true", "yes") and not prefer_compile:
         return model
     if not str(device).startswith("cuda"):
         print("[sglang-lite] torch.compile skipped (device is not cuda)")
@@ -64,7 +72,7 @@ def maybe_compile_model(
         return model
     # FI + reduce-overhead CUDAGraphs overwrite internal buffers → hard fail.
     # DynamicCache + reduce-overhead also fails (cudagraph tree overwrite on RoPE).
-    # Default to mode=default for HF-cache path (~1.5–2× decode on Qwen3-MoE).
+    # Default to mode=default for HF-cache path.
     if paged_hooks:
         mode = os.environ.get("SGLANG_LITE_TORCH_COMPILE_MODE", "skip")
         if mode in ("", "skip", "none", "0"):

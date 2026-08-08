@@ -274,16 +274,32 @@ class ModelRunner:
             )
             print(f"[sglang-lite] Paged attention hooks attached: {n} modules")
 
-        # Phase-A: optional torch.compile (CUDA graphs under the hood when shapes allow).
-        # Skip for device_map multi-GPU shards — compile + accelerate is fragile.
-        on_meta_or_sharded = bool(getattr(self.model, "hf_device_map", None))
+        # Phase-A: optional torch.compile. Prefer on for HF batched_mm thruput
+        # (~80 tok/s vs ~47 eager on Qwen3-MoE). Skip true multi-GPU shards only.
+        dmap = getattr(self.model, "hf_device_map", None)
+        multi_gpu_shard = False
+        if isinstance(dmap, dict) and dmap:
+            devices = {str(v) for v in dmap.values()}
+            multi_gpu_shard = len(devices) > 1
         paged_hooks = bool(
             self.use_paged_as_source
             and getattr(self.kernel_backend, "supports_paged_attention", False)
         )
-        if not on_meta_or_sharded:
+        prefer_compile = (
+            not self.use_paged_as_source
+            and self._experts_impl == "batched_mm"
+            and str(self.device).startswith("cuda")
+        )
+        if not multi_gpu_shard:
             self.model = maybe_compile_model(
-                self.model, self.device, paged_hooks=paged_hooks
+                self.model,
+                self.device,
+                paged_hooks=paged_hooks,
+                prefer_compile=prefer_compile,
+            )
+        elif prefer_compile:
+            print(
+                "[sglang-lite] torch.compile skipped (multi-GPU device_map shard)"
             )
         self._decode_input_buf = DecodeInputBuffer(self.device)
         # Growable ones-mask for HF path (avoid per-step host alloc of new tensors).

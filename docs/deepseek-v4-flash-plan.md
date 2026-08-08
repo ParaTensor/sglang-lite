@@ -832,32 +832,31 @@ CPU 默认 soak/回归应 `overall: PASS`。
 | sglang-lite FI 静态 metadata | 15.2 | 22.8 | 22.7 | 每层免 `torch.tensor` 分配 |
 | sglang-lite HF + inference_mode burst | ~14 | 21.6 | 21.9 | 修 burst 缺 `@torch.inference_mode` |
 | sglang-lite HF + torch.compile(default) | ~14 | 38.7 | 38.8 | inductor；冷启动 ~150s |
-| sglang-lite **HF + experts=batched_mm** | ~14 | **~46** | **~46** | 对齐 `model.generate`；DynamicCache |
-| HF `model.generate` 同权重 | — | ~45 | ~45 | 上限参考 |
-| lab: batched_mm + StaticCache CUDA graph | — | — | **~77** | **数值漂移**（token≥4–14），默认关 |
+| sglang-lite HF + experts=batched_mm eager | ~14 | **~46.6** | **~47.1** | bit-match `model.generate` |
+| sglang-lite **batched_mm + torch.compile(default)** | 16.3 | **84.7** | **83.2** | `thru_qwen3_30b_compile_bmm.json`；越过 generate |
+| HF `model.generate` 同权重 | — | ~45–46 | ~45–46 | eager 上限 |
+| lab: StaticCache CUDA graph | — | — | ~77 | KV 一致但 attn 在 ~14 tok 漂移；默认关 |
 | **SGLang 0.5.16 Docker** | 65.1 | **152.2** | **155.3** | 完整 CUDA graph capture |
 
-比值（当前最优正确 warm）：**SGLang / lite ≈ 3.4×**（155/46）。  
-相对首测 **+122%**（20.7→46）。已触及 HF.generate 天花板。
+比值（当前最优 warm）：**SGLang / lite ≈ 1.87×**（155/83.2）。  
+相对首测 **+302%**（20.7→83.2）。已越过 HF.generate 与 0.5× SGLang 门槛（~77.5）。
 
 **根因与开关（2026-08-07 → 08-08）**
 
-1. **`run_decode_burst` 必须 `@torch.inference_mode()`**  
-   无 mode 时 DynamicCache 每步建 autograd 图 → pure decode ~7 tok/s。
-2. **`SGLANG_LITE_FORCE_HF_CACHE=1`**（探针默认）  
-   单流 FI paged plan/append 税高于 HF SDPA。
-3. **`SGLANG_LITE_EXPERTS_IMPL=batched_mm`**（探针默认；FORCE_HF 时 runner 默认）  
-   TF 默认 `grouped_mm` ~21 tok/s；`batched_mm` ~46 且与 generate token 一致。  
-   `grouped_mm` 在 CUDA graph capture 中触发 CPU↔CUDA copy。
-4. **StaticCache + CUDA graph（实验）**  
-   `SGLANG_LITE_HF_STATIC_GRAPH=1`：`HfStaticDecodeCudaGraph` 可达 ~77 tok/s，  
-   但 Qwen3-MoE 上 StaticCache vs DynamicCache 在 ~14 tok 后漂移 → **默认关**。
-5. **`logits_to_keep=1`**；可选 `SGLANG_LITE_TORCH_COMPILE=1`（mode=default）。
+1. **`run_decode_burst` 必须 `@torch.inference_mode()`**
+2. **`SGLANG_LITE_FORCE_HF_CACHE=1`** + **`SGLANG_LITE_EXPERTS_IMPL=batched_mm`**  
+   `grouped_mm` ~21；`batched_mm` ~47 且 bit-match generate。
+3. **`torch.compile(mode=default)`**（FORCE_HF+batched_mm 时 prefer；探针 `TORCH_COMPILE=1`）  
+   暖路径 ~81 tok/s。greedy 与 eager 在 ~11 tok 后可分叉（inductor 数值），文本仍连贯。  
+   `SGLANG_LITE_TORCH_COMPILE=0` 可强制关。多卡 device_map 分片跳过 compile。
+4. **StaticCache + CUDA graph**（`SGLANG_LITE_HF_STATIC_GRAPH=1`）  
+   lab ~77 但 pad slot attention 泄漏 → 默认关。KV 与 Dynamic 逐位一致。
+5. **`logits_to_keep=1`**。
 
 脚本：`scripts/moe_thruput_probe.py`、`scripts/sglang_thru_docker.sh`。
 
-**下一刀（越过 generate、逼近 0.5× SGLang ≈ 75+）**：修复 StaticCache 数值或换
-radix-native paged decode 图（非 HF cache）；或 sgl-kernel / fused MoE 换核。
+**下一刀（逼近 SGLang 全图）**：radix-native paged decode 图 / sgl-kernel fused MoE；
+或修复 StaticCache mask 以启用手写 CUDA graph（~77+ 且可图化）。
 
 Registry：`engine/models.py` → `MINIMAX_MOE`。  
 Runner：`runner.py` 对 MLA / MiniMax / 非 2^n GQA 跳过标准 FI paged，走 HF `use_cache`。  
