@@ -147,11 +147,11 @@ CUDA_VISIBLE_DEVICES=0 python scripts/moe_thruput_probe.py \
   --cases 1x64,1x128 --out ~/bench/thru_qwen3_30b_a3b.json
 # bit-exact eager（~47 tok/s）：SGLANG_LITE_TORCH_COMPILE=0 ...
 # 实验 cutlass fused MoE（e2e ~44，默认关）：SGLANG_LITE_FUSED_MOE=1 SGLANG_LITE_TORCH_COMPILE=0 ...
-# Radix-native（PRO6000 Qwen3-30B ~102–103 tok/s warm；body~9.5ms，距 SGLang~155 仍~1.5×）：
+# Radix-native（PRO6000 Qwen3-30B ~103 tok/s warm；距 SGLang~155 仍~1.5×）：
 #   SGLANG_LITE_RADIX_NATIVE=1 python scripts/moe_thruput_probe.py ...
-#   探针默认：CUDA_GRAPH=1 + FUSED_MOE=1 + NATIVE_DECODE=1 + FUSE_QKV=1
-#   SGLANG_LITE_PAGED_MAX_PAGES=256
-#   宿主侧：burst 无 per-step .item()；page-boundary COW；FI plan << body
+#   默认：CUDA_GRAPH=1 + FUSED_MOE=1 + NATIVE_DECODE=1 + FUSE_QKV=1
+#   MoE 后端：SGLANG_LITE_MOE_BACKEND=cutlass|trtllm|sgl|auto（PRO6000 仅 cutlass 可用）
+#   叶核探测：python scripts/moe_kernel_probe.py --e2e --model ~/models/Qwen3-30B-A3B-Instruct
 #
 # HF golden gate（见 docs/pega-lessons.md）：
 #   # FORCE_HF exact（默认 require-exact；dump 单卡+batched_mm）

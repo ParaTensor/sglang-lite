@@ -887,20 +887,26 @@ FORCE_HF+compile 仍 ~84（≈1.87×）。相对首测 **+388%**（20.7→101）
 
 | 栈 | warm tok/s | 备注 |
 |----|------------|------|
-| radix native+CG+fused+QKV fuse | **~102–103** | plan ~0.11ms / body ~9.5ms |
+| radix native+CG+**cutlass** MoE+QKV | **~103** | plan ~0.11ms / body ~9.5ms |
 | body-only 理论 | ~106 | plan 占比 <2% |
+| MoE leaf only (cutlass micro) | 0.057ms×48≈2.7ms | MoE 不是唯一大头 |
 | SGLang 0.5.16 | **~155** | body 约需 ~6.5ms/tok |
 | FORCE_HF+compile | ~84 | 默认 thruput |
 
-结论：**宿主税已基本吃干**（burst 无 per-step `.item()`、page-boundary COW、
-fused QKV、FI plan 可忽略）。与 SGLang 的 **~1.5×** 差在 **GPU body**
-（MoE GEMM + attn + lm_head），不是再抠 Python。要超过 SGLang 需要：
+**换 MoE 核实测（PRO6000，`scripts/moe_kernel_probe.py`）**
 
-1. **更强 MoE leaf**（sgl-kernel / TRT-LLM bf16 MoE / FP8 权重）  
-2. 或 **更短 capture 体**（手写 fused residual+norm+proj）  
-3. 多请求饱和吞吐（另一套指标，不是单流 B=1 TPOT）
+| Backend | 状态 | e2e warm |
+|---------|------|----------|
+| **cutlass** (FI) | OK | **~103** |
+| **trtllm** bf16 | soft API 可见；**GEMM fail**（sm100f cubin on SM120） | fallback cutlass ~103 |
+| **sgl-kernel** 0.3.21 | **import fail**（torch 2.11 ABI / 无 SM120 .so） | 无 fused → ~79 |
 
-当前 B=1 单流：**~103 vs SGLang ~155，尚未超过**。
+`SGLANG_LITE_MOE_BACKEND=auto|cutlass|trtllm|sgl`（auto=cutlass first）。
+
+结论：宿主税已吃干；**本机可工作的 BF16 MoE 叶仍是 cutlass**。TRT-LLM /
+sgl-kernel 在 PRO6000+torch2.11 上**尚未可用**，不是再剥 Python 能过 155。
+要超过 SGLang 需要：SM120 可用的 sgl-kernel 构建、或 FP8/量化路径、或更短
+全层 fused capture。
 
 Registry：`engine/models.py` → `MINIMAX_MOE`。  
 Runner：`runner.py` 对 MLA / MiniMax / 非 2^n GQA 跳过标准 FI paged，走 HF `use_cache`。  
