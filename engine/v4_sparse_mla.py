@@ -122,13 +122,31 @@ def sparse_mla_decode_from_official_tensors(
     return out
 
 
+def _sparse_backend_preference() -> str:
+    """``auto`` | ``torch`` | ``fi`` | ``official``.
+
+    Default **auto**: prefer torch sparse (no pack tax) on SM120; FI only when
+    ``SGLANG_LITE_V4_FORCE_FI_SPARSE=1``.
+    """
+    import os
+
+    raw = os.environ.get("SGLANG_LITE_V4_SPARSE", "auto").strip().lower()
+    if raw in ("torch", "fi", "flashinfer", "official", "tilelang", "auto"):
+        if raw in ("flashinfer",):
+            return "fi"
+        if raw in ("tilelang",):
+            return "official"
+        return raw
+    return "auto"
+
+
 def attach_v4_sparse_mla(backend: Any, *, window_size: int = 128) -> bool:
     """Monkey-patch official ``model.sparse_attn`` / ``kernel.sparse_attn``.
 
-    Returns True if the FlashInfer SM120 path is armed (may still fall back
-    per-call). Returns False if capability is official-only (no patch needed
-    beyond documenting fallback).
+    Returns True if a non-official decode path is armed (torch or FlashInfer).
     """
+    import os
+
     try:
         import kernel as kernel_mod  # type: ignore
         import model as model_mod  # type: ignore
@@ -143,17 +161,45 @@ def attach_v4_sparse_mla(backend: Any, *, window_size: int = 128) -> bool:
         logger.warning("attach_v4_sparse_mla: sparse_attn symbol missing")
         return False
 
+    backend._official_sparse_attn = orig
+    pref = _sparse_backend_preference()
+    force_fi = os.environ.get("SGLANG_LITE_V4_FORCE_FI_SPARSE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     smla = getattr(backend, "sparse_mla_backend", None)
-    use_fi = smla in (
+    fi_capable = smla in (
         SparseMlaBackend.FLASHINFER_SPARSE_SM120,
         SparseMlaBackend.FLASHINFER_SPARSE_SM100,
     )
+
+    # --- Torch path (default on auto; no DSV4 pack) ---
+    use_torch = pref == "torch" or (
+        pref == "auto" and not force_fi and pref != "official"
+    )
+    if pref == "official":
+        use_torch = False
+    if pref == "fi" or force_fi:
+        use_torch = False
+
+    if use_torch:
+        from .v4_sparse_torch import attach_torch_sparse_attn
+
+        routed = attach_torch_sparse_attn(window_size=window_size, orig=orig)
+        kernel_mod.sparse_attn = routed
+        model_mod.sparse_attn = routed
+        backend._v4_sparse_attn_routed = routed
+        logger.info("v4 sparse MLA: torch gather path armed (decode); prefill=official")
+        print("[sglang-lite] v4 sparse: TORCH path (no FI pack)")
+        return True
+
+    use_fi = (pref == "fi" or force_fi) and fi_capable
     if not use_fi:
-        # Keep official path; wire OFFICIAL_SPARSE_ATTN through backend for tests.
-        backend._official_sparse_attn = orig
         logger.info(
-            "v4 sparse MLA: using official sparse_attn (%s)",
+            "v4 sparse MLA: using official sparse_attn (%s pref=%s)",
             getattr(smla, "value", smla),
+            pref,
         )
         return False
 
@@ -199,10 +245,12 @@ def attach_v4_sparse_mla(backend: Any, *, window_size: int = 128) -> bool:
     routed._sglang_lite_stats = stats  # type: ignore[attr-defined]
     kernel_mod.sparse_attn = routed
     model_mod.sparse_attn = routed
-    backend._official_sparse_attn = orig
     backend._v4_sparse_attn_routed = routed
     logger.info(
         "v4 sparse MLA: FlashInfer path armed (%s) for decode; prefill=official",
         getattr(smla, "value", smla),
+    )
+    print(
+        f"[sglang-lite] v4 sparse: FI path armed ({getattr(smla, 'value', smla)})"
     )
     return True

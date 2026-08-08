@@ -461,11 +461,15 @@ class ModelRunner:
             torch.cuda.manual_seed_all(33377335)
         # Refresh capabilities after Hybrid import path may have put FI≥0.6.16
         # on sys.path (SGLANG_LITE_FI_PREFIX). Then arm sparse MLA hook.
+        # Official-only when DISABLE_FI and no torch preference.
+        # Default product path: SGLANG_LITE_V4_SPARSE=auto → torch sparse (faster
+        # than FI pack on PRO6000). TileLang when SGLANG_LITE_V4_SPARSE=official.
         disable_fi = os.environ.get("SGLANG_LITE_V4_DISABLE_FI_SPARSE", "").lower() in (
             "1",
             "true",
             "yes",
         )
+        sparse_pref = os.environ.get("SGLANG_LITE_V4_SPARSE", "auto").strip().lower()
         try:
             from .capability import probe_kernel_capabilities
             from .kernel_backend import FlashInferBackend
@@ -481,17 +485,27 @@ class ModelRunner:
                     SparseMlaBackend.FLASHINFER_SPARSE_SM100,
                 )
             win = int(cfg.get("window_size", 128))
-            if disable_fi:
+            # Torch path ignores DISABLE_FI (that flag only blocks FI leaf).
+            force_official = sparse_pref in ("official", "tilelang")
+            if force_official:
                 print(
-                    "[sglang-lite] v4 sparse MLA hook disabled "
-                    "(SGLANG_LITE_V4_DISABLE_FI_SPARSE); official sparse_attn only"
+                    "[sglang-lite] v4 sparse: official TileLang "
+                    f"(SGLANG_LITE_V4_SPARSE={sparse_pref})"
                 )
                 armed = False
             else:
-                armed = attach_v4_sparse_mla(kb, window_size=win)
+                # Even with DISABLE_FI=1, auto/torch still arm torch sparse.
+                if disable_fi and sparse_pref in ("fi", "flashinfer"):
+                    print(
+                        "[sglang-lite] v4 FI sparse disabled "
+                        "(SGLANG_LITE_V4_DISABLE_FI_SPARSE=1)"
+                    )
+                    armed = False
+                else:
+                    armed = attach_v4_sparse_mla(kb, window_size=win)
             print(
                 f"[sglang-lite] v4 sparse MLA hook armed={armed} "
-                f"backend={kb.sparse_mla_backend.value}"
+                f"backend={kb.sparse_mla_backend.value} pref={sparse_pref}"
             )
         except Exception as e:
             print(f"[sglang-lite] v4 sparse MLA hook skipped: {e}")

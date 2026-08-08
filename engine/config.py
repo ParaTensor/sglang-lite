@@ -45,8 +45,10 @@ class Config:
                 "port": 9001,
                 "log_level": "INFO",
             }
-            # Official main path unless operator explicitly set FI envs.
+            # Sparse decode: torch gather by default (see SGLANG_LITE_V4_SPARSE).
+            # DISABLE_FI only blocks FlashInfer leaf, not torch.
             os.environ.setdefault("SGLANG_LITE_V4_DISABLE_FI_SPARSE", "1")
+            os.environ.setdefault("SGLANG_LITE_V4_SPARSE", "auto")
             os.environ.setdefault("SGLANG_LITE_LOG_JSON", "1")
             # Product default: DeepSeek-V4-Flash only (docs/v4-flash-only.md).
             os.environ.setdefault("SGLANG_LITE_V4_ONLY", "1")

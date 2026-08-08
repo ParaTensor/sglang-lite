@@ -9,7 +9,8 @@ export SGLANG_LITE_PRESET="${SGLANG_LITE_PRESET:-lite}"
 # Product: DeepSeek-V4-Flash only (docs/v4-flash-only.md)
 export SGLANG_LITE_V4_ONLY="${SGLANG_LITE_V4_ONLY:-1}"
 
-# Official main path — never default FI
+# Sparse decode: auto → torch gather (fast on PRO6000). FI only if FORCE + FI_PREFIX.
+export SGLANG_LITE_V4_SPARSE="${SGLANG_LITE_V4_SPARSE:-auto}"
 export SGLANG_LITE_V4_DISABLE_FI_SPARSE="${SGLANG_LITE_V4_DISABLE_FI_SPARSE:-1}"
 export SGLANG_LITE_FI_PREFIX="${SGLANG_LITE_FI_PREFIX:-}"
 unset SGLANG_LITE_V4_FORCE_FI_SPARSE 2>/dev/null || true
