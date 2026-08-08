@@ -142,11 +142,19 @@ class V4DecodeAccelerator:
         token_ids: torch.Tensor,
         start_pos: int,
     ) -> torch.Tensor:
-        """Decode step logits; uses graph when ``(B, start_pos)`` was captured."""
+        """Forward logits; static ``[B,1]`` buffer / CUDA graph only for decode.
+
+        Prefill (``seq_len > 1``) always goes eager so we never reshape a prompt
+        of length N into ``[B, 1]`` (PRO6000 regression: size 5 → view 1,1).
+        """
         if token_ids.dim() == 1:
             token_ids = token_ids.view(1, -1)
-        bsz = int(token_ids.shape[0])
         token_ids = token_ids.to(self.device, non_blocking=True)
+        bsz = int(token_ids.shape[0])
+        seqlen = int(token_ids.shape[1])
+        # Prefill / multi-token chunk: no static single-token buffer.
+        if seqlen != 1:
+            return extract_logits(self.model(token_ids, start_pos=int(start_pos)))
         key = (bsz, int(start_pos))
         g = self._graphs.get(key)
         if g is not None:
