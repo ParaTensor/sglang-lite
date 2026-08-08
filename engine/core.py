@@ -110,6 +110,8 @@ class LiteEngine:
             top_k=top_k,
             seed=seed,
             stop=stop,
+            ignore_eos=bool(getattr(self, "_gen_ignore_eos", False)),
+            skip_streaming_text=bool(getattr(self, "_gen_skip_streaming_text", False)),
         )
         return self._collect_generate(request_id, input_ids, params)
 

@@ -51,6 +51,17 @@ def test_minimax_family_registered():
     assert fam3.name == "minimax_moe"
 
 
+def test_qwen3_a3b_name_and_local_config(tmp_path):
+    from sglang_lite.models import QWEN_MOE
+
+    fam = assert_moe_supported("Qwen/Qwen3-30B-A3B-Instruct-2507")
+    assert fam is QWEN_MOE
+    cfg = tmp_path / "config.json"
+    cfg.write_text('{"model_type": "qwen3_moe", "architectures": ["Qwen3MoeForCausalLM"]}')
+    fam2 = assert_moe_supported(str(tmp_path))
+    assert fam2 is QWEN_MOE
+
+
 def test_find_rank_shard_naming(tmp_path):
     p = tmp_path / "model3-mp8.safetensors"
     p.write_bytes(b"x")

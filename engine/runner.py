@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 
 import torch
 
+from .cuda_graph import DecodeInputBuffer, PagedDecodeCudaGraph, maybe_compile_model
 from .kernel_backend import PagedAttnContext, create_kernel_backend
 from .kv_cache import PastKV, RadixCache
 from .models import assert_moe_supported, is_fixture_model, register_verified
@@ -52,6 +53,8 @@ class ModelRunner:
         self._tp_plan = None
         self._kv_layout = None
         self._swa_layout = None
+        self._decode_input_buf = DecodeInputBuffer(device)
+        self._paged_decode_cg = PagedDecodeCudaGraph(device)
         # Must match model compute dtype; fp16 pages + bf16 activations promote to fp32 in SDPA.
         self.torch_dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
         self.kernel_backend = create_kernel_backend(self.device)
@@ -175,7 +178,23 @@ class ModelRunner:
         is_minimax = mt_lower.startswith("minimax") or fam.name == "minimax_moe"
         skip_paged = is_mla or is_minimax or not fi_gqa_ok
         print(f"[sglang-lite] Kernel backend: {self.kernel_backend.name}")
-        if skip_paged:
+        import os as _os
+
+        force_hf_cache = _os.environ.get("SGLANG_LITE_FORCE_HF_CACHE", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        # PRO6000 profile: FI paged hooks can be ~2× slower than native HF SDPA
+        # for single-stream Qwen3-MoE (append+plan tax). Prefer HF cache when forced
+        # or when env asks for thruput path.
+        if force_hf_cache:
+            self.use_paged_as_source = False
+            print(
+                "[sglang-lite] SGLANG_LITE_FORCE_HF_CACHE=1 — HF use_cache path "
+                "(no FlashInfer paged hooks)"
+            )
+        elif skip_paged:
             self.use_paged_as_source = False
             reason = (
                 "MLA"
@@ -196,6 +215,33 @@ class ModelRunner:
                 self.model, num_qo_heads=n_heads, head_dim=self.head_dim, sm_scale=sm_scale
             )
             print(f"[sglang-lite] Paged attention hooks attached: {n} modules")
+
+        # Phase-A: optional torch.compile (CUDA graphs under the hood when shapes allow).
+        # Skip for device_map multi-GPU shards — compile + accelerate is fragile.
+        on_meta_or_sharded = bool(getattr(self.model, "hf_device_map", None))
+        paged_hooks = bool(
+            self.use_paged_as_source
+            and getattr(self.kernel_backend, "supports_paged_attention", False)
+        )
+        if not on_meta_or_sharded:
+            self.model = maybe_compile_model(
+                self.model, self.device, paged_hooks=paged_hooks
+            )
+        self._decode_input_buf = DecodeInputBuffer(self.device)
+        # Growable ones-mask for HF path (avoid per-step host alloc of new tensors).
+        self._attn_mask_buf: Optional[torch.Tensor] = None
+        # Throughput: allow TF32 tensor cores on Ampere+ (safe for thruput probes).
+        if str(self.device).startswith("cuda") and torch.cuda.is_available():
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.set_float32_matmul_precision("high")
+                # Prefer Flash / mem-efficient SDPA kernels when available.
+                torch.backends.cuda.enable_flash_sdp(True)
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+                torch.backends.cuda.enable_math_sdp(True)
+            except Exception:
+                pass
 
         register_verified(model_name)
         print(f"[sglang-lite] MoE model '{model_name}' ready on {self.device}")
@@ -437,14 +483,35 @@ class ModelRunner:
     def detokenize_delta(self, token_ids: List[int], prev_text: str = "") -> str:
         """Incremental decode; never re-emit the whole string on tokenizer churn.
 
-        - Prefers ``full[len(prev):]`` when ``full`` extends ``prev``.
-        - If ``full`` is a prefix of ``prev`` (incomplete multi-byte piece), wait.
-        - Otherwise emit only the suffix after the longest common prefix.
-        - If there is no common prefix and ``prev`` is non-empty, emit nothing
-          (avoids dumping a rewritten full sentence / ``�`` storms to SSE).
+        Phase-A thruput: most steps use a **windowed** decode (last ≤16 tokens)
+        instead of full-sequence decode every token (was O(n²) tokenizer cost).
+        Full resync every 16 tokens and on empty/irregular deltas.
         """
         if not token_ids:
             return ""
+        n = len(token_ids)
+        # Windowed fast path: decode a short suffix and emit only the new piece.
+        # Full resync periodically for stop-string / multi-byte correctness.
+        use_window = n > 1 and (n % 16) != 0
+        if use_window and self.tokenizer is not None:
+            window = 12
+            suffix_ids = token_ids[-window:]
+            # Decode suffix; best-effort delta = last piece after re-decode.
+            suffix = self.tokenizer.decode(suffix_ids, skip_special_tokens=True)
+            # Heuristic: if prev ends with a prefix of suffix, emit the rest.
+            # Fallback to full path when mismatch.
+            for k in range(min(len(prev_text), len(suffix)), -1, -1):
+                if k == 0:
+                    break
+                if prev_text.endswith(suffix[:k]):
+                    delta = suffix[k:]
+                    if delta == "\ufffd":
+                        return ""
+                    return delta
+            # If prev is empty, emit full suffix once.
+            if not prev_text:
+                return suffix if suffix != "\ufffd" else ""
+
         full = self.detokenize(token_ids)
         if full.startswith(prev_text):
             delta = full[len(prev_text) :]
@@ -452,19 +519,44 @@ class ModelRunner:
             # Incomplete UTF-8 / multi-token glyph — hold until decode grows.
             return ""
         else:
-            n = 0
+            n_common = 0
             limit = min(len(prev_text), len(full))
-            while n < limit and prev_text[n] == full[n]:
-                n += 1
-            if n == 0 and prev_text:
+            while n_common < limit and prev_text[n_common] == full[n_common]:
+                n_common += 1
+            if n_common == 0 and prev_text:
                 return ""
-            delta = full[n:]
+            delta = full[n_common:]
         # Lone U+FFFD is an incomplete decode artifact — do not stream it.
         if delta == "\ufffd":
             return ""
         return delta
 
-    @torch.no_grad()
+    @torch.inference_mode()
+    def run_decode_burst(
+        self, seq: Sequence, radix: RadixCache, n_steps: int
+    ) -> List[int]:
+        """Decode up to ``n_steps`` tokens for one sequence without scheduler hops.
+
+        Appends to ``seq.output_ids`` and updates ``cached_len`` via ``_decode_one``.
+        Caller must still run stop/finish logic.
+
+        Must run under inference_mode: without it, DynamicCache updates build an
+        autograd graph each step (~3× slower on Qwen3-30B-A3B decode).
+        """
+        out: List[int] = []
+        eos = self.eos_token_id
+        for _ in range(max(0, int(n_steps))):
+            if seq.finished:
+                break
+            tok = self._decode_one(seq, radix)
+            out.append(int(tok))
+            seq.output_ids.append(int(tok))
+            seq.decode_tokens = getattr(seq, "decode_tokens", 0) + 1
+            if eos is not None and int(tok) == int(eos):
+                break
+        return out
+
+    @torch.inference_mode()
     def run_batch(
         self,
         batch: List[Sequence],
@@ -710,6 +802,7 @@ class ModelRunner:
             seq.cached_len = pos + 1
             results[i] = self._sample(logits, seq)
 
+    @torch.inference_mode()
     def _prefill_one(self, seq: Sequence, radix: RadixCache) -> int:
         """Serial prefill fallback (different past lengths in a group)."""
         prompt = seq.input_ids
@@ -752,14 +845,21 @@ class ModelRunner:
         if self._use_paged_attention():
             outputs = self._model_forward_paged(input_ids, [seq], radix, is_decode=False)
             logits = outputs.logits[0, -1, :]
-            seq.last_logits = logits.detach().float().cpu().clone()
+            # Keep on device for immediate sample; radix insert will CPU-clone if needed.
+            seq.last_logits = logits.detach()
             seq.kv_state = None
             seq.cached_len = len(prompt)
             seq.prefill_tokens = getattr(seq, "prefill_tokens", 0) + len(new_tokens)
             return self._sample(logits, seq)
         past = self._past_for_seq(seq, radix)
         attn = self._attention_mask(input_ids, past, past_len_hint=start)
-        outputs = self._model_forward(input_ids, past, attn)
+        n_new = len(new_tokens)
+        position_ids = torch.arange(
+            start, start + n_new, device=self.device, dtype=torch.long
+        ).unsqueeze(0)
+        outputs = self._model_forward(
+            input_ids, past, attn, position_ids=position_ids
+        )
         logits = outputs.logits[0, -1, :]
         new_kv = outputs.past_key_values
         if self.use_paged_as_source:
@@ -769,11 +869,12 @@ class ModelRunner:
         else:
             # MLA / non-standard KV: keep HF DynamicCache only (no MHA pages).
             seq.kv_state = new_kv
-        seq.last_logits = logits.detach().float().cpu().clone()
+        seq.last_logits = logits.detach()
         seq.cached_len = len(prompt)
         seq.prefill_tokens = getattr(seq, "prefill_tokens", 0) + len(new_tokens)
         return self._sample(logits, seq)
 
+    @torch.inference_mode()
     def _decode_one(self, seq: Sequence, radix: RadixCache) -> int:
         if not seq.output_ids and getattr(seq, "last_logits", None) is not None:
             if self._v4_hybrid:
@@ -781,7 +882,8 @@ class ModelRunner:
             seq.cached_len = len(seq.input_ids)
             return self._sample(seq.last_logits.to(device=self.device), seq)
         last_token = seq.output_ids[-1] if seq.output_ids else seq.input_ids[-1]
-        input_ids = torch.tensor([[last_token]], dtype=torch.long, device=self.device)
+        # Reuse host-side alloc for single-token decode (Phase-A thruput).
+        input_ids = self._decode_input_buf.set_token(int(last_token))
         pos = seq.cached_len
         if self._v4_hybrid:
             self._v4_ensure_restored(seq, batch_slot=0)
@@ -808,7 +910,10 @@ class ModelRunner:
             return self._sample(logits, seq)
         past = self._past_for_seq(seq, radix)
         attn = self._attention_mask(input_ids, past, past_len_hint=pos)
-        outputs = self._model_forward(input_ids, past, attn)
+        position_ids = self._decode_input_buf.set_position(pos)
+        outputs = self._model_forward(
+            input_ids, past, attn, position_ids=position_ids
+        )
         logits = outputs.logits[0, -1, :]
         new_kv = outputs.past_key_values
         if self.use_paged_as_source:
@@ -1132,12 +1237,25 @@ class ModelRunner:
         cached_lens = [s.cached_len for s in seqs]
         q_lens = [q_len] * B
         past_len = cached_lens[0]
-        position_ids = (
-            torch.arange(past_len, past_len + q_len, device=self.device, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(B, -1)
-        )
-        attn = torch.ones((B, past_len + q_len), dtype=torch.long, device=self.device)
+        # Decode B=1: reuse static position buffer.
+        if is_decode and B == 1 and q_len == 1:
+            position_ids = self._decode_input_buf.set_position(past_len)
+        else:
+            position_ids = (
+                torch.arange(
+                    past_len, past_len + q_len, device=self.device, dtype=torch.long
+                )
+                .unsqueeze(0)
+                .expand(B, -1)
+            )
+        # Paged FI path ignores mask for attention; decode uses None so CUDA graph
+        # is not tied to a growing mask length.
+        if is_decode and B == 1:
+            attn = None
+        else:
+            attn = torch.ones(
+                (B, past_len + q_len), dtype=torch.long, device=self.device
+            )
         n_heads = int(self.model.config.num_attention_heads)
         sm_scale = float(self.head_dim**-0.5)
         ctx = PagedAttnContext(
@@ -1151,8 +1269,8 @@ class ModelRunner:
             head_dim=self.head_dim,
             sm_scale=sm_scale,
         )
-        self.kernel_backend.begin_forward(ctx)
-        try:
+
+        def _body():
             return self.model(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -1160,18 +1278,70 @@ class ModelRunner:
                 use_cache=False,
                 attention_mask=attn,
             )
+
+        # Phase-A: optional CUDA graph for single-token decode (plan outside graph).
+        use_cg = (
+            is_decode
+            and B == 1
+            and q_len == 1
+            and str(self.device).startswith("cuda")
+            and not self._v4_hybrid
+        )
+        if use_cg:
+            page_size = radix.block_size
+            total_len = past_len + 1
+            npages = (total_len + page_size - 1) // page_size
+            self.kernel_backend.begin_forward(ctx)
+            try:
+                out = self._paged_decode_cg.maybe_run(
+                    model_fn=_body, npages=npages
+                )
+                if out is None:
+                    out = _body()
+                return out
+            finally:
+                self.kernel_backend.end_forward()
+
+        self.kernel_backend.begin_forward(ctx)
+        try:
+            return _body()
         finally:
             self.kernel_backend.end_forward()
 
-    def _model_forward(self, input_ids, past, attention_mask):
+    def _model_forward(self, input_ids, past, attention_mask, position_ids=None):
         self.model_forward_count += 1
         self.last_model_forward_size = int(input_ids.shape[0])
-        return self.model(
-            input_ids=input_ids,
-            past_key_values=self._as_model_cache(past),
-            use_cache=True,
-            attention_mask=attention_mask,
-        )
+        kwargs = {
+            "input_ids": input_ids,
+            "past_key_values": self._as_model_cache(past),
+            "use_cache": True,
+            "attention_mask": attention_mask,
+        }
+        if position_ids is not None:
+            kwargs["position_ids"] = position_ids
+            # TF5 / Qwen3: cache_position aligns rope + cache updates.
+            if position_ids.numel() > 0:
+                kwargs["cache_position"] = position_ids.reshape(-1)
+        # Match HF generate(): only materialize last-token logits (big prefill win).
+        if self._supports_logits_to_keep():
+            kwargs["logits_to_keep"] = 1
+        return self.model(**kwargs)
+
+    def _supports_logits_to_keep(self) -> bool:
+        flag = getattr(self, "_logits_to_keep_ok", None)
+        if flag is not None:
+            return flag
+        ok = False
+        try:
+            import inspect
+
+            fwd = getattr(self.model, "forward", None)
+            if fwd is not None:
+                ok = "logits_to_keep" in inspect.signature(fwd).parameters
+        except Exception:
+            ok = False
+        self._logits_to_keep_ok = ok
+        return ok
 
     def _past_for_seq(self, seq: Sequence, radix: RadixCache):
         """CPU/stub path: rebuild HF cache from paged KV when enabled."""
@@ -1263,7 +1433,23 @@ class ModelRunner:
             k0 = past[0][0]
             past_len = int(k0.shape[-2]) if k0.dim() >= 3 else 0
         total = past_len + input_ids.shape[-1]
-        return torch.ones((input_ids.shape[0], total), dtype=torch.long, device=input_ids.device)
+        bsz = int(input_ids.shape[0])
+        buf = self._attn_mask_buf
+        if (
+            buf is None
+            or buf.device != input_ids.device
+            or buf.shape[0] < bsz
+            or buf.shape[1] < total
+        ):
+            # Cap growth in powers-of-two-ish chunks to limit reallocs.
+            cols = max(total, 64)
+            if buf is not None and buf.shape[1] > 0:
+                cols = max(cols, int(buf.shape[1]) * 2)
+            self._attn_mask_buf = torch.ones(
+                (max(bsz, 1), cols), dtype=torch.long, device=input_ids.device
+            )
+            buf = self._attn_mask_buf
+        return buf[:bsz, :total]
 
     def _cast_legacy_kv(self, past: PastKV) -> PastKV:
         """Ensure K/V match model dtype (avoids bf16×fp16 → fp32 SDPA promotion)."""
@@ -1300,11 +1486,9 @@ class ModelRunner:
             except Exception:
                 # Last resort: pass legacy list; some remote codes still accept it.
                 return past
-        # Existing Cache object: rebuild if dtype mismatches model
+        # Existing Cache / DynamicCache: pass through. Never materialize all layers
+        # to legacy just to check dtypes — that was a multi-ms/step tax on decode.
         if hasattr(past, "get_seq_length") or hasattr(past, "layers"):
-            legacy = self._to_legacy_kv(past)
-            if legacy and any(k.dtype != self.torch_dtype for k, _ in legacy):
-                return self._as_model_cache(legacy)
             return past
         return past
 

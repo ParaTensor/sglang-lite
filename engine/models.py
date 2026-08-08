@@ -6,7 +6,9 @@ Verified ids are those successfully loaded in this process (plus explicit regist
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Set
 
 
@@ -35,6 +37,8 @@ QWEN_MOE = MoEFamily(
         {
             "Qwen/Qwen1.5-MoE-A2.7B-Chat",
             "Qwen/Qwen2-57B-A14B-Instruct",
+            "Qwen/Qwen3-30B-A3B",
+            "Qwen/Qwen3-30B-A3B-Instruct-2507",
         }
     ),
 )
@@ -119,6 +123,32 @@ def family_for_model_type(model_type: Optional[str]) -> Optional[MoEFamily]:
     return None
 
 
+def _model_type_from_local_config(model_id: str) -> Optional[str]:
+    """Read model_type from a local HF/ModelScope checkpoint directory."""
+    root = Path(model_id)
+    if is_fixture_model(model_id):
+        root = Path(model_id.split(":", 1)[1])
+    if not root.is_dir():
+        return None
+    cfg_path = root / "config.json"
+    if not cfg_path.is_file():
+        return None
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    mt = raw.get("model_type")
+    if isinstance(mt, str) and mt:
+        return mt
+    # Multimodal wrappers (out of scope) may nest text_config.model_type.
+    text_cfg = raw.get("text_config")
+    if isinstance(text_cfg, dict):
+        mt2 = text_cfg.get("model_type")
+        if isinstance(mt2, str) and mt2:
+            return mt2
+    return None
+
+
 def assert_moe_supported(model_id: str, model_type: Optional[str] = None) -> MoEFamily:
     """Raise ValueError if the model is not an allowed MoE family."""
     if is_fixture_model(model_id) or model_id == "stub":
@@ -128,10 +158,22 @@ def assert_moe_supported(model_id: str, model_type: Optional[str] = None) -> MoE
     if fam is not None:
         return fam
 
+    # Local dirs: resolve model_type before name heuristics (e.g. Qwen3-30B-A3B).
+    if model_type is None:
+        mt_local = _model_type_from_local_config(model_id)
+        fam = family_for_model_type(mt_local)
+        if fam is not None:
+            return fam
+
     lower = model_id.lower()
     if "mixtral" in lower:
         return MIXTRAL
     if "qwen" in lower and "moe" in lower:
+        return QWEN_MOE
+    # Qwen3 MoE naming often uses A3B / A14B without the substring "moe".
+    if "qwen" in lower and (
+        "a3b" in lower or "a14b" in lower or "a2.7b" in lower or "-moe" in lower
+    ):
         return QWEN_MOE
     if "deepseek" in lower and "v4" in lower:
         return DEEPSEEK_V4

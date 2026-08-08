@@ -809,6 +809,54 @@ CPU 默认 soak/回归应 `overall: PASS`。
 
 摘要：`~/bench/moe_reg_multi_summary.json`。
 
+**Phase-A 吞吐探针（PRO6000，2026-08-07）— Qwen3-30B-A3B（文本 MoE）**
+
+> 用户曾指定 [Qwen3.5-27B](https://www.modelscope.ai/models/Qwen/Qwen3.5-27B)：实测
+> `model_type=qwen3_5` + vision，**Dense + 多模态 → scope 拒绝**。改测同量级文本 MoE
+> `Qwen/Qwen3-30B-A3B-Instruct-2507`（`qwen3_moe`，128 experts / 8 active）。
+
+| 项 | 结果 |
+| --- | --- |
+| 卡 | **1×** PRO 6000（`CUDA_VISIBLE_DEVICES=0`） |
+| 门禁 | **PASS** `~/bench/moe_reg_qwen3_30b_a3b.json`（finish=length） |
+| load_s | **~13.9–15 s** |
+| 脚本 | `scripts/moe_thruput_probe.py` |
+
+说明：tok/s 为 **加载后** wall-clock；作 Phase-A **sglang-lite 自基线**。
+
+**同机对照 SGLang 0.5.16 Docker（2026-08-07，PRO6000 GPU0，同权重）**
+
+| Engine | load_s | 1×64 warm | 1×128 warm | 备注 |
+| --- | --- | --- | --- | --- |
+| sglang-lite 首测 | 13.9 | 20.8 | 20.7 | `thru_qwen3_30b_a3b.json` |
+| sglang-lite FI 静态 metadata | 15.2 | 22.8 | 22.7 | 每层免 `torch.tensor` 分配 |
+| sglang-lite **HF cache + inference_mode burst** | ~14 | **21.6** | **21.9** | 修 `run_decode_burst` 缺 `@torch.inference_mode`（曾掉到 ~7–16） |
+| sglang-lite **HF + torch.compile(default)** | ~14 | **38.7** | **38.8** | `thru_qwen3_30b_compile.json`；冷启动 compile ~150s |
+| HF `model.generate` 同权重 | — | ~45 | ~45 | 上限参考（非 engine 路径） |
+| **SGLang 0.5.16 Docker** | 65.1 | **152.2** | **155.3** | 完整 CUDA graph capture |
+
+比值（当前最优 warm）：**SGLang / lite ≈ 4.0×**（155/38.8）。  
+相对首测 **+87%**（20.7→38.8）。相对 HF.generate 约 **0.86×**。
+
+**根因与开关（2026-08-07 后续）**
+
+1. **`run_decode_burst` 必须 `@torch.inference_mode()`**  
+   无 mode 时 DynamicCache 每步建 autograd 图 → pure decode ~7 tok/s；有 mode → ~21。  
+   `run_batch` 原先有装饰器，burst 路径漏了，thruput 探针走 burst 被拖垮。
+2. **单流 thruput 默认 `SGLANG_LITE_FORCE_HF_CACHE=1`**（探针 setdefault）  
+   FI paged plan/append 单流税高于 HF SDPA+DynamicCache。
+3. **`SGLANG_LITE_TORCH_COMPILE=1` + `mode=default`**（探针 setdefault）  
+   `reduce-overhead` 与 DynamicCache 不兼容（cudagraph tree overwrite）。  
+   `mode=default` 暖路径 ~39 tok/s；冷路径含 inductor 编译。
+4. **`logits_to_keep=1`**（HF 支持时）对齐 generate 的 prefill logits 裁剪。
+5. 全图 CUDA graph 捕获 HF+FI 仍失败；session disable 保留。
+
+脚本：`scripts/moe_thruput_probe.py`、`scripts/sglang_thru_docker.sh`。
+
+**下一刀（真要逼近 0.5× SGLang ≈ 75+ tok/s）**：不能再靠 HF eager 包装——需专用
+decode 图（KV append 图外 / MoE+attn kernel 图内）或 sgl-kernel 换核，目标越过
+HF.generate 天花板（~45）再追 SGLang 全图。
+
 Registry：`engine/models.py` → `MINIMAX_MOE`。  
 Runner：`runner.py` 对 MLA / MiniMax / 非 2^n GQA 跳过标准 FI paged，走 HF `use_cache`。  
 权重侧 TF5 补丁（仅 PRO6000 权重目录，不进 engine）：  

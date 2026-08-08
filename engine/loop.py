@@ -5,6 +5,7 @@ HTTP handlers only submit work and consume deltas; this loop owns scheduling.
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -29,6 +30,9 @@ class GenParams:
     stop: Optional[List[str]] = None
     timeout_s: float = 300.0
     ignore_eos: bool = False
+    # When True, skip per-token text streaming (detokenize only on finish).
+    # Used by thruput probes to remove O(n²) tokenizer cost from the hot path.
+    skip_streaming_text: bool = False
 
 
 @dataclass
@@ -326,6 +330,8 @@ class EngineLoop:
                 eos = self.runner.eos_token_id
                 if eos is not None and not item.params.ignore_eos:
                     seq.stop_token_ids = [eos]
+                seq.ignore_eos = bool(item.params.ignore_eos)
+                seq.skip_streaming_text = bool(item.params.skip_streaming_text)
             except MemoryError as e:
                 self._emit(
                     item.request_id,
@@ -446,10 +452,14 @@ class EngineLoop:
             if len(seq.output_ids) > seq.max_tokens:
                 seq.output_ids.pop()
                 self.scheduler.mark_finished(seq, "length")
+                if getattr(seq, "skip_streaming_text", False):
+                    return True, "", tok
                 delta = self.runner.detokenize_delta(seq.output_ids, prev_text)
                 return True, delta, tok if delta else None
         if len(seq.output_ids) >= seq.max_tokens:
             self.scheduler.mark_finished(seq, "length")
+            if getattr(seq, "skip_streaming_text", False):
+                return True, "", tok
             delta = self.runner.detokenize_delta(seq.output_ids, prev_text)
             return True, delta, tok if delta else None
 
@@ -457,22 +467,29 @@ class EngineLoop:
             if seq.output_ids and seq.output_ids[-1] == tok:
                 seq.output_ids.pop()
             self.scheduler.mark_finished(seq, "stop")
+            if getattr(seq, "skip_streaming_text", False):
+                return True, "", None
             delta = self.runner.detokenize_delta(seq.output_ids, prev_text)
             return True, delta, None
 
-        full = self.runner.detokenize(seq.output_ids)
+        # Only full detokenize when stop strings need scanning (hot-path cost).
         if seq.stop_strings:
+            full = self.runner.detokenize(seq.output_ids)
             for s in seq.stop_strings:
                 if s and s in full:
                     trimmed = full[: full.find(s)]
-                    while seq.output_ids and len(self.runner.detokenize(seq.output_ids)) > len(
-                        trimmed
-                    ):
+                    while seq.output_ids and len(
+                        self.runner.detokenize(seq.output_ids)
+                    ) > len(trimmed):
                         seq.output_ids.pop()
                     self.scheduler.mark_finished(seq, "stop")
+                    if getattr(seq, "skip_streaming_text", False):
+                        return True, "", None
                     delta = self.runner.detokenize_delta(seq.output_ids, prev_text)
                     return True, delta, tok if delta else None
 
+        if getattr(seq, "skip_streaming_text", False):
+            return False, "", tok
         delta = self.runner.detokenize_delta(seq.output_ids, prev_text)
         return False, delta, tok
 
@@ -537,8 +554,21 @@ class EngineLoop:
                 self.scheduler.update_after_decode(seq, tok, seq.kv_state)
 
                 prev = self._prev_text.get(seq.request_id, "")
-                finished, delta_text, emit_tok = self._apply_stop_and_limits(seq, tok, prev)
-                self._prev_text[seq.request_id] = self.runner.detokenize(seq.output_ids)
+                skip_text = bool(getattr(seq, "skip_streaming_text", False))
+                finished, delta_text, emit_tok = self._apply_stop_and_limits(
+                    seq, tok, prev
+                )
+                if skip_text:
+                    if finished:
+                        delta_text = self.runner.detokenize(seq.output_ids)
+                        self._prev_text[seq.request_id] = delta_text
+                else:
+                    if delta_text:
+                        self._prev_text[seq.request_id] = prev + delta_text
+                    elif finished:
+                        self._prev_text[seq.request_id] = self.runner.detokenize(
+                            seq.output_ids
+                        )
                 if emit_tok is not None or delta_text:
                     self._record_first_token(seq)
                 if finished:
@@ -583,6 +613,80 @@ class EngineLoop:
                 )
             return True
 
+        # Single-seq decode burst: many tokens per pump without re-scheduling.
+        burst_env = int(os.environ.get("SGLANG_LITE_DECODE_BURST", "16"))
+        can_burst = (
+            burst_env > 1
+            and len(batch) == 1
+            and not is_prefill[0]
+            and next_tokens
+            and next_tokens[0] is not None
+            and not batch[0].finished
+        )
+        if can_burst:
+            seq = batch[0]
+            remaining = max(0, int(seq.max_tokens) - len(seq.output_ids) - 1)
+            extra = min(remaining, burst_env - 1)
+            # First token already produced by run_batch.
+            first = int(next_tokens[0])
+            self.scheduler.update_after_decode(seq, first, seq.kv_state)
+            toks = [first]
+            if extra > 0:
+                more = self.runner.run_decode_burst(seq, self.radix, extra)
+                toks.extend(more)
+            skip_text = bool(getattr(seq, "skip_streaming_text", False))
+            prev = self._prev_text.get(seq.request_id, "")
+            finished = False
+            acc_text = ""
+            last_emit = None
+            for tok in toks:
+                finished, delta_text, last_emit = self._apply_stop_and_limits(
+                    seq, tok, prev
+                )
+                if skip_text:
+                    # Defer text until finish (thruput path).
+                    pass
+                else:
+                    if delta_text:
+                        acc_text += delta_text
+                        prev = prev + delta_text
+                    elif finished:
+                        prev = self.runner.detokenize(seq.output_ids)
+                        acc_text = prev
+                    self._prev_text[seq.request_id] = prev
+                if last_emit is not None or delta_text:
+                    self._record_first_token(seq)
+                if finished:
+                    break
+                if (
+                    not getattr(seq, "ignore_eos", False)
+                    and self.runner.eos_token_id is not None
+                    and tok == self.runner.eos_token_id
+                ):
+                    self.scheduler.mark_finished(seq, "stop")
+                    finished = True
+                    break
+            if finished:
+                self._record_request_finished(seq)
+                if skip_text:
+                    acc_text = self.runner.detokenize(seq.output_ids)
+                    self._prev_text[seq.request_id] = acc_text
+            self._emit(
+                seq.request_id,
+                {
+                    "text": acc_text,
+                    "token": last_emit,
+                    "finish_reason": seq.finish_reason if finished else None,
+                    "usage": self._usage(seq) if finished else None,
+                    "error": None,
+                },
+                final=finished,
+            )
+            self.scheduler.running = [
+                s for s in self.scheduler.running if not s.finished
+            ]
+            return True
+
         for seq, tok, pre in zip(batch, next_tokens, is_prefill):
             if seq.finished or tok is None:
                 continue
@@ -610,8 +714,22 @@ class EngineLoop:
             self.scheduler.update_after_decode(seq, tok, seq.kv_state)
 
             prev = self._prev_text.get(seq.request_id, "")
+            skip_text = bool(getattr(seq, "skip_streaming_text", False))
             finished, delta_text, emit_tok = self._apply_stop_and_limits(seq, tok, prev)
-            self._prev_text[seq.request_id] = self.runner.detokenize(seq.output_ids)
+            if skip_text:
+                # Defer detokenize until finish (thruput / offline).
+                if finished:
+                    delta_text = self.runner.detokenize(seq.output_ids)
+                    self._prev_text[seq.request_id] = delta_text
+                else:
+                    delta_text = ""
+            else:
+                if delta_text:
+                    self._prev_text[seq.request_id] = prev + delta_text
+                elif finished:
+                    self._prev_text[seq.request_id] = self.runner.detokenize(
+                        seq.output_ids
+                    )
             if emit_tok is not None or delta_text:
                 self._record_first_token(seq)
             if finished:

@@ -38,6 +38,8 @@ class Sequence:
     seed: Optional[int] = None
     stop_token_ids: List[int] = field(default_factory=list)
     stop_strings: List[str] = field(default_factory=list)
+    ignore_eos: bool = False
+    skip_streaming_text: bool = False
     # Phase 0c dual-pool page handle (V4 Hybrid dual-write; optional)
     swa_block_table: List[int] = field(default_factory=list)
     comp_block_table: List[int] = field(default_factory=list)
@@ -191,13 +193,16 @@ class Scheduler:
         new_token: int,
         new_kv_state: PastKV,
         new_block_ids: Optional[List[int]] = None,
+        *,
+        already_appended: bool = False,
     ) -> None:
-        seq.output_ids.append(new_token)
+        if not already_appended:
+            seq.output_ids.append(new_token)
+            seq.decode_tokens += 1
         # cached_len tracks KV length and is updated by the runner after each forward
         seq.kv_state = new_kv_state
         if new_block_ids:
             seq.block_table.extend(new_block_ids)
-        seq.decode_tokens += 1
         seq.last_token_ts = time.time()
 
     def mark_finished(self, seq: Sequence, reason: str = "stop") -> None:

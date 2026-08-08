@@ -194,6 +194,19 @@ class FlashInferBackend(KernelBackend):
         self._last_page_len: Optional[torch.Tensor] = None
         self._qo_indptr: Optional[torch.Tensor] = None
         self._patched_modules: List[Any] = []
+        # Phase-A thruput: static metadata for B=1, q_len=1 decode (avoid per-layer alloc).
+        self._decode_fast = False
+        self._max_pages_static = 0
+        self._st_batch_indices: Optional[torch.Tensor] = None  # [1]
+        self._st_positions: Optional[torch.Tensor] = None  # [1]
+        self._st_kv_indices: Optional[torch.Tensor] = None  # [max_pages]
+        self._st_kv_indptr: Optional[torch.Tensor] = None  # [2]
+        self._st_kv_last: Optional[torch.Tensor] = None  # [1]
+        self._st_page_indices: Optional[torch.Tensor] = None
+        self._st_page_indptr: Optional[torch.Tensor] = None
+        self._st_last_page_len: Optional[torch.Tensor] = None
+        self._st_n_pages = 0
+        self._st_append_start = 0
 
     def append_paged_kv(
         self,
@@ -230,6 +243,25 @@ class FlashInferBackend(KernelBackend):
             radix, block_table, start, layer_idx, k_tok, v_tok, append_len, self.device
         )
 
+    def _ensure_decode_static(self, max_pages: int) -> None:
+        """Allocate once for B=1 decode metadata (host→device free on hot path)."""
+        if (
+            self._st_batch_indices is not None
+            and self._max_pages_static >= max_pages
+        ):
+            return
+        max_pages = max(int(max_pages), 8)
+        dev = self.device
+        self._max_pages_static = max_pages
+        self._st_batch_indices = torch.zeros(1, dtype=torch.int32, device=dev)
+        self._st_positions = torch.zeros(1, dtype=torch.int32, device=dev)
+        self._st_kv_indices = torch.zeros(max_pages, dtype=torch.int32, device=dev)
+        self._st_kv_indptr = torch.zeros(2, dtype=torch.int32, device=dev)
+        self._st_kv_last = torch.zeros(1, dtype=torch.int32, device=dev)
+        self._st_page_indices = torch.zeros(max_pages, dtype=torch.int32, device=dev)
+        self._st_page_indptr = torch.zeros(2, dtype=torch.int32, device=dev)
+        self._st_last_page_len = torch.zeros(1, dtype=torch.int32, device=dev)
+
     def _append_one_layer(
         self,
         radix: RadixCache,
@@ -249,6 +281,27 @@ class FlashInferBackend(KernelBackend):
         k_tok, v_tok = radix.normalize_kv(k, v)
         k_new = k_tok.to(device=device, dtype=radix.dtype)
         v_new = v_tok.to(device=device, dtype=radix.dtype)
+
+        # Fast path: B=1 decode, q_len=1 — reuse static index buffers (set in begin_forward).
+        if (
+            self._decode_fast
+            and append_len == 1
+            and self._st_batch_indices is not None
+            and pages_after == self._st_n_pages
+        ):
+            self._flashinfer.append_paged_kv_cache(
+                k_new,
+                v_new,
+                self._st_batch_indices,
+                self._st_positions,
+                (radix.k_cache[layer_idx], radix.v_cache[layer_idx]),
+                self._st_kv_indices[: self._st_n_pages],
+                self._st_kv_indptr,
+                self._st_kv_last,
+                kv_layout="NHD",
+            )
+            return
+
         batch_indices = torch.zeros(append_len, dtype=torch.int32, device=device)
         positions = torch.arange(
             start, start + append_len, dtype=torch.int32, device=device
@@ -366,10 +419,46 @@ class FlashInferBackend(KernelBackend):
     def begin_forward(self, ctx: PagedAttnContext) -> None:
         total_lens = [c + q for c, q in zip(ctx.cached_lens, ctx.q_lens)]
         page_size = ctx.radix.block_size
-        self._page_indices, self._page_indptr, self._last_page_len = self._page_metadata(
-            ctx.block_tables, total_lens, page_size, self.device
+        self._decode_fast = bool(
+            ctx.is_decode
+            and len(ctx.block_tables) == 1
+            and len(ctx.q_lens) == 1
+            and ctx.q_lens[0] == 1
         )
-        if ctx.is_decode:
+
+        if self._decode_fast:
+            # Single-token decode: fill static page/append metadata once per step.
+            slen = int(total_lens[0])
+            start = int(ctx.cached_lens[0])
+            npages = (slen + page_size - 1) // page_size
+            bt = ctx.block_tables[0]
+            if len(bt) < npages:
+                raise RuntimeError(
+                    f"block_table too short: need {npages} pages for seq_len={slen}"
+                )
+            self._ensure_decode_static(max(npages, len(bt)))
+            assert self._st_page_indices is not None
+            for i in range(npages):
+                self._st_page_indices[i] = int(bt[i])
+            self._st_page_indptr[0] = 0
+            self._st_page_indptr[1] = npages
+            last = slen % page_size
+            self._st_last_page_len[0] = page_size if last == 0 else last
+            # Append metadata for writing the new token at `start`.
+            self._st_positions[0] = start
+            self._st_batch_indices[0] = 0
+            # pages needed after writing token at `start` (= npages for decode).
+            for i in range(npages):
+                self._st_kv_indices[i] = int(bt[i])
+            self._st_kv_indptr[0] = 0
+            self._st_kv_indptr[1] = npages
+            self._st_kv_last[0] = start % page_size if start > 0 else 0
+            self._st_n_pages = npages
+            self._st_append_start = start
+
+            self._page_indices = self._st_page_indices[:npages]
+            self._page_indptr = self._st_page_indptr
+            self._last_page_len = self._st_last_page_len
             self._qo_indptr = None
             self.decode_wrapper.plan(
                 self._page_indptr,
@@ -385,25 +474,48 @@ class FlashInferBackend(KernelBackend):
                 kv_data_type=ctx.radix.dtype,
             )
         else:
-            qo = [0]
-            for qlen in ctx.q_lens:
-                qo.append(qo[-1] + qlen)
-            self._qo_indptr = torch.tensor(qo, dtype=torch.int32, device=self.device)
-            self.prefill_wrapper.plan(
-                self._qo_indptr,
-                self._page_indptr,
-                self._page_indices,
-                self._last_page_len,
-                ctx.num_qo_heads,
-                ctx.num_kv_heads,
-                ctx.head_dim,
-                page_size,
-                causal=True,
-                pos_encoding_mode="NONE",
-                sm_scale=ctx.sm_scale,
-                q_data_type=ctx.radix.dtype,
-                kv_data_type=ctx.radix.dtype,
+            self._page_indices, self._page_indptr, self._last_page_len = (
+                self._page_metadata(
+                    ctx.block_tables, total_lens, page_size, self.device
+                )
             )
+            if ctx.is_decode:
+                self._qo_indptr = None
+                self.decode_wrapper.plan(
+                    self._page_indptr,
+                    self._page_indices,
+                    self._last_page_len,
+                    ctx.num_qo_heads,
+                    ctx.num_kv_heads,
+                    ctx.head_dim,
+                    page_size,
+                    pos_encoding_mode="NONE",
+                    sm_scale=ctx.sm_scale,
+                    q_data_type=ctx.radix.dtype,
+                    kv_data_type=ctx.radix.dtype,
+                )
+            else:
+                qo = [0]
+                for qlen in ctx.q_lens:
+                    qo.append(qo[-1] + qlen)
+                self._qo_indptr = torch.tensor(
+                    qo, dtype=torch.int32, device=self.device
+                )
+                self.prefill_wrapper.plan(
+                    self._qo_indptr,
+                    self._page_indptr,
+                    self._page_indices,
+                    self._last_page_len,
+                    ctx.num_qo_heads,
+                    ctx.num_kv_heads,
+                    ctx.head_dim,
+                    page_size,
+                    causal=True,
+                    pos_encoding_mode="NONE",
+                    sm_scale=ctx.sm_scale,
+                    q_data_type=ctx.radix.dtype,
+                    kv_data_type=ctx.radix.dtype,
+                )
         ctx.planned = True
         self._attn_ctx = ctx
 
@@ -413,6 +525,7 @@ class FlashInferBackend(KernelBackend):
         self._page_indptr = None
         self._last_page_len = None
         self._qo_indptr = None
+        self._decode_fast = False
 
     def attach_to_model(self, model: Any, num_qo_heads: int, head_dim: int, sm_scale: float) -> int:
         """Monkeypatch HF attention modules so forward uses FlashInfer paged KV."""
