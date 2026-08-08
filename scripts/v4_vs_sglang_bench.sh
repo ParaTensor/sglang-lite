@@ -61,12 +61,9 @@ if [[ "$SKIP_SGLANG" -eq 1 ]]; then
   exit 0
 fi
 
-if ! command -v python -c "import sglang" 2>/dev/null; then
-  # check import
-  if ! python -c "import sglang" 2>/dev/null; then
-    echo "[warn] sglang not installed — skip baseline. Install on host for KPI."
-    exit 0
-  fi
+if ! python -c "import sglang" 2>/dev/null; then
+  echo "[warn] sglang not installed — skip baseline. Install on host for KPI."
+  exit 0
 fi
 
 echo "=== SGLang baseline (operator-owned launch) ==="

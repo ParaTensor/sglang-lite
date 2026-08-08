@@ -14,8 +14,16 @@
 
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HF_CKPT="${HF_CKPT:-${HOME}/models/ds-v4-flash}"
-INFER_DIR="${INFER_DIR:-${HF_CKPT}/inference}"
+# Prefer in-tree vendor official graph (docs/v4-flash-only.md).
+if [[ -z "${INFER_DIR:-}" ]]; then
+  if [[ -f "${ROOT}/engine/vendor/deepseek_infer/model.py" ]]; then
+    INFER_DIR="${ROOT}/engine/vendor/deepseek_infer"
+  else
+    INFER_DIR="${HF_CKPT}/inference"
+  fi
+fi
 SAVE_PATH="${SAVE_PATH:-/tmp/ds-v4-mp${MP:-8}}"
 MP="${MP:-8}"
 EXPERTS="${EXPERTS:-256}"
