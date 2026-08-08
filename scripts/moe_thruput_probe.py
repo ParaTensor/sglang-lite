@@ -69,8 +69,10 @@ def main() -> int:
     os.environ.setdefault("SGLANG_LITE_FORCE_HF_CACHE", "1")
     # Large burst: fewer scheduler hops; runner warms compile at load.
     os.environ.setdefault("SGLANG_LITE_DECODE_BURST", "128")
-    # batched_mm: ~2× default grouped_mm; + torch.compile(mode=default) ~83 tok/s.
+    # batched_mm: ~2× default grouped_mm; + torch.compile(mode=default) ~84 tok/s.
     os.environ.setdefault("SGLANG_LITE_EXPERTS_IMPL", "batched_mm")
+    # cutlass fused MoE opt-in only (e2e ~44 < compile ~84 on PRO6000).
+    os.environ.setdefault("SGLANG_LITE_FUSED_MOE", "0")
     # Runner prefer_compile when FORCE_HF + batched_mm; warmup runs at load.
     os.environ.setdefault("SGLANG_LITE_TORCH_COMPILE", "1")
 

@@ -854,13 +854,18 @@ CPU 默认 soak/回归应 `overall: PASS`。
    `model()` + buffer；`DECODE_BURST` 默认 64（探针 128）。
 5. **StaticCache + CUDA graph** 仍默认关：即使 `create_causal_mask` 4D 全长 mask，  
    仍在 ~14 tok 漂移；`reduce-overhead` 与 DynamicCache 仍 CUDAGraph 冲突。
-6. **`logits_to_keep=1`**。FI 有 `fused_moe`/`b12x_fused_moe`，**未接线**（下一刀）。
+6. **`logits_to_keep=1`**。
+7. **FlashInfer cutlass fused MoE**（`engine/moe_hooks.py`，`SGLANG_LITE_FUSED_MOE=1`）  
+   - 接线：Qwen3 `gate_up` **up||gate** pack 后 `cutlass_fused_moe`（层内 maxdiff ~0.016）。  
+   - **B12x** 仅 FP4 权重，不适用于当前 bf16 检查点。  
+   - **e2e PRO6000**：fused-only ~**44** tok/s < batched_mm ~47 < **compile ~84**。  
+     fused+compile 更差（~30，dynamo 反复 graph-break）。默认 **关**。
 
 脚本：`scripts/moe_thruput_probe.py`、`scripts/sglang_thru_docker.sh`。
 
-**下一刀（逼近 SGLang ~155）**：HF 包装已近天花板（~85）；需  
-**FlashInfer fused MoE（sm120 b12x）换核** 或 **radix-native paged decode 图**，  
-不再依赖 HF DynamicCache + inductor。
+**下一刀（逼近 SGLang ~155）**：HF+inductor 天花板 ~85；需  
+**radix-native paged decode 图** 或 **真 FP4/B12x 量化 MoE 权重 + 图捕获**，  
+而不是再叠 HF expert 替换。
 
 Registry：`engine/models.py` → `MINIMAX_MOE`。  
 Runner：`runner.py` 对 MLA / MiniMax / 非 2^n GQA 跳过标准 FI paged，走 HF `use_cache`。  

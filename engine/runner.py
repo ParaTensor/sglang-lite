@@ -17,6 +17,7 @@ from .cuda_graph import (
 from .kernel_backend import PagedAttnContext, create_kernel_backend
 from .kv_cache import PastKV, RadixCache
 from .models import assert_moe_supported, is_fixture_model, register_verified
+from .moe_hooks import maybe_attach_fused_moe
 from .sampling import make_generator, sample_logits
 from .scheduler import Sequence
 
@@ -274,6 +275,12 @@ class ModelRunner:
             )
             print(f"[sglang-lite] Paged attention hooks attached: {n} modules")
 
+        # Fused MoE (FlashInfer cutlass) — before torch.compile so graph-breaks
+        # land on the custom op boundary. Auto-on for FORCE_HF thruput path.
+        self._fused_moe_n = maybe_attach_fused_moe(
+            self.model, force_hf_cache=force_hf_cache
+        )
+
         # Phase-A: optional torch.compile. Prefer on for HF batched_mm thruput
         # (~80 tok/s vs ~47 eager on Qwen3-MoE). Skip true multi-GPU shards only.
         dmap = getattr(self.model, "hf_device_map", None)
@@ -290,9 +297,9 @@ class ModelRunner:
             and self._experts_impl == "batched_mm"
             and str(self.device).startswith("cuda")
         )
-        self._compile_preferred = prefer_compile and not multi_gpu_shard
+        compiled = self.model
         if not multi_gpu_shard:
-            self.model = maybe_compile_model(
+            compiled = maybe_compile_model(
                 self.model,
                 self.device,
                 paged_hooks=paged_hooks,
@@ -302,6 +309,8 @@ class ModelRunner:
             print(
                 "[sglang-lite] torch.compile skipped (multi-GPU device_map shard)"
             )
+        self._compile_preferred = compiled is not self.model
+        self.model = compiled
         self._decode_input_buf = DecodeInputBuffer(self.device)
         # Growable ones-mask for HF path (avoid per-step host alloc of new tensors).
         self._attn_mask_buf: Optional[torch.Tensor] = None
