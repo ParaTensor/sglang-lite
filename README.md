@@ -1,19 +1,20 @@
 # sglang-lite
 
-**A minimal, production-grade LLM inference engine focused on MoE models.** High-cohesion "Token Factory" focused on:
+**DeepSeek-V4-Flash 专用**、极致高内聚的 Token Factory（性能优先于通用性）。
 
-- RadixAttention (prefix sharing for chat/agent workloads)
-- Continuous batching scheduler
-- Low-overhead decode with CUDA graph
-- OpenAI-compatible API (the critical control point)
+- 自持 Radix / dual-pool KV + continuous batching
+- **Vendor** 官方 inference 图（不 `import sglang` / `import vllm`）
+- CUDA graph 友好 decode 热路径（`engine/v4_runner`）
+- 薄 Rust OpenAI 控制面
 
-> "The engine is only responsible for reliably and efficiently producing tokens." — Push agent logic, structured output, and multimodal handling up to the gateway/harness layer (unigateway).
+> "The engine is only responsible for reliably and efficiently producing tokens." — 业务与宽协议上移 UniGateway。
+
+**产品宪章**：[docs/v4-flash-only.md](docs/v4-flash-only.md)
 
 ## Mission
 
-A minimal, production-grade LLM inference engine focused exclusively on popular MoE models. It provides stable, high-throughput, low-latency token generation for MoE architectures. The core revolves around continuous batching + efficient KV cache (Radix) + expert-routing-aware execution, exposing a minimal and stable OpenAI-compatible interface.
-
-It does **not** do: agent runtime, multimodal, built-in constrained decoding, speculative decoding, prefill-decode disaggregation, dynamic multi-LoRA, or complex expert parallelism scheduling.
+只服务 **DeepSeek-V4-Flash**（含 0731 权重形态）。KPI：同机同权重 warm decode tok/s **超过 SGLang**。  
+其它 MoE 为 legacy（`SGLANG_LITE_V4_ONLY=0`）。Dense / 多模态 / 投机 / PD disagg **不做**。
 
 ## Why sglang-lite?
 

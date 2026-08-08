@@ -1,7 +1,8 @@
 # sglang-lite 运维 Runbook（稳部署）
 
-面向 **standalone Token Factory** 最小可部署路径。主路径为官方 attention 核；
-FlashInfer SM120 sparse **不默认开启**。
+面向 **DeepSeek-V4-Flash 专用** standalone Token Factory。主路径为 **vendor 官方图**
+（`engine/vendor/deepseek_infer`）+ 官方 attention 核；FlashInfer SM120 sparse **不默认开启**。
+权威产品宪章：[v4-flash-only.md](./v4-flash-only.md)。
 
 ## 1. 环境预设
 
@@ -9,32 +10,29 @@ FlashInfer SM120 sparse **不默认开启**。
 cd /path/to/sglang-lite
 source scripts/env_lite.sh
 
-# DeepSeek-V4-Flash（可选）
+# DeepSeek-V4-Flash（唯一一等公民）
 export SGLANG_LITE_DSV4_HF=~/models/DeepSeek-V4-Flash-0731
 export SGLANG_LITE_DSV4_CONVERTED=~/models/ds-v4-mp8
 export SGLANG_LITE_MODEL="$SGLANG_LITE_DSV4_HF"
+# 图默认走仓内 vendor（env_lite 已 setdefault）
+# export SGLANG_LITE_DSV4_INFER=$PWD/engine/vendor/deepseek_infer
 ```
 
 关键变量：
 
 | 变量 | 默认 | 含义 |
 |------|------|------|
+| `SGLANG_LITE_V4_ONLY` | `1` | 拒绝非 V4-Flash 模型 |
+| `SGLANG_LITE_DSV4_INFER` | `engine/vendor/deepseek_infer` | 官方/vendor 图路径 |
 | `SGLANG_LITE_V4_DISABLE_FI_SPARSE` | `1` | 官方 `sparse_attn` 主路径 |
+| `SGLANG_LITE_V4_CUDA_GRAPH` | 关 | 固定 start_pos 微基准 CUDA graph |
 | `SGLANG_LITE_LOG_JSON` | `1` | `sglang_lite.req` JSON 行日志 |
 | `SGLANG_LITE_MAX_BATCH_SIZE` | `4` | continuous batch 上限 |
 | `SGLANG_LITE_REQUEST_TIMEOUT` | `300` | 单请求超时秒 |
 
 ## 2. 启动
 
-**CPU / 单卡 Mixtral 类（HF id）**
-
-```bash
-python -m sglang_lite.process \
-  --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
-  --device cuda --port 9001
-```
-
-**DeepSeek-V4-Flash TP=8（PRO6000 宿主）**
+**DeepSeek-V4-Flash TP=8（PRO6000 宿主）— 唯一生产路径**
 
 ```bash
 source scripts/env_lite.sh
@@ -43,12 +41,34 @@ torchrun --nproc-per-node=8 -m sglang_lite.process \
   --model "$SGLANG_LITE_DSV4_HF" --device cuda --port 9001
 ```
 
+**权重转换**（首次，官方 convert 已 vendor）：
+
+```bash
+export EXPERTS=256 MP=8
+python engine/vendor/deepseek_infer/convert.py \
+  --hf-ckpt-path "$SGLANG_LITE_DSV4_HF" \
+  --save-path "$SGLANG_LITE_DSV4_CONVERTED" \
+  --n-experts $EXPERTS --model-parallel $MP
+```
+
+**Legacy 多 MoE**（非 KPI，需显式）：`SGLANG_LITE_V4_ONLY=0`
+
 可选控制面（Rust）：
 
 ```bash
 # 另开终端
 sglang-lite-serving --engine-url http://127.0.0.1:9001 --port 8000
 ```
+
+## 2.1 KPI：对打 SGLang
+
+同机同权重 warm decode tok/s（见 v4-flash-only §5）：
+
+```bash
+bash scripts/v4_vs_sglang_bench.sh --mp 8 --max-new 128
+```
+
+记录 lite 与 SGLang 的 warm tok/s；主 KPI 要求 **lite > SGLang**。
 
 ## 3. 健康与指标
 

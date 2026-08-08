@@ -92,28 +92,32 @@ engine/
 ### Phase V0 — 立宪（本 PR 文档）
 
 - [x] 本文 + scope / AGENTS 对齐  
-- [ ] `vendor/SOURCES.md` 模板  
-- [ ] 拒绝非 V4 模型的 load 路径开关（`SGLANG_LITE_V4_ONLY=1` 默认开）
+- [x] `docs/vendor/SOURCES.md` + `engine/vendor/` 骨架 + `scripts/vendor_v4_slice.py`  
+- [x] 拒绝非 V4 模型的 load 路径（`SGLANG_LITE_V4_ONLY=1` 默认开；fixture/stub 例外）
 
 ### Phase V1 — 最小可跑专用 runner
 
-- 启动只加载 V4-Flash  
-- forward 走 **vendor 官方图或 SGLang V4 runner 子集**（二选一，先选更快那条）  
-- 保留现有 Rust SSE / TokenDelta  
-- 跑通 `1×128` 与短 greedy
+- [x] `engine/v4_runner/` 入口（identity + load + forward + encode + accel）  
+- [x] 首次 vendor `deepseek_infer/`（`hf@60d8d707…`：model/kernel/encoding/convert）  
+- [x] Hybrid load 走 `load_v4_flash`；forward 走 `V4DecodeAccelerator`  
+- [x] 保留现有 Rust SSE / TokenDelta  
+- [ ] 跑通 `1×128` 与短 greedy（**权重机**执行 `scripts/v4_vs_sglang_bench.sh`）
 
 ### Phase V2 — 焊核 + 满图
 
-- 从 SGLang/vLLM 搬 **CUDA graph decode** 捕获条件与静态 buffer  
+- [x] SGLang V4 切片 **reference** pin（`sglang@e732c0a9…`）— 不 runtime import  
+- [x] 固定 start_pos CUDA graph 脚手架（`SGLANG_LITE_V4_CUDA_GRAPH`）  
+- [ ] 按 reference 移植 dsv4 **叶子** op + 满位 decode graph（跨 start_pos）  
 - sparse MLA：SM120 正确后端（禁止错走 SM100 TRTLLM）  
-- MoE：FP8/分组 GEMM 以 V4 权格式为准（deep-gemm / vendor 核）  
+- MoE：FP8/分组 GEMM 以 V4 权格式为准  
 - dual-pool page 为源，去掉不必要的 CPU snapshot 热路径
 
 ### Phase V3 — 对打 SGLang 与削脂
 
-- runbook 固定对照命令  
-- 删除 `legacy` 通用 MoE thruput 路径（或移出默认构建）  
-- 包体/依赖清单最小化
+- [x] runbook + `scripts/v4_vs_sglang_bench.sh` 对照命令  
+- [ ] 权重机验收 warm tok/s > SGLang  
+- [ ] 删除 `legacy` 通用 MoE thruput 路径（或移出默认构建）  
+- [ ] 包体/依赖清单最小化
 
 ---
 

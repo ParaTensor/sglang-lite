@@ -100,10 +100,26 @@ def main() -> int:
 
     hf = Path(args.hf_ckpt or os.path.expanduser("~/models/ds-v4-flash")).expanduser()
     converted = Path(args.converted).expanduser()
-    infer = hf / "inference"
+    root = Path(__file__).resolve().parents[1]
+    vendor_infer = root / "engine" / "vendor" / "deepseek_infer"
+    env_infer = os.environ.get("SGLANG_LITE_DSV4_INFER", "").strip()
+    if env_infer:
+        infer = Path(env_infer).expanduser()
+    elif (vendor_infer / "generate.py").is_file():
+        infer = vendor_infer
+    else:
+        infer = hf / "inference"
     config = infer / "config.json"
     if not config.is_file():
-        print(f"missing {config}", file=sys.stderr)
+        # generate needs ModelArgs-shaped config; vendor ships one
+        alt = vendor_infer / "config.json"
+        if alt.is_file():
+            config = alt
+        else:
+            print(f"missing {config}", file=sys.stderr)
+            return 2
+    if not (infer / "generate.py").is_file():
+        print(f"missing generate.py under {infer}", file=sys.stderr)
         return 2
     shard0 = converted / f"model0-mp{args.mp}.safetensors"
     if not shard0.is_file():

@@ -48,6 +48,8 @@ class Config:
             # Official main path unless operator explicitly set FI envs.
             os.environ.setdefault("SGLANG_LITE_V4_DISABLE_FI_SPARSE", "1")
             os.environ.setdefault("SGLANG_LITE_LOG_JSON", "1")
+            # Product default: DeepSeek-V4-Flash only (docs/v4-flash-only.md).
+            os.environ.setdefault("SGLANG_LITE_V4_ONLY", "1")
         else:
             base = {}
 

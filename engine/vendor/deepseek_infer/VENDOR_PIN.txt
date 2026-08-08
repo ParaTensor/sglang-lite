@@ -1,0 +1,15 @@
+target=deepseek-infer
+pin=hf:deepseek-ai/DeepSeek-V4-Flash@60d8d70770c6776ff598c94bb586a859a38244f1
+src=huggingface.co/deepseek-ai/DeepSeek-V4-Flash inference/ + encoding/
+license=Apache-2.0 / model terms (DeepSeek)
+files:
+  - model.py
+  - kernel.py
+  - config.json
+  - convert.py
+  - generate.py
+  - requirements.txt
+  - encoding_dsv4.py
+  - test_encoding_dsv4.py
+  - UPSTREAM_README.md
+notes: runtime imports via sys.path insert of this dir (model, kernel, encoding_dsv4). No import sglang/vllm.

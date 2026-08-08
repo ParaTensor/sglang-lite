@@ -59,6 +59,7 @@ class ModelRunner:
         self.use_paged_as_source = True
         self._v4_hybrid = False
         self._v4_prefix_cache = None
+        self._v4_accel = None
         self._tp_plan = None
         self._kv_layout = None
         self._swa_layout = None
@@ -392,11 +393,17 @@ class ModelRunner:
             print(f"[sglang-lite] torch.compile warmup skipped: {e}")
 
     def _load_deepseek_v4_hybrid(self, model_name: str, load_id: str, config) -> None:
-        """Hybrid: official inference Transformer + TP shard from convert.py."""
+        """Hybrid: official/vendor Transformer + TP shard from convert.py.
+
+        Graph load prefers in-tree ``vendor/deepseek_infer`` (v4_runner), never
+        runtime ``import sglang`` / ``import vllm``. Product gate: V4-Flash only
+        (escape ``SGLANG_LITE_V4_ONLY=0`` for legacy experiments).
+        """
         import os
 
         from .kv_cache import KvLayout
-        from .model_loader import load_v4_hybrid_model, resolve_v4_paths
+        from .model_loader import resolve_v4_paths
+        from .v4_runner import load_v4_flash
 
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         paths = resolve_v4_paths(hf_ckpt=load_id)
@@ -412,9 +419,13 @@ class ModelRunner:
                 "Use: torchrun --nproc-per-node=8 scripts/v4_lite_engine_gen.py "
                 "or scripts/v4_lite_short_gen.py"
             )
-        # load_v4_hybrid_model inits NCCL before Transformer; device from LOCAL_RANK.
-        model, cfg, plan = load_v4_hybrid_model(
-            paths, max_batch_size=self.max_batch
+        model, cfg, plan, graph_src = load_v4_flash(
+            model_id=load_id,
+            paths=paths,
+            max_batch_size=self.max_batch,
+        )
+        print(
+            f"[sglang-lite] v4 graph source kind={graph_src.kind} path={graph_src.path}"
         )
         self.model = model
         self.device = plan.local_device
@@ -422,8 +433,12 @@ class ModelRunner:
         self._is_real = True
         self._v4_hybrid = True
         from .v4_prefix_cache import V4PrefixCache
+        from .v4_runner import V4DecodeAccelerator
 
         self._v4_prefix_cache = V4PrefixCache()
+        self._v4_accel = V4DecodeAccelerator(
+            model, device=plan.local_device, max_batch=self.max_batch
+        )
         self._tp_plan = plan
         self.vocab_size = int(cfg.get("vocab_size", 129280))
         self.num_layers = int(cfg.get("n_layers") or cfg.get("num_hidden_layers", 43))
@@ -578,44 +593,51 @@ class ModelRunner:
         return self.tokenize("\n".join(parts))
 
     def _v4_encode_messages(self, messages: list) -> Optional[List[int]]:
-        """Prefer official encoding_dsv4 when HF tree is available."""
+        """Prefer vendored encoding_dsv4; fall back to HF tree encoding/."""
         import sys
 
-        try:
-            from .model_loader import resolve_v4_paths
+        from .v4_runner import encode_chat_messages
 
-            paths = resolve_v4_paths()
-        except Exception:
-            return None
-        encoding_dir = paths.hf_ckpt / "encoding"
-        infer_dir = paths.hf_ckpt / "inference"
-        if not encoding_dir.is_dir():
-            return None
-        for p in (str(encoding_dir), str(infer_dir)):
-            if p not in sys.path:
-                sys.path.insert(0, p)
-        try:
-            from encoding_dsv4 import encode_messages
+        rendered = encode_chat_messages(messages, thinking_mode="chat")
+        if rendered is None:
+            try:
+                from .model_loader import resolve_v4_paths
 
-            norm = []
-            for m in messages:
-                if isinstance(m, dict):
-                    norm.append(
-                        {
-                            "role": m.get("role", "user"),
-                            "content": m.get("content") or "",
-                        }
-                    )
-                else:
-                    norm.append(
-                        {
-                            "role": getattr(m, "role", "user"),
-                            "content": getattr(m, "content", "") or "",
-                        }
-                    )
-            rendered = encode_messages(norm, thinking_mode="chat")
-            if self.tokenizer is None:
+                paths = resolve_v4_paths()
+            except Exception:
                 return None
+            encoding_dir = paths.hf_ckpt / "encoding"
+            infer_dir = paths.hf_ckpt / "inference"
+            if not encoding_dir.is_dir():
+                return None
+            for p in (str(encoding_dir), str(infer_dir)):
+                if p not in sys.path:
+                    sys.path.insert(0, p)
+            try:
+                from encoding_dsv4 import encode_messages
+
+                norm = []
+                for m in messages:
+                    if isinstance(m, dict):
+                        norm.append(
+                            {
+                                "role": m.get("role", "user"),
+                                "content": m.get("content") or "",
+                            }
+                        )
+                    else:
+                        norm.append(
+                            {
+                                "role": getattr(m, "role", "user"),
+                                "content": getattr(m, "content", "") or "",
+                            }
+                        )
+                rendered = encode_messages(norm, thinking_mode="chat")
+            except Exception:
+                return None
+        if rendered is None or self.tokenizer is None:
+            return None
+        try:
             return list(self.tokenizer.encode(rendered))
         except Exception:
             return None
@@ -1295,27 +1317,15 @@ class ModelRunner:
         )
 
     def _model_forward_v4(self, input_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
-        """Official Transformer.forward(input_ids, start_pos) → logits [B, vocab]."""
+        """Official/vendored Transformer → logits [B, vocab] via v4_runner."""
         self.model_forward_count += 1
         self.last_model_forward_size = int(input_ids.shape[0])
-        # Prefer greedy logits for Hybrid numerics / gates.
-        if hasattr(self.model, "temperature"):
-            try:
-                self.model.temperature = 0.0
-            except Exception:
-                pass
-        out = self.model(input_ids, start_pos=int(start_pos))
-        if isinstance(out, torch.Tensor):
-            logits = out
-        elif isinstance(out, (tuple, list)):
-            # Official DeepSeek-V4 Transformer: (output_ids, logits, main_hidden).
-            logits = out[1] if len(out) > 1 else out[0]
-        else:
-            logits = out.logits
-        # Official returns last-position logits [B, vocab]; accept [B, T, vocab] too.
-        if logits.dim() == 3:
-            logits = logits[:, -1, :]
-        return logits
+        accel = getattr(self, "_v4_accel", None)
+        if accel is not None:
+            return accel.decode_logits(input_ids, start_pos)
+        from .v4_runner import model_forward_logits
+
+        return model_forward_logits(self.model, input_ids, start_pos)
 
     def v4_match_prefix(self, token_ids: List[int]):
         """Match ``token_ids`` against the Hybrid V4 prefix snapshot store."""

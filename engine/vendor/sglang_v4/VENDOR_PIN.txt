@@ -1,0 +1,7 @@
+target=sglang-v4
+pin=sgl-project/sglang@e732c0a9dc071ca06026dba93887e8d77e631d04
+license=Apache-2.0
+status=REFERENCE_ONLY (not imported at runtime — full sglang.srt deps)
+purpose: Phase V2 kernel/graph port reference for DeepSeek-V4-Flash
+files: see reference/ tree (models/deepseek_v4.py, decode_cuda_graph_runner.py, dsv4 ops, configs)
+runtime_path: engine/vendor/deepseek_infer (official) is the live graph

@@ -144,7 +144,8 @@ sglang-lite 强调高内聚与整洁，**根目录严禁堆放非核心内容**�
 **产品赌注已切换为 V4-Flash 专用**（2026-08-08）。
 
 - 文档：`docs/v4-flash-only.md` 为宪章；通用 MoE thruput（Qwen FORCE_HF 等）**退出 P0**。  
-- 代码现状：Hybrid + dual-pool 仍在；下一实现 **Phase V1**：vendor 子集 + 专用 runner，默认 `V4_ONLY`。  
+- 代码现状：`SGLANG_LITE_V4_ONLY=1`；**live vendor** `engine/vendor/deepseek_infer/`（官方 model/kernel/encoding，HF pin `60d8d707`）；`v4_runner` 负责 load/forward/encode/accel。SGLang V4 切片在 `vendor/sglang_v4/reference`（不 import sglang）。  
+- 下一刀（权重机）：`bash scripts/v4_vs_sglang_bench.sh` 验收 warm tok/s > SGLang；Phase V2 移植 dsv4 叶子核 + 跨 start_pos 满图。  
 - 技术细节与 SM120 路由仍见 [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md)。  
 - 运维入口见 [docs/runbook.md](docs/runbook.md)（将逐步改为 V4 对照命令）。
 

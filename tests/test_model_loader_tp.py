@@ -41,7 +41,9 @@ def test_deepseek_v4_family_registered():
     assert fam2.name == "deepseek_v4"
 
 
-def test_minimax_family_registered():
+def test_minimax_family_registered(monkeypatch):
+    # Legacy multi-MoE path (product default is V4-only).
+    monkeypatch.setenv("SGLANG_LITE_V4_ONLY", "0")
     assert family_for_model_type("minimax_m2") is MINIMAX_MOE
     fam = assert_moe_supported("MiniMaxAI/MiniMax-M2", "minimax_m2")
     assert fam.name == "minimax_moe"
@@ -51,9 +53,10 @@ def test_minimax_family_registered():
     assert fam3.name == "minimax_moe"
 
 
-def test_qwen3_a3b_name_and_local_config(tmp_path):
+def test_qwen3_a3b_name_and_local_config(tmp_path, monkeypatch):
     from sglang_lite.models import QWEN_MOE
 
+    monkeypatch.setenv("SGLANG_LITE_V4_ONLY", "0")
     fam = assert_moe_supported("Qwen/Qwen3-30B-A3B-Instruct-2507")
     assert fam is QWEN_MOE
     cfg = tmp_path / "config.json"

@@ -85,38 +85,94 @@ class DeepseekV4Paths:
             return json.load(f)
 
 
+def vendored_deepseek_infer_dir() -> Path:
+    """In-tree vendor path for DeepSeek official inference graph subset."""
+    return Path(__file__).resolve().parent / "vendor" / "deepseek_infer"
+
+
 def resolve_v4_paths(
     hf_ckpt: Optional[str] = None,
     converted_ckpt: Optional[str] = None,
 ) -> DeepseekV4Paths:
-    """Resolve HF + official inference/ paths from env or arguments."""
+    """Resolve HF + inference graph paths from env or arguments.
+
+    Prefer in-tree ``engine/vendor/deepseek_infer`` when it contains ``model.py``
+    and ``SGLANG_LITE_DSV4_INFER`` is unset.
+    """
     hf = Path(
         hf_ckpt
         or os.environ.get("SGLANG_LITE_DSV4_HF", "")
         or os.environ.get("HF_CKPT", "")
         or os.path.expanduser("~/models/ds-v4-flash")
     ).expanduser()
-    infer = Path(
-        os.environ.get("SGLANG_LITE_DSV4_INFER", str(hf / "inference"))
-    ).expanduser()
+    env_infer = os.environ.get("SGLANG_LITE_DSV4_INFER", "").strip()
+    if env_infer:
+        infer = Path(env_infer).expanduser()
+    else:
+        vendor = vendored_deepseek_infer_dir()
+        if (vendor / "model.py").is_file():
+            infer = vendor
+        else:
+            infer = hf / "inference"
     conv_env = converted_ckpt or os.environ.get("SGLANG_LITE_DSV4_CONVERTED", "")
     conv = Path(conv_env).expanduser() if conv_env else None
     return DeepseekV4Paths(hf_ckpt=hf, inference_dir=infer, converted_ckpt=conv)
 
 
-def import_official_inference(inference_dir: Path):
-    """Import official ``model`` module from DeepSeek inference/."""
+def import_official_inference(inference_dir: Optional[Path] = None):
+    """Import official ``model`` module for V4 Hybrid load.
+
+    Preference order (no runtime ``import sglang`` / ``import vllm``):
+
+    1. Explicit ``inference_dir`` if it contains ``model.py``
+    2. In-tree ``engine/vendor/deepseek_infer/`` when vendored
+    3. ``SGLANG_LITE_DSV4_INFER`` / resolved HF ``inference/`` path
+    """
+    import importlib
     import sys
 
-    inference_dir = inference_dir.resolve()
-    if not inference_dir.is_dir():
-        raise FileNotFoundError(f"inference dir not found: {inference_dir}")
-    key = str(inference_dir)
-    if key not in sys.path:
-        sys.path.insert(0, key)
-    import importlib
+    candidates: List[Path] = []
+    if inference_dir is not None:
+        candidates.append(Path(inference_dir))
+    vendor = vendored_deepseek_infer_dir()
+    if (vendor / "model.py").is_file():
+        candidates.append(vendor)
+    # External HF tree still allowed until full vendor lands.
+    env_infer = os.environ.get("SGLANG_LITE_DSV4_INFER", "").strip()
+    if env_infer:
+        candidates.append(Path(env_infer).expanduser())
 
-    return importlib.import_module("model")
+    seen: set = set()
+    last_err: Optional[Exception] = None
+    for d in candidates:
+        d = d.resolve()
+        if d in seen:
+            continue
+        seen.add(d)
+        if not (d / "model.py").is_file():
+            continue
+        key = str(d)
+        # Prefer this dir over any earlier path entry with the same module name.
+        if key in sys.path:
+            sys.path.remove(key)
+        sys.path.insert(0, key)
+        # Drop cached foreign ``model`` so we load from this tree.
+        if "model" in sys.modules:
+            mod = sys.modules["model"]
+            mod_file = getattr(mod, "__file__", "") or ""
+            if not mod_file.startswith(key):
+                del sys.modules["model"]
+        try:
+            return importlib.import_module("model")
+        except Exception as e:  # noqa: BLE001 — surface later with path context
+            last_err = e
+            continue
+
+    raise FileNotFoundError(
+        "DeepSeek-V4 inference graph not found. Vendor official model.py into "
+        f"{vendor} (preferred) or set SGLANG_LITE_DSV4_INFER. "
+        f"last_error={last_err!r}"
+    )
 
 
 # HF config.json → official ModelArgs field names (partial map).
