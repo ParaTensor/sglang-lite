@@ -780,7 +780,7 @@ class ModelRunner:
         self._v4_stage_pages_before_forward(seq, batch_slot=0)
 
         tok_buf = self._decode_input_buf
-        # GPU token ring; single D2H at end.
+        # GPU token ring; single D2H at end when ignore_eos (no mid-burst sync).
         if (
             self._paged_burst_toks is None
             or self._paged_burst_toks.device.type != torch.device(self.device).type
@@ -790,24 +790,41 @@ class ModelRunner:
                 max(n_steps, 128), dtype=torch.long, device=self.device
             )
         assert self._paged_burst_toks is not None
-        produced = 0
+        last_t = torch.tensor(
+            [seq.output_ids[-1] if seq.output_ids else seq.input_ids[-1]],
+            dtype=torch.long,
+            device=self.device,
+        )
+        # Fast path: ignore_eos thruput — zero host token reads until burst end.
+        if ignore_eos or eos is None:
+            for i in range(max(0, n_steps)):
+                pos = seq.cached_len
+                input_ids = tok_buf.set_token_tensor(last_t)
+                logits = self._model_forward_v4(input_ids, start_pos=pos)
+                nxt = torch.argmax(logits[0])
+                self._paged_burst_toks[i] = nxt
+                last_t = nxt
+                seq.kv_state = None
+                seq.cached_len = pos + 1
+                seq.decode_tokens = getattr(seq, "decode_tokens", 0) + 1
+            host = self._paged_burst_toks[:n_steps].tolist()
+            seq.output_ids.extend(int(x) for x in host)
+            return [int(x) for x in host]
+
         for i in range(max(0, n_steps)):
-            last = seq.output_ids[-1] if seq.output_ids else seq.input_ids[-1]
             pos = seq.cached_len
-            input_ids = tok_buf.set_token(int(last))
+            input_ids = tok_buf.set_token_tensor(last_t)
             logits = self._model_forward_v4(input_ids, start_pos=pos)
             nxt = torch.argmax(logits[0])
             self._paged_burst_toks[i] = nxt
-            tok = int(nxt.item())  # needed for EOS check; cheap vs dual stage
+            tok = int(nxt.item())
+            last_t = nxt
             seq.kv_state = None
             seq.cached_len = pos + 1
             out.append(tok)
             seq.output_ids.append(tok)
             seq.decode_tokens = getattr(seq, "decode_tokens", 0) + 1
-            produced += 1
-            # Skip per-token dual_append in burst: live KV is module buffers.
-            # Dual pages refresh on next prefill snapshot / explicit path.
-            if not ignore_eos and eos is not None and tok == int(eos):
+            if tok == int(eos):
                 break
         return out
 
