@@ -137,9 +137,28 @@ engine/
 
 `SGLANG_LITE_V4_SPARSE=official|torch|fi`。默认 **official**。  
 
-**时间占比（PRO6000，32 decode step profile）**：`sparse_attn` 仅占 wall **~2.5%**  
-（~95ms / ~3744ms）。再抠 sparse 最多 +3%；真正大头是 **MoE / 其它 GEMM**。  
-宿主：`deep_gemm` 有；`sgl_kernel` 未加载。
+**时间占比（PRO6000，32 decode step profile）**
+
+| 组件 | wall 占比 | 说明 |
+|------|-----------|------|
+| **MoE 整体** | **~52%** | 真正大头 |
+| Linear/GEMM 合计 | ~25% | 含 Attention + MoE 内 |
+| Expert 前向 | ~19% | 含在 MoE 内 |
+| `sparse_attn` | ~2.5% | 再抠 sparse 收益上限很低 |
+
+**MoE 加速实验（`engine/v4_moe_fast.py`，默认开）**
+
+| 手段 | 结果 |
+|------|------|
+| 只跑 top-k **激活**专家（不扫 32 个 local idle） | 调度税↓ |
+| SwiGLU **gate/up 共用一次 act_quant** | GEMM 前 quant 减半 |
+| e2e 1×128 warm | **~9.13**（与 TileLang 基线 ~9.3 同量级，方差内） |
+| e2e 4×96 warm | **~26.9**（略优于 ~26.5） |
+| `deep_gemm` bf16 | **SM120 Unsupported architecture**（不可用） |
+| FI `b12x_fused_moe` / cutlass MoE | API 存在；权布局转换未焊进 Hybrid（下一步） |
+
+开关：`SGLANG_LITE_V4_MOE_FAST=0` 关闭。  
+下一步：把 **FP4 专家权**接到 FlashInfer **B12x / SM120 cutlass fused MoE**（分组 GEMM），才能吃掉 MoE 52%。
 
 ### Phase V2 — 焊核 + 满图
 
