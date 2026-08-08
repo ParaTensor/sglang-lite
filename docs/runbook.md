@@ -124,6 +124,15 @@ python scripts/soak_stability.py --profile short --out /tmp/soak.json
 # overall PASS：errors=0、oom=0、blocks 稳定
 ```
 
+**PRO6000 SSH**
+
+```bash
+ssh -p 2208 bodesi@39.183.171.3   # hostname=pro6000
+# 代码：~/src/sglang-lite（git main）
+# venv：source ~/venvs/sglang-lite/bin/activate
+# 权重：~/models/DeepSeek-V4-Flash-0731  shards：~/models/ds-v4-mp8
+```
+
 **PRO6000 V4 Hybrid（真机）**
 
 ```bash

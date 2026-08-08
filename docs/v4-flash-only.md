@@ -101,7 +101,19 @@ engine/
 - [x] 首次 vendor `deepseek_infer/`（`hf@60d8d707…`：model/kernel/encoding/convert）  
 - [x] Hybrid load 走 `load_v4_flash`；forward 走 `V4DecodeAccelerator`  
 - [x] 保留现有 Rust SSE / TokenDelta  
-- [ ] 跑通 `1×128` 与短 greedy（**权重机**执行 `scripts/v4_vs_sglang_bench.sh`）
+- [x] **PRO6000 真机**（`42e0ea0`，vendor graph，`DISABLE_FI=1`）`1×128` / `4×96` / `1×256` 跑通  
+
+### PRO6000 验收（2026-08-08，宿主 torch 2.11+cu130，vendor `deepseek_infer`）
+
+| Case | warm tok/s | 基线 warm（§6.4.1） | 说明 |
+|------|------------|---------------------|------|
+| 1×128 | **7.44** | 7.59 | 与基线同量级；sample 前缀 `Hello! How can I help you today?` |
+| 4×96 | **16.48** | 16.74 | 同上 |
+| 1×256 | **7.48** | 7.51 | 同上 |
+| load_s | ~8–11 | ~8 | graph source=`vendor` |
+
+日志：`~/bench/v4_thru_vendor_summary.json`（host）。  
+修过 prefill：`V4DecodeAccelerator` 不得把 `seq_len>1` reshape 成 `[B,1]`（`42e0ea0`）。
 
 ### Phase V2 — 焊核 + 满图
 
