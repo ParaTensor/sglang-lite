@@ -47,6 +47,9 @@ package-dir = { "sglang_lite" = "engine" }
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# Vendored upstream slices (official inference / DeepGEMM / SGLang reference):
+# keep as-is, do not lint third-party code.
+extend-exclude = ["engine/vendor"]
 
 [tool.pytest.ini_options]
 markers = [

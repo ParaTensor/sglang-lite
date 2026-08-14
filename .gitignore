@@ -64,3 +64,6 @@ sglang_lite.egg-info/
 # Test / benchmark outputs
 *.prof
 benchmarks/
+
+# Agent tool output
+.zene/
