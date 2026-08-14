@@ -1890,8 +1890,16 @@ class ModelRunner:
         if position_ids is not None:
             kwargs["position_ids"] = position_ids
             # TF5 / Qwen3: cache_position aligns rope + cache updates.
+            # cache_position must be the per-sequence positions of shape [T]:
+            # HF 4.57 sizes the causal/SDPA mask from cache_position.shape[0],
+            # so flattening a batched [B, T] position_ids into [B*T] mis-sizes
+            # the mask (q_len = B*T) for batched prefill. Engine batch groups
+            # share one cached_len, so all rows are identical → take row 0.
             if position_ids.numel() > 0:
-                kwargs["cache_position"] = position_ids.reshape(-1)
+                if position_ids.dim() == 2:
+                    kwargs["cache_position"] = position_ids[0]
+                else:
+                    kwargs["cache_position"] = position_ids.reshape(-1)
         # Match HF generate(): only materialize last-token logits (big prefill win).
         if self._supports_logits_to_keep():
             kwargs["logits_to_keep"] = 1

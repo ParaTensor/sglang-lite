@@ -104,8 +104,10 @@ def test_restore_vs_stage_counters():
     release_dual_pool_pages(radix, handle)
 
 
-def test_runner_stages_when_page_primary():
-    """_v4_stage_pages_before_forward only runs when page_primary is set."""
+def test_runner_stages_once_after_restore_when_page_primary():
+    """_v4_stage_pages_before_forward is gated by _v4_need_stage (set after a
+    prefix-hit dual restore) and runs at most once — continuous decode must
+    NOT re-stage every step (PRO6000 thruput poison, see v4-flash-only §9)."""
     model = _FakeV4(t=8)
     gold = torch.arange(8 * 512, dtype=torch.bfloat16).view(8, 512)
     model.attn.kv_cache[0] = gold.clone()
@@ -143,10 +145,22 @@ def test_runner_stages_when_page_primary():
     assert radix.dual_stage_count == 0
     assert torch.count_nonzero(model.attn.kv_cache) == 0
 
+    # page_primary alone must NOT trigger staging (no need_stage → no re-stage).
     seq._v4_page_primary = True
+    assert runner._v4_stage_pages_before_forward(seq, batch_slot=0) is False
+    assert radix.dual_stage_count == 0
+
+    # A prefix-hit dual restore sets _v4_need_stage → exactly one stage.
+    seq._v4_need_stage = True
     assert runner._v4_stage_pages_before_forward(seq, batch_slot=0) is True
     assert radix.dual_stage_count == 1
     assert torch.allclose(model.attn.kv_cache[0, :8].float(), gold.float(), atol=1e-2)
+
+    # One-shot: subsequent decode steps do not re-stage.
+    model.attn.kv_cache.zero_()
+    assert runner._v4_stage_pages_before_forward(seq, batch_slot=0) is False
+    assert radix.dual_stage_count == 1
+    assert torch.count_nonzero(model.attn.kv_cache) == 0
     release_dual_pool_pages(radix, handle)
 
 
